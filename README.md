@@ -1,4 +1,4 @@
-# Quantified API 🚀
+# Quantified API 🟪
 
 Welcome to the **Quantified API** - your go-to toolkit for supercharging Minecraft mod performance with async computing, smart caching, and GPU acceleration. Whether you're optimizing chunk generation, caching player data, or building distributed mod networks, this API makes high-performance modding feel effortless.
 
