@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Quantified API Webpanel</title>
+    <link rel="stylesheet" href="/dashboard.css">
+    <link rel="icon" type="image/png" href="/dashboard-logo.png">
+</head>
+<body>
+    <header class="dashboard-brand">
+        <img src="/dashboard-logo.png" alt="Quantified API logo" class="dashboard-brand__logo">
+        <span class="dashboard-brand__title">Quantified API Webpanel</span>
+    </header>
+    <div id="root"></div>
+    <script>
+        window.__dashboardErrorHandler = function displayError(message, error) {
+            try {
+                console.error('Dashboard error:', message, error);
+                var root = document.getElementById('root');
+                var overlay = document.createElement('div');
+                overlay.id = 'dashboard-error-overlay';
+                overlay.style.position = 'fixed';
+                overlay.style.top = '0';
+                overlay.style.left = '0';
+                overlay.style.width = '100%';
+                overlay.style.height = '100%';
+                overlay.style.background = 'rgba(0,0,0,0.92)';
+                overlay.style.color = '#fff';
+                overlay.style.zIndex = 99999;
+                overlay.style.padding = '24px';
+                overlay.style.overflow = 'auto';
+                var title = document.createElement('h1');
+                title.innerText = 'Dashboard JavaScript error';
+                overlay.appendChild(title);
+                var pre = document.createElement('pre');
+                pre.style.whiteSpace = 'pre-wrap';
+                pre.style.fontSize = '13px';
+                pre.style.color = '#fff';
+                var stack = (error && error.stack) ? error.stack : JSON.stringify(error || message, null, 2);
+                pre.innerText = (message || '') + '\n\n' + stack;
+                overlay.appendChild(pre);
+                if (root && root.parentNode) {
+                    // remove any existing overlay
+                    var existing = document.getElementById('dashboard-error-overlay');
+                    if (existing) existing.remove();
+                    root.parentNode.insertBefore(overlay, root.nextSibling);
+                } else {
+                    document.body.appendChild(overlay);
+                }
+            } catch (e) {
+                console.error('Failed to render overlay for dashboard error', e);
+            }
+        };
+        window.addEventListener('error', function(e) { window.__dashboardErrorHandler(e.message, e.error || e); });
+        window.addEventListener('unhandledrejection', function(e) { window.__dashboardErrorHandler(e.reason && e.reason.message ? e.reason.message : 'Unhandled promise rejection', e.reason); });
+    </script>
+    <script type="module" src="/dashboard.js"></script>
+</body>
+</html>
