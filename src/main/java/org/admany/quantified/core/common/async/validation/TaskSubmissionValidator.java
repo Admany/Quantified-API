@@ -59,6 +59,47 @@ public final class TaskSubmissionValidator {
         return new ValidatedSubmission<>(taskKey, resolvedType, resolvedScore, resolvedComputation, resolution.threadSafe(), resolvedTimeout);
     }
 
+    public static <T> ValidatedSubmission<T> validate(long taskKey,
+                                                      PriorityTaskType type,
+                                                      double score,
+                                                      TaskComputation<T> computation,
+                                                      Duration timeout,
+                                                      boolean threadSafeOverride,
+                                                      AsyncMetrics metrics,
+                                                      Logger logger) {
+        Objects.requireNonNull(metrics, "metrics");
+        Objects.requireNonNull(logger, "logger");
+        TaskComputation<T> resolvedComputation = Objects.requireNonNull(computation, "computation");
+
+        PriorityTaskType resolvedType = type;
+        if (resolvedType == null) {
+            metrics.recordTypeDefaulted();
+            resolvedType = PriorityTaskType.OTHER;
+            logger.log(Level.WARNING, "Task {0} defaulted priority type to {1} due to null input", new Object[]{taskKey, resolvedType});
+        }
+
+        double resolvedScore = resolvedType.sanitiseScore(score);
+        if (Double.compare(resolvedScore, score) != 0) {
+            metrics.recordScoreSanitised();
+            logger.log(Level.FINER, "Task {0} score sanitised from {1} to {2}", new Object[]{taskKey, score, resolvedScore});
+        }
+
+        TaskSafetyRegistry.Resolution resolution = TaskSafetyRegistry.resolve(resolvedComputation);
+        if (resolution.overrideUsed()) {
+            metrics.recordSafetyOverride();
+        }
+
+        if (threadSafeOverride != resolution.threadSafe()) {
+            metrics.recordSafetyOverride();
+        }
+
+        ensureThreadSafety(taskKey, resolvedType, resolvedComputation, threadSafeOverride, metrics, logger);
+
+        Duration resolvedTimeout = validateTimeout(taskKey, timeout, logger);
+
+        return new ValidatedSubmission<>(taskKey, resolvedType, resolvedScore, resolvedComputation, threadSafeOverride, resolvedTimeout);
+    }
+
     private static <T> void ensureThreadSafety(long taskKey,
                                                PriorityTaskType type,
                                                TaskComputation<T> computation,

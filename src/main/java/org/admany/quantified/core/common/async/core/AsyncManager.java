@@ -142,6 +142,90 @@ public final class AsyncManager {
         return submit(key, type, score, TaskComputation.async(supplier), null, modId, TaskMetadata.DEFAULT);
     }
 
+    // Convenience overload: include a timeout
+    public static <T> CompletableFuture<T> submitSync(long key, PriorityTaskType type, double score, Supplier<T> supplier, Duration timeout, String modId) {
+        return submit(key, type, score, TaskComputation.sync(supplier), timeout, modId, TaskMetadata.DEFAULT);
+    }
+
+    public static <T> CompletableFuture<T> submitAsync(long key, PriorityTaskType type, double score, Supplier<CompletableFuture<T>> supplier, Duration timeout, String modId) {
+        return submit(key, type, score, TaskComputation.async(supplier), timeout, modId, TaskMetadata.DEFAULT);
+    }
+
+    // Overloads allowing explicit thread-safety override (with and without explicit TaskMetadata)
+    public static <T> CompletableFuture<T> submitSync(long key, PriorityTaskType type, double score, Supplier<T> supplier, Duration timeout, boolean threadSafe, String modId) {
+        return submit(key, type, score, TaskComputation.sync(supplier), timeout, threadSafe, modId, TaskMetadata.DEFAULT);
+    }
+
+    public static <T> CompletableFuture<T> submitAsync(long key, PriorityTaskType type, double score, Supplier<CompletableFuture<T>> supplier, Duration timeout, boolean threadSafe, String modId) {
+        return submit(key, type, score, TaskComputation.async(supplier), timeout, threadSafe, modId, TaskMetadata.DEFAULT);
+    }
+
+    public static <T> CompletableFuture<T> submitSync(long key, PriorityTaskType type, double score, Supplier<T> supplier, Duration timeout, boolean threadSafe, String modId, TaskMetadata metadata) {
+        return submit(key, type, score, TaskComputation.sync(supplier), timeout, threadSafe, modId, metadata);
+    }
+
+    public static <T> CompletableFuture<T> submitAsync(long key, PriorityTaskType type, double score, Supplier<CompletableFuture<T>> supplier, Duration timeout, boolean threadSafe, String modId, TaskMetadata metadata) {
+        return submit(key, type, score, TaskComputation.async(supplier), timeout, threadSafe, modId, metadata);
+    }
+
+    // New overload: allow explicit thread-safety override and metadata
+    public static <T> CompletableFuture<T> submit(
+        long key,
+        PriorityTaskType type,
+        double score,
+        TaskComputation<T> computation,
+        Duration timeout,
+        boolean threadSafeOverride,
+        String modId,
+        TaskMetadata metadata
+    ) {
+
+        ensureInitialised();
+        METRICS.incrementRequests();
+
+        TaskSubmissionValidator.ValidatedSubmission<T> v =
+            TaskSubmissionValidator.validate(key, type, score, computation, timeout, threadSafeOverride, METRICS, LOGGER);
+
+        long now = System.nanoTime();
+        Long prev = LAST_REQUEST_NANOS.put(key, now);
+
+        if (prev != null && now - prev < DEBOUNCE_WINDOW_NANOS) {
+            TaskEntry<T> existing = existingEntry(key);
+            if (existing != null) {
+                METRICS.incrementCoalesced();
+                METRICS.incrementCacheHits();
+                return existing.future;
+            }
+        }
+
+        Holder<TaskEntry<T>> holder = new Holder<>();
+
+        TASKS.compute(key, (k, existing) -> {
+            if (existing != null) {
+                holder.value = cast(existing);
+                METRICS.incrementCoalesced();
+                METRICS.incrementCacheHits();
+                return existing;
+            }
+
+            TaskEntry<T> entry = new TaskEntry<>(
+                v.computation(),
+                v.threadSafe(),
+                v.timeout(),
+                modId,
+                metadata
+            );
+
+            holder.value = entry;
+            schedule(key, entry, v.type(), v.score());
+            return entry;
+        });
+
+        pruneIfNecessary();
+        return holder.value.future;
+    }
+
+    // Existing submit remains for callers that rely on TaskMetadata to set safety via TaskSafetyRegistry
     public static <T> CompletableFuture<T> submit(
         long key,
         PriorityTaskType type,
@@ -195,6 +279,10 @@ public final class AsyncManager {
 
         pruneIfNecessary();
         return holder.value.future;
+    }
+
+    public static <T> CompletableFuture<T> submit(long key, PriorityTaskType type, double score, TaskComputation<T> computation, String modId) {
+        return submit(key, type, score, computation, null, modId, TaskMetadata.DEFAULT);
     }
 
     private static <T> void schedule(long key, TaskEntry<T> entry, PriorityTaskType type, double score) {
