@@ -280,6 +280,7 @@ public final class OpenCLManager {
         OpenCLRuntime.destroy();
     }
 
+    // -------------------- CLBuffer --------------------
     public static class CLBuffer implements AutoCloseable {
         private final long bufferHandle;
         private final long sizeBytes;
@@ -344,6 +345,81 @@ public final class OpenCLManager {
         }
     }
 
+    // -------------------- PredictiveBufferCache --------------------
+    public static class PredictiveBufferCache {
+        private final Map<Long, List<CLBuffer>> sizeBuckets = new ConcurrentHashMap<>();
+        private final GPUMonitor monitor;
+        private final OpenCLContext context;
+        private final long maxMemory;
+        private final Object cacheMutex = new Object();
+
+        public PredictiveBufferCache(GPUMonitor monitor, OpenCLContext context, long maxMemory) {
+            this.monitor = monitor;
+            this.context = context;
+            this.maxMemory = maxMemory;
+        }
+
+        public CLBuffer getOrCreate(long sizeBytes) {
+            synchronized (cacheMutex) {
+                List<CLBuffer> bucket = sizeBuckets.computeIfAbsent(sizeBytes, k -> new ArrayList<>());
+
+                for (CLBuffer buf : bucket) {
+                    if (!buf.isInUse()) {
+                        buf.markInUse();
+                        return buf;
+                    }
+                }
+
+                if (shouldSpillToDisk(sizeBytes)) {
+                    return null;
+                }
+
+                CLBuffer newBuf = CLBuffer.createReadWrite(context, sizeBytes);
+                bucket.add(newBuf);
+                newBuf.markInUse();
+                return newBuf;
+            }
+        }
+
+        public void release(CLBuffer buffer) {
+            synchronized (cacheMutex) {
+                buffer.markFree();
+                if (getTotalMemoryUsage() > maxMemory * 0.9) {
+                    evictLRU();
+                }
+            }
+        }
+
+        private boolean shouldSpillToDisk(long sizeBytes) {
+            if (monitor == null) return false;
+            GPUMonitor.GPUStatus status = monitor.getStatus();
+            long currentUsage = status != null ? status.usedVramBytes() : 0;
+            return currentUsage + sizeBytes > maxMemory * 0.8;
+        }
+
+        private void evictLRU() {
+            final long[] freed = {0};
+            sizeBuckets.values().forEach(bucket -> 
+                bucket.removeIf(buf -> {
+                    if (!buf.isInUse() && buf.getLastUsed() < System.nanoTime() - 60_000_000_000L) {
+                        freed[0] += buf.getSize();
+                        return true;
+                    }
+                    return false;
+                })
+            );
+            LOGGER.fine("Evicted buffers, freed " + freed[0] + " bytes");
+        }
+
+        private long getTotalMemoryUsage() {
+            return sizeBuckets.values().stream()
+                .flatMap(List::stream)
+                .mapToLong(CLBuffer::getSize)
+                .sum();
+        }
+    }
+
+    // -------------------- Structured Buffer Helpers --------------------
     public static ByteBuffer createStructuredBuffer(OpenCLContext ctx, Map<String, Object> dataMap) {
         return CLDataUtil.createKernelBuffer(ctx, dataMap);
     }
