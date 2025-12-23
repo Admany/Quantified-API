@@ -15,10 +15,6 @@ import org.admany.quantified.core.common.async.core.AsyncManagerBootstrap;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-/**
- * Tests for the high-level OpenCL utility methods in QuantifiedOpenCL.
- * These tests demonstrate usage and verify basic functionality.
- */
 public class QuantifiedOpenCLUtilitiesTest {
 
     private static final String TEST_MOD_ID = "test-mod";
