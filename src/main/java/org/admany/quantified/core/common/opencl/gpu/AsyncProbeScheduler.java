@@ -125,7 +125,7 @@ public class AsyncProbeScheduler {
             handleProbeResult(trigger, attemptNo, result, null);
         } catch (Throwable t) {
             LOGGER.log(Level.WARNING, "OpenCL probe execution failure on attempt #" + attemptNo, t);
-            DeveloperOverlayManager.recordApiLog("[OpenCL] Probe attempt " + attemptNo + " failed (" + trigger + ") — " + t.getMessage());
+            DeveloperOverlayManager.recordApiLog("[OpenCL] Probe attempt " + attemptNo + " failed (" + trigger + ") - " + t.getMessage());
             scheduleRetry("execution-exception");
         }
     }
@@ -136,7 +136,7 @@ public class AsyncProbeScheduler {
         }
         if (err != null) {
             LOGGER.log(Level.WARNING, "OpenCL probe attempt #" + attemptNo + " (" + trigger + ") failed", err);
-            DeveloperOverlayManager.recordApiLog("[OpenCL] Probe attempt " + attemptNo + " failed (" + trigger + ") — " + err.getMessage());
+            DeveloperOverlayManager.recordApiLog("[OpenCL] Probe attempt " + attemptNo + " failed (" + trigger + ") - " + err.getMessage());
             scheduleRetry("exception");
             return;
         }

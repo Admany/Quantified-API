@@ -252,7 +252,6 @@ public final class StressTestController {
     }
 
     private static void injectCpuLoad() {
-        // Submit CPU-bound work to the dedicated stress pool in short chunks so we don't starve normal workers
         for (int i = 0; i < 16; i++) {
             final long taskKey = taskIdCounter.incrementAndGet();
             try {
@@ -468,7 +467,7 @@ public final class StressTestController {
     }
 
     public enum StressTestProfile {
-        CPU_HEAVY("cpu_heavy", "CPU-bound worker saturation"),
+        CPU_HEAVY("cpu_heavy", "CPU bound worker saturation"),
         GPU_TEST("gpu_test", "Direct GPU stress test bypassing async system"),
         CACHE_PRESSURE("cache_pressure", "Cache thrash and eviction pressure"),
         NETWORK_TEST("network_test", "Network packet traffic generation");

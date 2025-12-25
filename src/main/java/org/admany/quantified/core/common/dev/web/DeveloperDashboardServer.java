@@ -21,6 +21,7 @@ import java.net.URLDecoder;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.Objects;
 import org.admany.quantified.api.QuantifiedAPI;
 import org.admany.quantified.api.interfaces.ConnectedMod;
 import org.admany.quantified.api.interfaces.ModStatistics;
@@ -33,6 +34,9 @@ import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.dev.DeveloperFeatures;
 import org.admany.quantified.core.common.dev.StressTestController;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
+import org.admany.quantified.core.common.opencl.core.OpenCLManager;
+import org.admany.quantified.core.common.opencl.gpu.GPUDetector;
+import org.admany.quantified.core.common.opencl.gpu.GPUMonitor;
 import org.admany.quantified.core.common.opencl.gpu.probe.GpuTelemetryService;
 import org.admany.quantified.core.common.opencl.task.OpenCLTaskManager;
 import org.admany.quantified.core.common.util.TaskScheduler;
@@ -53,7 +57,6 @@ import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -87,8 +90,8 @@ public final class DeveloperDashboardServer {
     private static final long SENSOR_REFRESH_INTERVAL_MS = 10_000L;
     private static final AtomicLong LAST_CPU_SENSOR_QUERY = new AtomicLong(0L);
     private static final AtomicReference<Double> LAST_CPU_SENSOR_VALUE = new AtomicReference<>(Double.NaN);
-    private static final AtomicBoolean CPU_TEMP_QUERY_DISABLED = new AtomicBoolean(false);
-    private static final AtomicBoolean CPU_TEMP_WARNING_LOGGED = new AtomicBoolean(false);
+    private static final long CPU_SENSOR_RETRY_INTERVAL_MS = 60_000L;
+    private static final AtomicLong LAST_CPU_SENSOR_REFRESH = new AtomicLong(0L);
     private static final AtomicLong LAST_CPU_LOAD_QUERY = new AtomicLong(0L);
     private static final AtomicReference<long[]> LAST_CPU_TICKS = new AtomicReference<>();
     private static final AtomicReference<Double> LAST_CPU_LOAD = new AtomicReference<>(Double.NaN);
@@ -583,7 +586,12 @@ public final class DeveloperDashboardServer {
         summary.addProperty("cacheEntryCount", usage.entryCount());
         summary.addProperty("cacheRamBytes", usage.heapBytes());
         summary.addProperty("cacheDiskBytes", usage.diskBytes());
-        summary.addProperty("vramUsedBytes", Math.max(0L, diagnostics.snapshot().gpuVramUsedBytes()));
+        long vramTelemetryBytes = Math.max(0L, diagnostics.snapshot().gpuVramUsedBytes());
+        long vramCacheBytes = Math.max(0L, OpenCLManager.cacheVramUsageBytes());
+        long vramTaskBytes = Math.max(0L, OpenCLManager.activeTaskVramBytes());
+        long vramContextBytes = Math.max(0L, vramTelemetryBytes - vramCacheBytes - vramTaskBytes);
+        long vramEffectiveBytes = Math.max(0L, vramTelemetryBytes - vramContextBytes);
+        summary.addProperty("vramUsedBytes", vramEffectiveBytes);
         summary.addProperty("vramBudgetBytes", Math.max(0L, diagnostics.snapshot().gpuVramBudgetBytes()));
         payload.add("summary", summary);
 
@@ -756,6 +764,7 @@ public final class DeveloperDashboardServer {
             placeholder.addProperty("error", "Config not loaded");
             return placeholder;
         }
+        JsonArray openclDeviceOptions = buildOpenClDeviceOptions();
         Map<String, Object> values = new LinkedHashMap<>();
         for (java.lang.reflect.Field field : MultithreadingConfig.Config.class.getFields()) {
             try {
@@ -776,6 +785,10 @@ public final class DeveloperDashboardServer {
                 field.addProperty("type", describeConfigType(value));
                 field.addProperty("comment", layout.comments().getOrDefault(key, ""));
                 field.add("value", GSON.toJsonTree(value));
+                if ("openclDeviceId".equals(key)) {
+                    field.addProperty("type", "select");
+                    field.add("options", openclDeviceOptions);
+                }
                 fields.add(field);
             }
             group.add("fields", fields);
@@ -804,6 +817,27 @@ public final class DeveloperDashboardServer {
         return "string";
     }
 
+    private static JsonArray buildOpenClDeviceOptions() {
+        JsonArray options = new JsonArray();
+        JsonObject auto = new JsonObject();
+        auto.addProperty("value", "auto");
+        auto.addProperty("label", "Auto (fastest)");
+        options.add(auto);
+        for (GPUDetector.OpenCLDeviceInfo device : GPUDetector.listDevices()) {
+            JsonObject option = new JsonObject();
+            option.addProperty("value", device.id());
+            option.addProperty("label", formatOpenClDeviceLabel(device));
+            options.add(option);
+        }
+        return options;
+    }
+
+    private static String formatOpenClDeviceLabel(GPUDetector.OpenCLDeviceInfo device) {
+        String type = device.type() != null ? device.type().name().toLowerCase(Locale.ROOT) : "gpu";
+        String vram = device.vramBytes() > 0 ? formatBytes(device.vramBytes()) : "unknown VRAM";
+        return device.name() + " (" + device.vendor() + " · " + type + " · " + vram + " · CU " + device.computeUnits() + ")";
+    }
+
     private static void applyConfigUpdates(JsonObject request) {
         if (request == null || request.entrySet().isEmpty()) {
             throw new IllegalArgumentException("No config entries provided");
@@ -824,13 +858,23 @@ public final class DeveloperDashboardServer {
         }
         try {
             synchronized (MultithreadingConfig.class) {
+                String previousOpenclDeviceId = MultithreadingConfig.CONFIG != null ? MultithreadingConfig.CONFIG.openclDeviceId : null;
+                String updatedOpenclDeviceId = previousOpenclDeviceId;
+                boolean openclDeviceChanged = false;
                 for (Map.Entry<String, JsonElement> entry : updates.entrySet()) {
                     String key = entry.getKey();
                     java.lang.reflect.Field field = MultithreadingConfig.Config.class.getField(key);
                     Object coerced = coerceConfigValue(field.getType(), entry.getValue());
                     field.set(MultithreadingConfig.CONFIG, coerced);
+                    if ("openclDeviceId".equals(key)) {
+                        updatedOpenclDeviceId = coerced != null ? coerced.toString() : null;
+                        openclDeviceChanged = !Objects.equals(previousOpenclDeviceId, updatedOpenclDeviceId);
+                    }
                 }
                 MultithreadingConfig.writePrettyJsonConfig(MultithreadingConfig.CONFIG);
+                if (openclDeviceChanged) {
+                    OpenCLManager.switchDevice(updatedOpenclDeviceId);
+                }
             }
         } catch (ReflectiveOperationException ex) {
             throw new IllegalArgumentException("Invalid config key provided", ex);
@@ -889,10 +933,6 @@ public final class DeveloperDashboardServer {
             if (request.has("dashboardEnabled")) {
                 boolean dashboard = request.get("dashboardEnabled").getAsBoolean();
                 DeveloperFeatures.setDashboardEnabled(dashboard, true);
-            }
-            if (request.has("overlayEnabled")) {
-                boolean overlay = request.get("overlayEnabled").getAsBoolean();
-                DeveloperFeatures.setOverlayEnabled(overlay, true);
             }
             if (request.has("timelineEnabled")) {
                 boolean timeline = request.get("timelineEnabled").getAsBoolean();
@@ -1010,13 +1050,18 @@ public final class DeveloperDashboardServer {
         JsonObject payload = new JsonObject();
         payload.addProperty("developerMode", DeveloperFeatures.isDeveloperModeEnabled());
         payload.addProperty("dashboardEnabled", DeveloperFeatures.isDashboardEnabled());
-        payload.addProperty("overlayEnabled", DeveloperFeatures.isOverlayEnabled());
         payload.addProperty("timelineEnabled", DeveloperFeatures.isTimelineEnabled());
         payload.addProperty("replayEnabled", DeveloperFeatures.isReplayEnabled());
         payload.addProperty("autoHintsEnabled", DeveloperFeatures.isAutoHintsEnabled());
         payload.addProperty("stressTestEnabled", DeveloperFeatures.isStressTestEnabled());
         payload.addProperty("modSpotlightEnabled", DeveloperFeatures.isModSpotlightEnabled());
-        payload.addProperty("overlaySamplingActive", DeveloperFeatures.isOverlaySamplingActive());
+        OpenCLManager.RuntimeStatus openclStatus = OpenCLManager.runtimeStatus();
+        payload.addProperty("openclAvailable", openclStatus.isAvailable());
+        if (openclStatus.failureReason() != null) {
+            payload.addProperty("openclFailureReason", openclStatus.failureReason());
+        }
+        GPUMonitor.GPUStatus gpuStatus = OpenCLManager.getGPUStatus();
+        payload.addProperty("openclDeviceName", gpuStatus != null ? gpuStatus.deviceName() : "");
         StressTestController.StressTestProfile profile = DeveloperFeatures.getStressTestProfile();
         if (profile != null) {
             payload.addProperty("stressTestProfile", profile.configKey());
@@ -1100,8 +1145,17 @@ public final class DeveloperDashboardServer {
         // Snapshot JSON (also record into the export history buffer)
         JsonObject snapshotJson = toJson(diagnostics.snapshot());
         payload.add("snapshot", snapshotJson);
+        long vramTelemetryBytes = Math.max(0L, diagnostics.snapshot().gpuVramUsedBytes());
+        long vramCacheBytes = Math.max(0L, OpenCLManager.cacheVramUsageBytes());
+        long vramTaskBytes = Math.max(0L, OpenCLManager.activeTaskVramBytes());
+        long vramContextBytes = Math.max(0L, vramTelemetryBytes - vramCacheBytes - vramTaskBytes);
+        long vramEffectiveBytes = Math.max(0L, vramTelemetryBytes - vramContextBytes);
         payload.addProperty("gpuVramBudgetBytes", diagnostics.snapshot().gpuVramBudgetBytes());
-        payload.addProperty("gpuVramUsedBytes", diagnostics.snapshot().gpuVramUsedBytes());
+        payload.addProperty("gpuVramUsedBytes", vramEffectiveBytes);
+        payload.addProperty("gpuVramUsedTelemetryBytes", vramTelemetryBytes);
+        payload.addProperty("gpuVramCacheBytes", vramCacheBytes);
+        payload.addProperty("gpuVramTaskBytes", vramTaskBytes);
+        payload.addProperty("gpuVramContextBytes", vramContextBytes);
         payload.addProperty("gpuSystemUsageRatio", diagnostics.snapshot().gpuSystemUsageRatio());
         try {
             synchronized (HISTORY_LOCK) {
@@ -1310,7 +1364,7 @@ public final class DeveloperDashboardServer {
                 drive.addProperty("path", root.getAbsolutePath());
                 drive.addProperty("total", formatBytes(root.getTotalSpace()));
                 drive.addProperty("free", formatBytes(root.getFreeSpace()));
-                drive.addProperty("type", "Drive");
+                drive.addProperty("type", " Drive");
                 drives.add(drive);
             }
         } catch (Throwable t) {
@@ -1349,10 +1403,6 @@ public final class DeveloperDashboardServer {
         if (system == null) {
             return cached;
         }
-        boolean isWindows = normalizeOsFamily(system).contains("windows");
-        if (isWindows && CPU_TEMP_QUERY_DISABLED.get()) {
-            return cached;
-        }
         try {
             Sensors sensors = system.getHardware().getSensors();
             if (sensors == null) {
@@ -1363,24 +1413,28 @@ public final class DeveloperDashboardServer {
                 LAST_CPU_SENSOR_VALUE.set(value);
                 return value;
             }
-            if (isWindows) {
-                disableCpuTemperaturePolling();
-            }
         } catch (Throwable ignored) {
-            if (isWindows) {
-                disableCpuTemperaturePolling();
+        }
+        if (normalizeOsFamily(system).contains("windows")) {
+            long lastRefresh = LAST_CPU_SENSOR_REFRESH.get();
+            if (now - lastRefresh >= CPU_SENSOR_RETRY_INTERVAL_MS) {
+                LAST_CPU_SENSOR_REFRESH.set(now);
+                try {
+                    SystemInfo refreshed = new SystemInfo();
+                    Sensors sensors = refreshed.getHardware().getSensors();
+                    if (sensors != null) {
+                        double value = sensors.getCpuTemperature();
+                        if (!Double.isNaN(value) && value > 0.0d) {
+                            LAST_CPU_SENSOR_VALUE.set(value);
+                            SYSTEM_INFO.set(refreshed);
+                            return value;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
             }
         }
         return cached;
-    }
-
-    private static void disableCpuTemperaturePolling() {
-        if (CPU_TEMP_QUERY_DISABLED.compareAndSet(false, true)) {
-            LAST_CPU_SENSOR_VALUE.set(Double.NaN);
-            if (CPU_TEMP_WARNING_LOGGED.compareAndSet(false, true)) {
-                LOGGER.fine("Disabling Windows CPU temperature polling after repeated WMI failures; dashboard will omit CPU thermals.");
-            }
-        }
     }
 
     private static double readCpuLoad(SystemInfo system) {

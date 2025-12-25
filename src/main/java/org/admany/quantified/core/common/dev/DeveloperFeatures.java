@@ -12,7 +12,6 @@ public final class DeveloperFeatures {
     private static final Logger LOGGER = Logger.getLogger(DeveloperFeatures.class.getName());
 
     private static final AtomicBoolean developerMode = new AtomicBoolean(false);
-    private static final AtomicBoolean overlayEnabled = new AtomicBoolean(false);
     private static final AtomicBoolean timelineEnabled = new AtomicBoolean(false);
     private static final AtomicBoolean replayEnabled = new AtomicBoolean(false);
     private static final AtomicBoolean stressTestEnabled = new AtomicBoolean(false);
@@ -36,10 +35,6 @@ public final class DeveloperFeatures {
 
     public static boolean isDeveloperModeEnabled() {
         return developerMode.get();
-    }
-
-    public static boolean isOverlayEnabled() {
-        return developerMode.get() && overlayEnabled.get();
     }
 
     public static boolean isTimelineEnabled() {
@@ -71,14 +66,14 @@ public final class DeveloperFeatures {
     }
 
     public static boolean isOverlaySamplingActive() {
-        return developerMode.get() && (overlayEnabled.get() || dashboardEnabled.get());
+        return developerMode.get()
+            && (dashboardEnabled.get() || timelineEnabled.get() || replayEnabled.get() || modSpotlightEnabled.get());
     }
 
     public static void setDeveloperMode(boolean enabled, boolean persist) {
         boolean changed = developerMode.getAndSet(enabled) != enabled;
         if (!enabled) {
             // Turning developer mode off automatically disables every experimental path.
-            overlayEnabled.set(false);
             timelineEnabled.set(false);
             replayEnabled.set(false);
             stressTestEnabled.set(false);
@@ -94,7 +89,7 @@ public final class DeveloperFeatures {
                 MultithreadingConfig.CONFIG.developerDashboardHost, MultithreadingConfig.CONFIG.developerDashboardHttps,
                 MultithreadingConfig.CONFIG.developerDashboardAuth);
             if (changed) {
-                LOGGER.info("Developer mode disabled; experimental telemetry overlays are offline.");
+                LOGGER.info("Developer mode disabled; experimental telemetry sampling is offline.");
             }
         } else if (changed) {
             LOGGER.info("Developer mode enabled; experimental telemetry toggles now available.");
@@ -111,17 +106,6 @@ public final class DeveloperFeatures {
         applyDashboardState();
     }
 
-    public static void setOverlayEnabled(boolean enabled, boolean persist) {
-        overlayEnabled.set(enabled);
-        if (persist) {
-            MultithreadingConfig.writePrettyJsonConfig(MultithreadingConfig.CONFIG);
-        }
-        if (enabled) {
-            setDashboardEnabled(true, persist);
-        }
-        applyOverlayState();
-    }
-
     public static void setTimelineEnabled(boolean enabled, boolean persist) {
         timelineEnabled.set(enabled);
         if (persist) {
@@ -129,6 +113,7 @@ public final class DeveloperFeatures {
             MultithreadingConfig.writePrettyJsonConfig(MultithreadingConfig.CONFIG);
         }
         applyAnalyticsState();
+        applyOverlayState();
     }
 
     public static void setReplayEnabled(boolean enabled, boolean persist) {
@@ -138,6 +123,7 @@ public final class DeveloperFeatures {
             MultithreadingConfig.writePrettyJsonConfig(MultithreadingConfig.CONFIG);
         }
         applyAnalyticsState();
+        applyOverlayState();
     }
 
     public static void setStressTestEnabled(boolean enabled, boolean persist) {
@@ -156,6 +142,7 @@ public final class DeveloperFeatures {
             MultithreadingConfig.writePrettyJsonConfig(MultithreadingConfig.CONFIG);
         }
         applyAnalyticsState();
+        applyOverlayState();
     }
 
     public static void setStressTestProfile(StressTestController.StressTestProfile profile, boolean persist) {

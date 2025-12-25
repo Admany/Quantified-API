@@ -9,10 +9,14 @@
     <link rel="icon" type="image/png" href="/dashboard-logo.png">
 </head>
 <body>
-    <header class="dashboard-brand">
-        <img src="/dashboard-logo.png" alt="Quantified API logo" class="dashboard-brand__logo">
-        <span class="dashboard-brand__title">Quantified API Webpanel</span>
-    </header>
+    <div id="boot-overlay" class="loading-screen">
+        <div class="loading-content">
+            <h1>Quantified API</h1>
+            <div class="loading-bar">
+                <div class="loading-progress"></div>
+            </div>
+        </div>
+    </div>
     <div id="root"></div>
     <script>
         window.__dashboardErrorHandler = function displayError(message, error) {

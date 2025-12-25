@@ -8,8 +8,6 @@ import net.minecraftforge.server.ServerLifecycleHooks;
 import org.slf4j.Logger;
 
 import java.io.*;
-import java.util.ArrayList;
-import java.util.List;
 
 public class MultithreadingConfig {
     public static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -49,6 +47,7 @@ public class MultithreadingConfig {
         public boolean enableGpuAcceleration = true; // Enable GPU acceleration when available
         public boolean openclForced = false; // Force OpenCL usage even for small tasks
         public boolean gpuDebugLogging = false; // Enable detailed GPU operation logging
+        public String openclDeviceId = "auto"; // OpenCL device selection ("auto" picks the fastest detected GPU)
 
         // Task Processing Configuration
         public int taskQueueSize = 1000; // Maximum queued tasks before rejection
@@ -60,7 +59,7 @@ public class MultithreadingConfig {
         public boolean developerReplay = true; // Enable replay functionality for diagnostics
         public boolean developerAutoHints = true; // Show automatic performance hints
         public boolean developerStressTest = false; // Enable stress testing features
-        public boolean developerModSpotlight = true; // Highlight mod performance in overlay
+        public boolean developerModSpotlight = true; // Highlight mod performance in diagnostics
 
         // === Developer Dashboard Configuration ===
         public boolean developerDashboard = false; // Enable developer dashboard (disabled by default on servers)
@@ -88,7 +87,6 @@ public class MultithreadingConfig {
         // === Security and Safety ===
         public boolean enableSecurityChecks = true; // Enable security validation checks
         public boolean validateTaskInputs = true; // Validate task inputs for safety
-        public List<String> allowedTaskTypes = new ArrayList<>(); // Whitelist of allowed task types (empty = all allowed)
         public boolean sandboxExternalCalls = true; // Sandbox external process calls
 
         // === Fixes ===
@@ -216,9 +214,6 @@ public class MultithreadingConfig {
     private static void validateAndSetDefaults(Config config, boolean isServer) {
 
         // Ensure lists are initialized
-        if (config.allowedTaskTypes == null) {
-            config.allowedTaskTypes = new ArrayList<>();
-        }
         if (isServer && config.developerStressTest) {
             config.developerStressTest = false;
         }
@@ -426,6 +421,7 @@ public class MultithreadingConfig {
             config.enableGpuAcceleration = extractBoxedBoolean(jsonData, "enableGpuAcceleration", config.enableGpuAcceleration);
             config.openclForced = extractBoxedBoolean(jsonData, "openclForced", config.openclForced);
             config.gpuDebugLogging = extractBoxedBoolean(jsonData, "gpuDebugLogging", config.gpuDebugLogging);
+            config.openclDeviceId = extractBoxedString(jsonData, "openclDeviceId", config.openclDeviceId);
 
             config.taskQueueSize = extractBoxedInt(jsonData, "taskQueueSize", config.taskQueueSize);
             config.taskTimeoutMs = extractBoxedLong(jsonData, "taskTimeoutMs", config.taskTimeoutMs);
@@ -459,7 +455,6 @@ public class MultithreadingConfig {
 
             config.enableSecurityChecks = extractBoxedBoolean(jsonData, "enableSecurityChecks", config.enableSecurityChecks);
             config.validateTaskInputs = extractBoxedBoolean(jsonData, "validateTaskInputs", config.validateTaskInputs);
-            config.allowedTaskTypes = extractBoxedStringArray(jsonData, "allowedTaskTypes", config.allowedTaskTypes);
             config.sandboxExternalCalls = extractBoxedBoolean(jsonData, "sandboxExternalCalls", config.sandboxExternalCalls);
 
             config.enableGcHints = extractBoxedBoolean(jsonData, "enableGcHints", config.enableGcHints);
@@ -505,6 +500,7 @@ public class MultithreadingConfig {
                 config.enableGpuAcceleration = extractBoxedBoolean(gpu, "enableGpuAcceleration", config.enableGpuAcceleration);
                 config.openclForced = extractBoxedBoolean(gpu, "openclForced", config.openclForced);
                 config.gpuDebugLogging = extractBoxedBoolean(gpu, "gpuDebugLogging", config.gpuDebugLogging);
+                config.openclDeviceId = extractBoxedString(gpu, "openclDeviceId", config.openclDeviceId);
             }
 
             // Parse task processing settings
@@ -562,7 +558,6 @@ public class MultithreadingConfig {
                 com.google.gson.JsonObject security = jsonData.get("security").getAsJsonObject();
                 config.enableSecurityChecks = extractBoxedBoolean(security, "enableSecurityChecks", config.enableSecurityChecks);
                 config.validateTaskInputs = extractBoxedBoolean(security, "validateTaskInputs", config.validateTaskInputs);
-                config.allowedTaskTypes = extractBoxedStringArray(security, "allowedTaskTypes", config.allowedTaskTypes);
                 config.sandboxExternalCalls = extractBoxedBoolean(security, "sandboxExternalCalls", config.sandboxExternalCalls);
             }
 
@@ -660,31 +655,6 @@ public class MultithreadingConfig {
         return defaultValue;
     }
 
-    private static java.util.List<String> extractBoxedStringArray(com.google.gson.JsonObject parent, String key, java.util.List<String> defaultValue) {
-        if (parent.has(key)) {
-            com.google.gson.JsonElement element = parent.get(key);
-            if (element.isJsonObject()) {
-                com.google.gson.JsonObject box = element.getAsJsonObject();
-                if (box.has("value") && box.get("value").isJsonArray()) {
-                    com.google.gson.JsonArray array = box.get("value").getAsJsonArray();
-                    java.util.List<String> result = new java.util.ArrayList<>();
-                    for (com.google.gson.JsonElement item : array) {
-                        result.add(item.getAsString());
-                    }
-                    return result;
-                }
-            } else if (element.isJsonArray()) {
-                com.google.gson.JsonArray array = element.getAsJsonArray();
-                java.util.List<String> result = new java.util.ArrayList<>();
-                for (com.google.gson.JsonElement item : array) {
-                    result.add(item.getAsString());
-                }
-                return result;
-            }
-        }
-        return defaultValue;
-    }
-
     public static ConfigLayout configLayout() {
         java.util.Map<String, String> commentsCopy = new java.util.LinkedHashMap<>(CONFIG_SCHEMA.comments());
         java.util.Map<String, String> labelsCopy = new java.util.LinkedHashMap<>(CONFIG_SCHEMA.displayNames());
@@ -707,16 +677,16 @@ public class MultithreadingConfig {
         describeField(comments, labels, "enableGpuAcceleration", "GPU Acceleration", "Let Quantified push compatible workloads onto the GPU whenever possible.");
         describeField(comments, labels, "openclForced", "Force OpenCL", "Always route compute through OpenCL even when the CPU would normally be chosen.");
         describeField(comments, labels, "gpuDebugLogging", "GPU Debug Logging", "Emit detailed OpenCL/GPU traces to help troubleshoot rendering or compute issues.");
+        describeField(comments, labels, "openclDeviceId", "OpenCL Device", "Select which OpenCL device to use. Use auto to let Quantified pick the fastest GPU.");
         describeField(comments, labels, "parallelMaxThreads", "Parallel Threads", "Upper bound for threads dedicated to the parallel compute pool.");
         describeField(comments, labels, "parallelQueueLimit", "Parallel Queue Limit", "Maximum number of queued parallel slices across all mods.");
         describeField(comments, labels, "parallelMaxSlicesPerMod", "Parallel Slices Per Mod", "Per-mod ceiling for simultaneously running slices.");
         describeField(comments, labels, "parallelFailurePolicy", "Parallel Failure Policy", "Default failure policy for parallel batches (FAIL_FAST or BEST_EFFORT).");
         describeField(comments, labels, "taskQueueSize", "Task Queue Size", "Maximum number of queued tasks before new ones are rejected.");
         describeField(comments, labels, "taskTimeoutMs", "Task Timeout", "Upper limit (in ms) for how long a single task may run.");
-        describeField(comments, labels, "developerMode", "Developer Mode", "Unlock developer-only UI elements, overlays, and tooling.");
-        describeField(comments, labels, "developerOverlay", "Developer Overlay", "Render the debugging HUD overlay inside the game.");
+        describeField(comments, labels, "developerMode", "Developer Mode", "Unlock developer-only UI elements and tooling.");
         describeField(comments, labels, "developerTimeline", "Timeline Capture", "Record execution timeline samples so you can scrub through performance history.");
-        describeField(comments, labels, "developerReplay", "Replay Recorder", "Keep overlay frames so you can replay them later for diagnostics.");
+        describeField(comments, labels, "developerReplay", "Replay Recorder", "Keep telemetry frames so you can replay them later for diagnostics.");
         describeField(comments, labels, "developerStressTest", "Stress Tester", "Expose the stress test harness that hammers the scheduler.");
         describeField(comments, labels, "developerModSpotlight", "Mod Spotlight", "Highlight verbose or busy mods directly in diagnostics.");
         describeField(comments, labels, "developerDashboard", "Web Dashboard", "Serve the browser-based dashboard for realtime control.");
@@ -738,7 +708,6 @@ public class MultithreadingConfig {
         describeField(comments, labels, "maxMetricsHistoryHours", "Metrics History", "How many hours of metrics the game should remember.");
         describeField(comments, labels, "enableSecurityChecks", "Security Checks", "Run extra validation to avoid unsafe or malicious workloads.");
         describeField(comments, labels, "validateTaskInputs", "Validate Task Inputs", "Double-check each task payload before it runs.");
-        describeField(comments, labels, "allowedTaskTypes", "Allowed Task Types", "Whitelist task IDs that may run (leave empty to allow everything).");
         describeField(comments, labels, "sandboxExternalCalls", "Sandbox External Calls", "Wrap risky system or process calls in a safer sandbox.");
         describeField(comments, labels, "enableGcHints", "GC Hints", "Log JVM garbage-collection hints to help with tuning.");
         describeField(comments, labels, "debug", "Debug Logging", "Enable verbose debug logging globally.");
@@ -752,14 +721,14 @@ public class MultithreadingConfig {
         java.util.LinkedHashMap<String, String[]> groups = new java.util.LinkedHashMap<>();
         groups.put("General Settings", new String[]{"logToConsole", "logLevel"});
         groups.put("Networking Configuration", new String[]{"enableNetworking", "networkTimeoutMs"});
-        groups.put("GPU / OpenCL", new String[]{"enableGpuAcceleration", "openclForced", "gpuDebugLogging"});
+        groups.put("GPU / OpenCL", new String[]{"enableGpuAcceleration", "openclForced", "gpuDebugLogging", "openclDeviceId"});
         groups.put("Parallel Execution", new String[]{"parallelMaxThreads", "parallelQueueLimit", "parallelMaxSlicesPerMod", "parallelFailurePolicy"});
         groups.put("Task Processing", new String[]{"taskQueueSize", "taskTimeoutMs"});
-        groups.put("Developer Features", new String[]{"developerMode", "developerOverlay", "developerTimeline", "developerReplay", "developerStressTest", "developerModSpotlight"});
+        groups.put("Developer Features", new String[]{"developerMode", "developerTimeline", "developerReplay", "developerStressTest", "developerModSpotlight"});
         groups.put("Developer Dashboard", new String[]{"developerDashboard", "developerDashboardPort", "developerDashboardHost", "developerDashboardHttps", "developerDashboardAuth", "developerDashboardUsername", "developerDashboardPassword", "developerDashboardKeystorePath", "developerDashboardKeystorePassword", "dashboardSessionTimeoutMinutes"});
         groups.put("Stress Testing", new String[]{"developerStressProfile", "stressTestCpuChunkMs"});
         groups.put("Monitoring & Metrics", new String[]{"enableMetrics", "metricsIntervalSeconds", "exportMetricsToFile", "metricsExportPath", "maxMetricsHistoryHours"});
-        groups.put("Security & Safety", new String[]{"enableSecurityChecks", "validateTaskInputs", "allowedTaskTypes", "sandboxExternalCalls"});
+        groups.put("Security & Safety", new String[]{"enableSecurityChecks", "validateTaskInputs", "sandboxExternalCalls"});
         groups.put("Fixes", new String[]{"enableGcHints"});
         groups.put("Debug Settings", new String[]{"debug", "debugShowTimings", "debugShowThreading", "debugSaveToFile", "debugLogFile", "debugMaxLogSizeMb"});
         groups.put("Experimental Features", new String[]{"enableExperimentalFeatures"});

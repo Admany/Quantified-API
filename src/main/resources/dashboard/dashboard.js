@@ -2,7 +2,7 @@ import React from "https://esm.sh/react@18.3.1";
 import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
 import htm from "https://esm.sh/htm@3.1.1";
 
-const { useCallback, useEffect, useMemo, useState } = React;
+const { useCallback, useEffect, useMemo, useRef, useState } = React;
 const html = htm.bind(React.createElement);
 
 const NAV_ITEMS = [
@@ -25,7 +25,12 @@ async function fetchJson(url, options) {
         ...(options && options.headers),
     };
 
-    const response = await fetch(url, fetchOptions);
+    let response;
+    try {
+        response = await fetch(url, fetchOptions);
+    } catch (err) {
+        throw new Error("The API has disconnected or shut down.");
+    }
     const text = await response.text();
     let payload = {};
     if (text) {
@@ -232,6 +237,22 @@ function formatMillis(value) {
     return `${Math.round(value)} ms`;
 }
 
+function escapeRegex(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function cleanDiskLabel(disk) {
+    const raw = String(disk?.name || " Physical Disk");
+    let cleaned = raw;
+    if (disk?.serial) {
+        const serialPattern = new RegExp(`${escapeRegex(disk.serial)}\\.?$`, "i");
+        cleaned = cleaned.replace(serialPattern, "");
+    }
+    cleaned = cleaned.replace(/\s*[a-f0-9]{4}(?:_[a-f0-9]{4}){2,}\.?$/i, "");
+    cleaned = cleaned.replace(/\s{2,}/g, " ").trim();
+    return cleaned || raw;
+}
+
 function getHintIcon(hint) {
     const message = hint.message.toLowerCase();
     if (message.includes("overheating") || message.includes("choking") || message.includes("close to safety guardrails") || message.includes("cpu load > 80%")) {
@@ -344,13 +365,29 @@ const App = () => {
     const [history, setHistory] = useState([]);
     const [lastUpdated, setLastUpdated] = useState(null);
     const [activeView, setActiveView] = useState("overview");
+    const [themeOverride, setThemeOverride] = useState(() => {
+        if (typeof window === "undefined") return null;
+        const saved =
+            window.localStorage.getItem("quantifiedThemeMode") ||
+            window.localStorage.getItem("quantifiedThemeOverride") ||
+            window.localStorage.getItem("quantifiedTheme");
+        if (saved === "light" || saved === "dark") return saved;
+        return null;
+    });
+    const [theme, setTheme] = useState(() => {
+        if (typeof window === "undefined") return "light";
+        if (themeOverride === "dark" || themeOverride === "light") return themeOverride;
+        return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    });
     const [resourceData, setResourceData] = useState(null);
     const [resourceBusy, setResourceBusy] = useState(false);
     const [selectedFiles, setSelectedFiles] = useState(() => new Set());
     const [configGroups, setConfigGroups] = useState([]);
     const [configEdits, setConfigEdits] = useState({});
     const [configLoading, setConfigLoading] = useState(false);
-    const [configSaving, setConfigSaving] = useState(false);
+    const [toasts, setToasts] = useState([]);
+    const toastIdRef = useRef(0);
+    const configSaveTimers = useRef(new Map());
 
     const [loadingState, setLoadingState] = useState({
         isLoading: true,
@@ -361,6 +398,37 @@ const App = () => {
         deadlineHit: false,
         loadError: null,
     });
+
+    const removeToast = useCallback((id) => {
+        setToasts((prev) => prev.filter((toast) => toast.id !== id));
+    }, []);
+
+    const pushToast = useCallback((message, tone = "info", duration = 2600) => {
+        const id = ++toastIdRef.current;
+        setToasts((prev) => [...prev, { id, message, tone }]);
+        if (duration > 0) {
+            setTimeout(() => removeToast(id), duration);
+        }
+        return id;
+    }, [removeToast]);
+
+    const formatFetchError = useCallback((err, fallback) => {
+        const message = err && err.message ? err.message : "";
+        if (message === "Failed to fetch" || message === "NetworkError") {
+            return "The API has disconnected or shut down.";
+        }
+        return message || fallback || "Request failed.";
+    }, []);
+
+    const disconnectToastRef = useRef(0);
+
+    const maybeToastDisconnect = useCallback((message) => {
+        if (!message || !message.toLowerCase().includes("api has disconnected")) return;
+        const now = Date.now();
+        if (now - disconnectToastRef.current < 12000) return;
+        disconnectToastRef.current = now;
+        pushToast(message, "error", 4200);
+    }, [pushToast]);
 
     const loadAll = useCallback(async () => {
         try {
@@ -401,8 +469,17 @@ const App = () => {
             const modsCacheSizeNow = Number(nextState?.modsCacheSize ?? Math.max(0, totalCacheSize - stressCacheSize));
             const cpuSystemLoad = Number(snapshot.cpuSystemLoad ?? nextState?.cpuSystemLoad ?? 0);
             const gpuVramBudgetBytes = Number(snapshot.gpuVramBudgetBytes ?? nextState?.gpuVramBudgetBytes ?? 0);
-            const gpuVramUsedBytes = Number(snapshot.gpuVramUsedBytes ?? nextState?.gpuVramUsedBytes ?? 0);
-            const gpuMemoryRatio = gpuVramBudgetBytes > 0 ? Math.max(0, Math.min(1, gpuVramUsedBytes / Math.max(1, gpuVramBudgetBytes))) : Number(snapshot.gpuMemoryUtil ?? 0);
+            const gpuVramUsedBytes = Number(nextState?.gpuVramUsedBytes ?? snapshot.gpuVramUsedBytes ?? 0);
+            const gpuMemoryRatio =
+                gpuVramBudgetBytes > 0
+                    ? Math.max(0, Math.min(1, gpuVramUsedBytes / Math.max(1, gpuVramBudgetBytes)))
+                    : Number(snapshot.gpuMemoryUtil ?? 0);
+            const gpuVramTelemetryBytes = Number(nextState?.gpuVramUsedTelemetryBytes ?? snapshot.gpuVramUsedBytes ?? 0);
+            const gpuVramCacheBytes = Number(nextState?.gpuVramCacheBytes ?? 0);
+            const gpuVramTaskBytes = Number(nextState?.gpuVramTaskBytes ?? 0);
+            const gpuVramContextBytes = Number(
+                nextState?.gpuVramContextBytes ?? Math.max(0, gpuVramTelemetryBytes - gpuVramCacheBytes - gpuVramTaskBytes)
+            );
             const modsPacketsSent = Number(nextState?.modsPacketsSent ?? 0);
             const modsPacketsReceived = Number(nextState?.modsPacketsReceived ?? 0);
             const modsNetworkErrors = Number(nextState?.modsNetworkErrors ?? 0);
@@ -430,6 +507,10 @@ const App = () => {
                 cpuSystemLoad,
                 gpuVramBudgetBytes,
                 gpuVramUsedBytes,
+                gpuVramTelemetryBytes,
+                gpuVramCacheBytes,
+                gpuVramTaskBytes,
+                gpuVramContextBytes,
                 cacheRamBytes: Number(nextState?.cacheRamBytes ?? 0),
                 cacheDiskBytes: Number(nextState?.cacheDiskBytes ?? 0),
                 cacheEntryCount: Number(nextState?.cacheEntryCount ?? totalCacheSize),
@@ -463,14 +544,15 @@ const App = () => {
             }));
         } catch (err) {
             console.error("Initial load failed:", err);
-            const customMessage = err.message === "Failed to fetch" ? "The game has shut down or there are connection issues with the API" : err.message || "Failed to load dashboard data";
+            const customMessage = formatFetchError(err, "Failed to load dashboard data");
             setLoadingState((prev) => ({
                 ...prev,
                 loadError: customMessage,
                 hasInitialData: false,
             }));
+            maybeToastDisconnect(customMessage);
         }
-    }, []);
+    }, [formatFetchError, maybeToastDisconnect]);
 
     const loadModStats = useCallback(
         async (modId) => {
@@ -621,6 +703,37 @@ const App = () => {
             fetchConfigLayout();
         }
     }, [activeView, configLoading, configGroups.length, fetchConfigLayout]);
+
+    useEffect(() => {
+        const boot = typeof document !== "undefined" ? document.getElementById("boot-overlay") : null;
+        if (boot && boot.parentNode) {
+            boot.parentNode.removeChild(boot);
+        }
+    }, []);
+
+    useEffect(() => {
+        if (typeof window === "undefined") return undefined;
+        if (themeOverride) return undefined;
+        const media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+        if (!media) return undefined;
+        const apply = () => setTheme(media.matches ? "dark" : "light");
+        apply();
+        if (media.addEventListener) {
+            media.addEventListener("change", apply);
+            return () => media.removeEventListener("change", apply);
+        }
+        media.addListener(apply);
+        return () => media.removeListener(apply);
+    }, [themeOverride]);
+
+    useEffect(() => {
+        if (typeof document === "undefined") return;
+        document.documentElement.dataset.theme = theme;
+        if (typeof window !== "undefined") {
+            const mode = themeOverride ? themeOverride : "auto";
+            window.localStorage.setItem("quantifiedThemeMode", mode);
+        }
+    }, [theme, themeOverride]);
 
     const updateToggles = useCallback(
         async (patch) => {
@@ -827,28 +940,104 @@ const App = () => {
         [selectedFiles]
     );
 
-    const saveConfigChanges = useCallback(async () => {
-        const entries = Object.entries(configEdits).map(([key, value]) => ({ key, value }));
-        if (!entries.length) {
-            return;
+    const updateConfigGroupValue = useCallback((key, value) => {
+        setConfigGroups((groups) => groups.map((group) => {
+            if (!group.fields) return group;
+            const fields = group.fields.map((field) => {
+                if (field.key !== key) return field;
+                return { ...field, value };
+            });
+            return { ...group, fields };
+        }));
+    }, []);
+
+    const normalizeDeviceName = useCallback((name) => {
+        return String(name || "").toLowerCase().replace(/\s+/g, " ").trim();
+    }, []);
+
+    const waitForGpuSwitch = useCallback(async (expectedName) => {
+        const deadline = Date.now() + 15000;
+        let lastState = null;
+        const expected = normalizeDeviceName(expectedName);
+        while (Date.now() < deadline) {
+            const state = await fetchJson("/api/v1/dashboard/state");
+            lastState = state;
+            const active = normalizeDeviceName(state.openclDeviceName);
+            if (state.openclAvailable === false && state.openclFailureReason) {
+                return { ok: false, deviceName: state.openclDeviceName || "", reason: state.openclFailureReason };
+            }
+            if (state.openclAvailable) {
+                if (!expected && active) {
+                    return { ok: true, deviceName: state.openclDeviceName };
+                }
+                if (expected && active && (active.includes(expected) || expected.includes(active))) {
+                    return { ok: true, deviceName: state.openclDeviceName };
+                }
+                if (expected && !active) {
+                    return { ok: true, deviceName: state.openclDeviceName || expectedName };
+                }
+            }
+            await new Promise((resolve) => setTimeout(resolve, 900));
+        }
+        return {
+            ok: false,
+            deviceName: lastState?.openclDeviceName || "",
+            reason: lastState?.openclFailureReason || "Timed out waiting for OpenCL switch",
+        };
+    }, [normalizeDeviceName]);
+
+    const applyConfigUpdate = useCallback(async (key, value, options = {}) => {
+        const isGpu = key === "openclDeviceId";
+        if (isGpu) {
+            pushToast("Applying GPU change...", "info", 2600);
         }
         try {
-            setConfigSaving(true);
             await fetchJson("/api/v1/config", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ entries }),
+                body: JSON.stringify({ entries: [{ key, value }] }),
             });
-            setConfigEdits({});
-            await fetchConfigLayout();
+            updateConfigGroupValue(key, value);
+            setConfigEdits((current) => {
+                const next = { ...current };
+                delete next[key];
+                return next;
+            });
+            if (isGpu) {
+                const expectedName = options.expectedDeviceName || "";
+                const result = await waitForGpuSwitch(expectedName);
+                if (result.ok) {
+                    const label = result.deviceName
+                        ? `GPU change applied - now using ${result.deviceName} for OpenCL tasks.`
+                        : "GPU change applied - OpenCL is ready.";
+                    pushToast(label, "success", 4200);
+                } else {
+                    const detail = result.reason ? ` (${result.reason})` : "";
+                    pushToast(`GPU change failed${detail}`, "error", 4200);
+                }
+            } else {
+                pushToast("Change applied", "success");
+            }
             setError(null);
         } catch (err) {
             console.error(err);
-            setError(err.message || "Failed to save config");
-        } finally {
-            setConfigSaving(false);
+            setError(err.message || "Failed to apply config change");
+            pushToast("Change failed", "error", 3200);
         }
-    }, [configEdits, fetchConfigLayout]);
+    }, [pushToast, updateConfigGroupValue, waitForGpuSwitch]);
+
+    const scheduleConfigUpdate = useCallback((key, value, options = {}) => {
+        const timers = configSaveTimers.current;
+        const delay = typeof options.delay === "number" ? options.delay : 350;
+        if (timers.has(key)) {
+            clearTimeout(timers.get(key));
+        }
+        const timeout = setTimeout(() => {
+            applyConfigUpdate(key, value, options);
+            timers.delete(key);
+        }, delay);
+        timers.set(key, timeout);
+    }, [applyConfigUpdate]);
 
     const clearDiskCache = useCallback(async () => {
         try {
@@ -883,6 +1072,10 @@ const App = () => {
     const cacheEntryCount = Number(state?.cacheEntryCount ?? 0);
     const vramUsedBytes = Number(state?.gpuVramUsedBytes ?? snapshot.gpuVramUsedBytes ?? 0);
     const vramBudgetBytes = Number(state?.gpuVramBudgetBytes ?? snapshot.gpuVramBudgetBytes ?? 0);
+    const vramTelemetryBytes = Number(state?.gpuVramUsedTelemetryBytes ?? snapshot.gpuVramUsedBytes ?? 0);
+    const vramCacheBytes = Number(state?.gpuVramCacheBytes ?? 0);
+    const vramTaskBytes = Number(state?.gpuVramTaskBytes ?? 0);
+    const vramContextBytes = Number(state?.gpuVramContextBytes ?? Math.max(0, vramTelemetryBytes - vramCacheBytes - vramTaskBytes));
     const vramRatio = vramBudgetBytes > 0 ? Math.min(1, vramUsedBytes / Math.max(1, vramBudgetBytes)) : gpuMemory;
     const networkErrors = Number(state?.modsNetworkErrors ?? 0) + Number(state?.stressNetworkErrors ?? 0);
     const networkPackets = Number(state?.modsPacketsSent ?? 0) + Number(state?.stressPacketsSent ?? 0);
@@ -893,6 +1086,25 @@ const App = () => {
     const spotlight = state?.spotlight ?? [];
     const systemInfo = state?.systemInfo ?? {};
     const gpuList = Array.isArray(systemInfo.gpuList) ? systemInfo.gpuList : [];
+    const gpuInventory = useMemo(() => {
+        if (!gpuList.length) return [];
+        const classified = gpuList.map((gpu) => {
+            const vendor = String(gpu.vendor || "").toLowerCase();
+            const vram = Number(gpu.vramBytes || 0);
+            const integrated = vendor.includes("intel") || vram <= 0;
+            return {
+                ...gpu,
+                integrated,
+                typeLabel: integrated ? "Integrated" : "Dedicated",
+                sortKey: integrated ? 0 : 1,
+            };
+        });
+        classified.sort((a, b) => {
+            if (a.sortKey !== b.sortKey) return a.sortKey - b.sortKey;
+            return Number(b.vramBytes || 0) - Number(a.vramBytes || 0);
+        });
+        return classified;
+    }, [gpuList]);
     const storageVolumes = Array.isArray(systemInfo.storage) ? systemInfo.storage : [];
     const physicalDisks = Array.isArray(systemInfo.physicalDisks) ? systemInfo.physicalDisks : [];
     const logs = (state?.apiLogs || []).slice(-300);
@@ -918,7 +1130,7 @@ const App = () => {
 
         const queueVariant = variantFor(queueDepth, queueWarning, queueThreshold);
         const gpuVariant = variantFor(gpuCompute, 0.75, 0.9);
-        const memoryVariant = variantFor(vramRatio, 0.8, 0.95);
+            const memoryVariant = variantFor(vramRatio, 0.8, 0.95);
         const cpuVariant = variantFor(cpuSystemLoad, 0.65, 0.85);
         const cacheVariant = variantFor(diskCacheBytes / Math.max(1, ramCacheBytes + diskCacheBytes), 0.5, 0.75);
         const networkVariant = variantFor(networkErrors / Math.max(1, networkPackets || 1), 0.02, 0.05);
@@ -943,7 +1155,7 @@ const App = () => {
                 badge: formatTemperature(gpuTemperature),
                 variant: gpuVariant === "ok" ? memoryVariant : gpuVariant,
                 detail: `${formatPercent(gpuCompute)} compute`,
-                message: `VRAM ${formatPercent(vramRatio)} of ${formatBytes(vramBudgetBytes || 0)}`,
+                message: `API VRAM ${formatPercent(vramRatio)} of ${formatBytes(vramBudgetBytes || 0)}`,
             },
             {
                 label: "CPU",
@@ -1037,7 +1249,6 @@ const App = () => {
     const caches = resourceData?.caches ?? [];
     const resourceSummary = resourceData?.summary ?? null;
     const selectedCount = selectedFilePayload.length;
-    const configPending = Object.keys(configEdits).length > 0;
     const modColorMap = useMemo(
         () => ({
             map: new Map(),
@@ -1047,10 +1258,10 @@ const App = () => {
         []
     );
 
-    const updateConfigValue = useCallback((key, originalValue, incomingValue) => {
+    const updateConfigValue = useCallback((key, originalValue, incomingValue, options = {}) => {
+        const same = JSON.stringify(incomingValue) === JSON.stringify(originalValue);
         setConfigEdits((current) => {
             const next = { ...current };
-            const same = JSON.stringify(incomingValue) === JSON.stringify(originalValue);
             if (same) {
                 delete next[key];
             } else {
@@ -1058,13 +1269,16 @@ const App = () => {
             }
             return next;
         });
-    }, []);
+        if (!same) {
+            scheduleConfigUpdate(key, incomingValue, options);
+        }
+    }, [scheduleConfigUpdate]);
 
     const renderOverview = () => {
         const apiMeta = [
             { label: "Queue Depth", value: formatNumber(queueDepth), sub: `Soft cap ${formatNumber(queueThreshold)}` },
             { label: "GPU Compute", value: formatPercent(gpuCompute), sub: `Temp ${formatTemperature(gpuTemperature)}` },
-            { label: "VRAM Utilization", value: formatPercent(vramRatio), sub: formatBytes(vramUsedBytes) },
+            { label: "API VRAM (telemetry)", value: formatPercent(vramRatio), sub: formatBytes(vramUsedBytes) },
             { label: "Cache Entries", value: formatNumber(cacheEntryCount), sub: `${formatBytes(ramCacheBytes)} RAM` },
         ];
         const modOptions = mods.map((mod) => html`<option key=${mod.selectValue} value=${mod.selectValue}>${mod.displayLabel}</option>`);
@@ -1116,8 +1330,8 @@ const App = () => {
             <${Card} title="Component Status">
                 <${StatusBoard} entries=${statusEntries} />
             </${Card}>
-            <div className="card-grid three">
-                <${Card} title="GPU Activity">
+              <div className="card-grid three">
+                  <${Card} title="GPU Activity">
                     <div className="chart-pane">
                         <${MultiLineChart}
                             series=${[
@@ -1128,13 +1342,24 @@ const App = () => {
                             max=${1}
                         />
                     </div>
-                    <div className="metrics-row">
-                        <${Metric} label="Compute" value=${formatPercent(gpuCompute)} sub="Current load" />
-                        <${Metric} label="Memory" value=${formatPercent(vramRatio)} sub="VRAM usage" />
-                        <${Metric} label="Temperature" value=${formatTemperature(gpuTemperature)} sub="GPU Sensors" />
-                    </div>
-                </${Card}>
-                <${Card} title="Cache Footprint">
+                      <div className="metrics-row">
+                          <${Metric} label="Compute" value=${formatPercent(gpuCompute)} sub="Current load" />
+                          <${Metric} label="API VRAM (telemetry)" value=${formatPercent(vramRatio)} sub="Context excluded" />
+                          <${Metric} label="Temperature" value=${formatTemperature(gpuTemperature)} sub="GPU Sensors" />
+                      </div>
+                  </${Card}>
+                  <${Card} title="GPU Memory Breakdown">
+                      <div className="metrics-row">
+                          <${Metric} label="Cache VRAM" value=${formatBytes(vramCacheBytes)} sub="Tiered GPU cache" />
+                          <${Metric} label="In-flight tasks" value=${formatBytes(vramTaskBytes)} sub="Estimated usage" />
+                          <${Metric} label="OpenCL context" value=${formatBytes(vramContextBytes)} sub="Ignored in API VRAM" />
+                      </div>
+                      <div className="breakdown-note">How this is calculated</div>
+                      <p className="text-muted">
+                          We start with the GPU's reported VRAM use, then subtract what Quantified is actively caching and what tasks are using right now. Anything left is treated as OpenCL context overhead and isn't counted toward the API VRAM ratio.
+                      </p>
+                  </${Card}>
+                  <${Card} title="Cache Footprint">
                     <div className="chart-pane">
                         <${MultiLineChart}
                             series=${[
@@ -1247,11 +1472,11 @@ const App = () => {
                       value: formatNumber(resourceSummary.queueDepth ?? 0),
                       sub: `Warn @ ${formatNumber(queueThreshold)}`,
                   },
-                  {
-                      label: "VRAM",
+                    {
+                      label: "API VRAM (telemetry)",
                       value: `${formatBytes(resourceSummary.vramUsedBytes ?? 0)} / ${formatBytes(resourceSummary.vramBudgetBytes ?? 0)}`,
                       sub: formatPercent((resourceSummary.vramUsedBytes || 0) / Math.max(1, resourceSummary.vramBudgetBytes || 1)),
-                  },
+                    },
                   { label: "RAM Cache", value: formatBytes(resourceSummary.cacheRamBytes ?? 0), sub: "Heap usage" },
                   { label: "Disk Cache", value: formatBytes(resourceSummary.cacheDiskBytes ?? 0), sub: "Persistent usage" },
               ]
@@ -1438,9 +1663,8 @@ const App = () => {
     const toggleDefinitions = [
         { key: "developerMode", label: "Developer Mode", description: "Expose experimental instrumentation" },
         { key: "dashboardEnabled", label: "Dashboard Server", description: "Serve this panel" },
-        { key: "overlayEnabled", label: "In-Game Overlay", description: "HUD overlay sampling" },
-        { key: "timelineEnabled", label: "Timeline Capture", description: "Record overlay timeline" },
-        { key: "replayEnabled", label: "Replay Frames", description: "Allow overlay playback" },
+        { key: "timelineEnabled", label: "Timeline Capture", description: "Record telemetry timeline" },
+        { key: "replayEnabled", label: "Replay Frames", description: "Allow telemetry playback" },
         { key: "stressTestEnabled", label: "Stress Harness", description: "Keep stress testing utilities active" },
         { key: "modSpotlightEnabled", label: "Mod Spotlight", description: "Highlight heavy mods automatically" },
     ];
@@ -1534,8 +1758,34 @@ const App = () => {
                                         <${ToggleRow}
                                             label=""
                                             value=${Boolean(value)}
-                                            onChange=${(next) => updateConfigValue(field.key, originalValue, next)}
+                                            onChange=${(next) => updateConfigValue(field.key, originalValue, next, { delay: 0 })}
                                         />
+                                    </div>`;
+                                }
+                                if (field.type === "select") {
+                                    const options = Array.isArray(field.options) ? field.options : [];
+                                    const hasCurrent = options.some((option) => option.value === value);
+                                    const mergedOptions = hasCurrent || value == null
+                                        ? options
+                                        : [{ value, label: `${value} (current)` }, ...options];
+                                    return html`<div className="config-field" key=${field.key}>
+                                        <div className="config-label">
+                                            <strong>${field.label}</strong>
+                                            ${field.comment ? html`<p className="config-comment">${field.comment}</p>` : null}
+                                        </div>
+                                        <select
+                                            value=${value ?? ""}
+                                            onChange=${(event) => {
+                                                const nextValue = event.target.value;
+                                                const selected = mergedOptions.find((option) => option.value === nextValue);
+                                                const expectedDeviceName = field.key === "openclDeviceId" && selected && nextValue !== "auto"
+                                                    ? String(selected.label || "").split(" (")[0].trim()
+                                                    : "";
+                                                updateConfigValue(field.key, originalValue, nextValue, { delay: 0, expectedDeviceName });
+                                            }}
+                                        >
+                                            ${mergedOptions.map((option) => html`<option value=${option.value}>${option.label}</option>`)}
+                                        </select>
                                     </div>`;
                                 }
                                 if (field.type === "number") {
@@ -1546,7 +1796,7 @@ const App = () => {
                                         </div>
                                         <${NumericInput}
                                             value=${Number(value ?? 0)}
-                                            onCommit=${(next) => updateConfigValue(field.key, originalValue, next)}
+                                            onCommit=${(next) => updateConfigValue(field.key, originalValue, next, { delay: 0 })}
                                         />
                                     </div>`;
                                 }
@@ -1565,7 +1815,7 @@ const App = () => {
                                                     .split(/\r?\n/)
                                                     .map((line) => line.trim())
                                                     .filter(Boolean);
-                                                updateConfigValue(field.key, originalValue, next);
+                                                updateConfigValue(field.key, originalValue, next, { delay: 650 });
                                             }}
                                         ></textarea>
                                     </div>`;
@@ -1578,7 +1828,7 @@ const App = () => {
                                     <input
                                         type="text"
                                         value=${value ?? ""}
-                                        onInput=${(event) => updateConfigValue(field.key, originalValue, event.target.value)}
+                                        onInput=${(event) => updateConfigValue(field.key, originalValue, event.target.value, { delay: 650 })}
                                     />
                                 </div>`;
                             })}
@@ -1587,11 +1837,7 @@ const App = () => {
                 })}
             </div>
             <div className="config-actions">
-                <button className="btn btn-primary" disabled=${!configPending || configSaving} onClick=${saveConfigChanges}>
-                    ${configSaving ? "Saving..." : "Save Changes"}
-                </button>
-                <button className="btn btn-secondary" disabled=${configSaving} onClick=${fetchConfigLayout}>Reload Layout</button>
-                <button className="btn btn-ghost" disabled=${!configPending || configSaving} onClick=${() => setConfigEdits({})}>Reset</button>
+                <button className="btn btn-secondary" onClick=${fetchConfigLayout}>Reload Layout</button>
             </div>
         </section>`;
     };
@@ -1612,8 +1858,24 @@ const App = () => {
                 </${Card}>
                 <${Card} title="Sensors">
                     <div className="metrics-row">
-                        <${Metric} label="CPU Temp" value=${formatTemperature(systemInfo.cpuTemperature)} sub="Reported by OSHI" />
-                        <${Metric} label="GPU Temp" value=${formatTemperature(systemInfo.gpuTemperature)} sub="Overlay snapshot" />
+                        <${Metric}
+                            label="CPU Temp"
+                            value=${Number.isFinite(systemInfo.cpuTemperature) && systemInfo.cpuTemperature > 0
+                                ? formatTemperature(systemInfo.cpuTemperature)
+                                : "N/A"}
+                            sub=${Number.isFinite(systemInfo.cpuTemperature) && systemInfo.cpuTemperature > 0
+                                ? "Reported by OSHI"
+                                : "No sensor data"}
+                        />
+                        <${Metric}
+                            label="GPU Temp"
+                            value=${Number.isFinite(systemInfo.gpuTemperature) && systemInfo.gpuTemperature > 0
+                                ? formatTemperature(systemInfo.gpuTemperature)
+                                : "N/A"}
+                            sub=${Number.isFinite(systemInfo.gpuTemperature) && systemInfo.gpuTemperature > 0
+                                ? "Overlay snapshot"
+                                : "No sensor data"}
+                        />
                         <${Metric} label="RAM Used" value=${formatBytes(ramUsed)} sub=${`${formatBytes(ramTotal)} total`} />
                         <${Metric} label="RAM Free" value=${formatBytes(ramAvailable)} sub="Available" />
                     </div>
@@ -1621,52 +1883,53 @@ const App = () => {
             </div>
             <div className="card-grid two">
                 <${Card} title="GPU Inventory">
-                    ${gpuList.length
+                    ${gpuInventory.length
                         ? html`<div className="list">
-                              ${gpuList.map(
+                              ${gpuInventory.map(
                                   (gpu, idx) => html`<div className="list-row" key=${idx}>
-                                      <div>
-                                          <strong>${gpu.name}</strong>
-                                          <div className="text-muted">${gpu.vendor}</div>
-                                      </div>
-                                      <span>${formatBytes(gpu.vramBytes || 0)}</span>
-                                  </div>`
-                              )}
-                          </div>`
+                                        <div>
+                                            <strong>GPU ${idx} (${gpu.typeLabel})</strong>
+                                            <div>${gpu.name}</div>
+                                            <div className="text-muted">${gpu.vendor}</div>
+                                        </div>
+                                        <span>${formatBytes(gpu.vramBytes || 0)}</span>
+                                    </div>`
+                                )}
+                            </div>`
                         : html`<p className="text-muted">GPU inventory not reported by OSHI.</p>`}
                 </${Card}>
                 <${Card} title="Storage">
                     ${storageVolumes.length
                         ? html`<div className="list">
                               ${storageVolumes.map(
-                                  (drive, idx) => html`<div className="list-row" key=${idx}>
-                                      <div>
-                                          <strong>${drive.path || drive.name || drive.serial}</strong>
-                                          <span className="text-muted">${drive.type || "Volume"}</span>
-                                      </div>
-                                      <div className="stacked">
-                                          <span>${drive.total || formatBytes(drive.sizeBytes || 0)} total</span>
-                                          <span className="text-muted">${drive.free || "-"} free</span>
-                                      </div>
-                                  </div>`
-                              )}
-                          </div>`
+                                    (drive, idx) => html`<div className="list-row" key=${idx}>
+                                        <div>
+                                            <strong>${drive.path || drive.name || drive.serial}</strong>
+                                            <span className="text-muted">${drive.type || "Volume"}</span>
+                                        </div>
+                                        <div className="stacked right">
+                                            <span>${drive.total || formatBytes(drive.sizeBytes || 0)} total</span>
+                                            <span className="text-muted">${drive.free || "-"} free</span>
+                                        </div>
+                                    </div>`
+                                )}
+                            </div>`
                         : html`<p className="text-muted">Volume details unavailable.</p>`}
                     ${physicalDisks.length
                         ? html`<div className="list dense">
-                              ${physicalDisks.map(
-                                  (disk, idx) => html`<div className="list-row" key=${`disk-${idx}`}>
-                                      <div>
-                                          <strong>${disk.name || "Physical Disk"}</strong>
-                                          <span className="text-muted">${disk.serial || ""}</span>
-                                      </div>
-                                      <div className="stacked">
-                                          <span>${formatBytes(disk.sizeBytes || 0)}</span>
-                                          <span className="text-muted">${formatNumber(disk.reads || 0)} reads / ${formatNumber(disk.writes || 0)} writes</span>
-                                      </div>
-                                  </div>`
-                              )}
-                          </div>`
+                                ${physicalDisks.map(
+                                    (disk, idx) => html`<div className="list-row" key=${`disk-${idx}`}>
+                                        <div>
+                                            <strong>${cleanDiskLabel(disk)}</strong>
+                                            <span className="text-muted">Physical disk</span>
+                                        </div>
+                                        <div className="stacked right">
+                                            <span>${formatBytes(disk.sizeBytes || 0)}</span>
+                                            <span className="text-muted">${formatNumber(disk.reads || 0)} reads / ${formatNumber(disk.writes || 0)} writes</span>
+                                        </div>
+                                    </div>`
+                                )}
+                            </div>`
                         : null}
                 </${Card}>
             </div>
@@ -1680,7 +1943,7 @@ const App = () => {
                     />
                 </div>
                 <div className="chart-legend">
-                    <span>VRAM usage (GB)</span>
+                    <span>API VRAM (GB)</span>
                     <span>Budget (GB)</span>
                 </div>
                 <div className="chart-pane">
@@ -1728,10 +1991,63 @@ const App = () => {
           </div>`
         : null;
 
-    return html`<div className="dashboard-shell">
+      const applyThemeOverride = (value) => {
+          if (value === "auto") {
+              setThemeOverride(null);
+              if (typeof window !== "undefined" && window.matchMedia) {
+                  const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+                  setTheme(prefersDark ? "dark" : "light");
+              }
+              return;
+          }
+          setThemeOverride(value);
+          setTheme(value);
+      };
+
+      return html`<div className="dashboard-shell">
+          <div className="theme-toggle">
+              <button
+                  className=${`theme-toggle__btn ${theme === "light" ? "active" : ""}`}
+                  onClick=${() => applyThemeOverride("light")}
+                  aria-label="Use light theme"
+                  title="Light theme"
+              >
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                      <circle cx="12" cy="12" r="4.5"></circle>
+                      <path d="M12 2.5v2.5M12 19v2.5M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M2.5 12h2.5M19 12h2.5M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"></path>
+                  </svg>
+              </button>
+              <button
+                  className=${`theme-toggle__btn ${theme === "dark" ? "active" : ""}`}
+                  onClick=${() => applyThemeOverride("dark")}
+                  aria-label="Use dark theme"
+                  title="Dark theme"
+              >
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                      <path d="M20.5 14.7a7.8 7.8 0 0 1-10.2-10.2 8.6 8.6 0 1 0 10.2 10.2z"></path>
+                  </svg>
+              </button>
+              <button
+                  className=${`theme-toggle__btn ${themeOverride ? "" : "active"}`}
+                  onClick=${() => applyThemeOverride("auto")}
+                  aria-label="Use system theme"
+                  title="System theme"
+              >
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                      <path d="M3 5.5h18M6 9h12M8 12.5h8M6 16h12M9 19.5h6"></path>
+                  </svg>
+              </button>
+        </div>
         ${overlay}
+        <div className="toast-stack">
+            ${toasts.map((toast) => html`
+                <div className=${`toast toast-${toast.tone || "info"}`} key=${toast.id}>
+                    ${toast.message}
+                </div>
+            `)}
+        </div>
         <div className="dashboard-layout">
-            <${Sidebar} activeView=${activeView} onSelect=${setActiveView} statusEntries=${statusEntries} />
+              <${Sidebar} activeView=${activeView} onSelect=${setActiveView} statusEntries=${statusEntries} />
             <main className="main-panel">
                 <header className="main-header">
                     <div>

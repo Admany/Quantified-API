@@ -18,9 +18,11 @@ public final class OpenCLTestTask extends OpenCLTask<String> {
     private static final float[] TEST_VECTOR_A = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
     private static final float[] TEST_VECTOR_B = {5.0f, 4.0f, 3.0f, 2.0f, 1.0f};
     private static final float[] EXPECTED_RESULT = {6.0f, 6.0f, 6.0f, 6.0f, 6.0f};
+    private final boolean quiet;
 
     private OpenCLTestTask(Builder builder) {
         super(builder);
+        this.quiet = builder.quiet;
     }
 
     @Override
@@ -36,7 +38,9 @@ public final class OpenCLTestTask extends OpenCLTask<String> {
 
     @Override
     public String executeOnGPU(OpenCLContext context) {
-        LOGGER.info("Executing OpenCL vector addition test on GPU");
+        if (!quiet) {
+            LOGGER.info("Executing OpenCL vector addition test on GPU");
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             // Create buffers
             long bufferA = context.createBuffer(CL10.CL_MEM_READ_ONLY,
@@ -97,20 +101,30 @@ public final class OpenCLTestTask extends OpenCLTask<String> {
             context.releaseKernel(kernel);
 
             String result = success ? "PASSED" : "FAILED";
-            LOGGER.info("OpenCL GPU test result: " + result);
+            if (!quiet) {
+                LOGGER.info("OpenCL GPU test result: " + result);
+            }
             return result;
 
         } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "OpenCL GPU test execution failed, falling back to CPU", e);
+            if (!quiet) {
+                LOGGER.log(Level.WARNING, "OpenCL GPU test execution failed, falling back to CPU", e);
+            }
             // Fallback to CPU verification
             return cpuFallback().get();
         }
     }
 
     public static final class Builder extends OpenCLTask.Builder<String> {
+        private boolean quiet;
 
         public Builder(String modId, String name, long taskKey, Supplier<String> cpuFallback) {
             super(modId, name, taskKey, cpuFallback);
+        }
+
+        public Builder quiet(boolean quiet) {
+            this.quiet = quiet;
+            return this;
         }
 
         @Override
@@ -120,8 +134,14 @@ public final class OpenCLTestTask extends OpenCLTask<String> {
     }
 
     public static Builder create(String modId, String name, long taskKey) {
+        return create(modId, name, taskKey, false);
+    }
+
+    public static Builder create(String modId, String name, long taskKey, boolean quiet) {
         Supplier<String> cpuFallback = () -> {
-            LOGGER.info("Executing OpenCL test verification on CPU (fallback)");
+            if (!quiet) {
+                LOGGER.info("Executing OpenCL test verification on CPU (fallback)");
+            }
             boolean success = true;
             for (int i = 0; i < TEST_VECTOR_A.length; i++) {
                 float actual = TEST_VECTOR_A[i] + TEST_VECTOR_B[i];
@@ -132,9 +152,11 @@ public final class OpenCLTestTask extends OpenCLTask<String> {
                 }
             }
             String result = success ? "PASSED (CPU fallback)" : "FAILED (CPU fallback)";
-            LOGGER.info("OpenCL CPU fallback test result: " + result);
+            if (!quiet) {
+                LOGGER.info("OpenCL CPU fallback test result: " + result);
+            }
             return result;
         };
-        return new Builder(modId, name, taskKey, cpuFallback);
+        return new Builder(modId, name, taskKey, cpuFallback).quiet(quiet);
     }
 }

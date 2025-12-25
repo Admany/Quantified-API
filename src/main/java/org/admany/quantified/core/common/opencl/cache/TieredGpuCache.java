@@ -222,6 +222,15 @@ public final class TieredGpuCache {
         }
     }
 
+    public long getVramUsageBytes() {
+        lock.lock();
+        try {
+            return vramUsageBytes;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     public void shutdown() {
         lock.lock();
         try {

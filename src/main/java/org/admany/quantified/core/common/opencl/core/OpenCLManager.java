@@ -1,6 +1,7 @@
 package org.admany.quantified.core.common.opencl.core;
 
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
+import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.opencl.cache.TieredGpuCache;
 import org.admany.quantified.core.common.opencl.cache.TieredGpuCache.CacheHit;
 import org.admany.quantified.core.common.opencl.gpu.AsyncProbeScheduler;
@@ -37,6 +38,9 @@ public final class OpenCLManager {
         t.setDaemon(true);
         return t;
     });
+    private static final Object probeMutex = new Object();
+    private static final java.util.concurrent.atomic.AtomicReference<String> forcedDeviceId =
+        new java.util.concurrent.atomic.AtomicReference<>(null);
 
     private OpenCLManager() {}
 
@@ -107,6 +111,16 @@ public final class OpenCLManager {
         return cache != null && cache.has(modId, key);
     }
 
+    public static long cacheVramUsageBytes() {
+        TieredGpuCache cache = tieredCache;
+        return cache != null ? cache.getVramUsageBytes() : 0L;
+    }
+
+    public static long activeTaskVramBytes() {
+        GPUMonitor current = monitor;
+        return current != null ? current.estimatedActiveVramBytes() : 0L;
+    }
+
     public static void cacheRemove(String modId, String key) {
         TieredGpuCache cache = tieredCache;
         if (cache != null) cache.remove(modId, key);
@@ -115,7 +129,7 @@ public final class OpenCLManager {
     public static CompletableFuture<Boolean> forceProbe() {
         return CompletableFuture.supplyAsync(() -> {
             try {
-                return performProbe();
+                return performProbe(ProbeOptions.standard(), getPreferredDeviceId());
             } catch (Throwable t) {
                 String failureMsg = "Failed to initialize OpenCL acceleration: " + t.getMessage();
                 LOGGER.log(Level.WARNING, "Force probe: " + failureMsg, t);
@@ -129,7 +143,7 @@ public final class OpenCLManager {
 
     public static boolean forceProbeSynchronous() {
         try {
-            return performProbe();
+            return performProbe(ProbeOptions.standard(), getPreferredDeviceId());
         } catch (Throwable t) {
             String failureMsg = "Failed to initialize OpenCL acceleration: " + t.getMessage();
             LOGGER.log(Level.WARNING, "Force probe: " + failureMsg, t);
@@ -140,26 +154,30 @@ public final class OpenCLManager {
         }
     }
 
-    private static boolean performProbe() throws Exception {
+    private static boolean performProbe(ProbeOptions options, String preferredDeviceId) throws Exception {
         OpenCLRuntime.AvailabilitySnapshot runtime = OpenCLRuntime.snapshot();
         if (!runtime.available()) {
             String reason = runtime.failureReason() != null ? runtime.failureReason() : "OpenCL runtime unavailable";
             String failureMsg = "OpenCL runtime unavailable: " + reason + " (binding: " + OpenCLRuntime.getBindingName() + ")";
             LOGGER.fine("Force probe: " + failureMsg);
-            DeveloperOverlayManager.recordApiLog("[OpenCL] Probe skipped - " + failureMsg);
+            if (options.recordOverlayLogs()) {
+                DeveloperOverlayManager.recordApiLog("[OpenCL] Probe skipped - " + failureMsg);
+            }
             lastRuntimeStatus = RuntimeStatus.failed(failureMsg);
             return false;
         }
 
         var status = HardwareDetector.detailedDetect();
-        capabilities = GPUDetector.detectCapabilities();
+        capabilities = GPUDetector.detectCapabilities(preferredDeviceId);
 
         if (!status.isOpenCLAvailable() || !status.isGPUAvailable()) {
             String failureMsg = String.format("OpenCL/GPU not available: OpenCL=%.0f%%, GPU=%.0f%%. Context test: %s",
                 status.getOpenCLConfidence() * 100, status.getGPUConfidence() * 100,
                 status.getDetectionResults().contextCreationSuccessful ? "passed" : "failed");
             LOGGER.fine("Force probe: " + failureMsg);
-            DeveloperOverlayManager.recordApiLog("[OpenCL] Probe failed - " + failureMsg);
+            if (options.recordOverlayLogs()) {
+                DeveloperOverlayManager.recordApiLog("[OpenCL] Probe failed - " + failureMsg);
+            }
             lastRuntimeStatus = RuntimeStatus.failed(failureMsg);
             return false;
         }
@@ -167,7 +185,9 @@ public final class OpenCLManager {
         if (!OpenCLRuntime.ensureInitialised()) {
             String failureMsg = "OpenCL runtime failed to initialize: " + OpenCLRuntime.lastError();
             LOGGER.warning("Force probe: " + failureMsg);
-            DeveloperOverlayManager.recordApiLog("[OpenCL] Runtime init failed - " + failureMsg);
+            if (options.recordOverlayLogs()) {
+                DeveloperOverlayManager.recordApiLog("[OpenCL] Runtime init failed - " + failureMsg);
+            }
             lastRuntimeStatus = RuntimeStatus.failed(failureMsg);
             return false;
         }
@@ -184,19 +204,26 @@ public final class OpenCLManager {
         OpenCLTaskManager.setDependencies(monitor, context, tieredCache);
 
         lastRuntimeStatus = RuntimeStatus.available();
-        runTestTask();
+        if (options.runTestTask()) {
+            runTestTask(options.quietTest());
+        }
 
         LOGGER.info("Force probe: OpenCL acceleration initialized successfully for: " + capabilities.device().name());
-        DeveloperOverlayManager.recordApiLog("[OpenCL] Acceleration ready - " + capabilities.device().name());
+        if (options.recordOverlayLogs()) {
+            DeveloperOverlayManager.recordApiLog("[OpenCL] Acceleration ready - " + capabilities.device().name());
+        }
         return true;
     }
 
-    private static void runTestTask() {
+    private static void runTestTask(boolean quiet) {
         try {
             if (!org.admany.quantified.core.common.async.core.AsyncManager.isInitialised()) return;
 
-            OpenCLTestTask testTask = OpenCLTestTask.create("quantified.core", "OpenCL Test", System.nanoTime()).build();
+            OpenCLTestTask testTask = OpenCLTestTask.create("quantified.core", "OpenCL Test", System.nanoTime(), quiet).build();
             submitTask(testTask).thenAccept(result -> {
+                if (quiet) {
+                    return;
+                }
                 if (result != null && result.startsWith("PASSED")) {
                     LOGGER.info("OpenCL test task succeeded");
                     DeveloperOverlayManager.recordApiLog("[OpenCL] Test SUCCEEDED");
@@ -205,11 +232,89 @@ public final class OpenCLManager {
                     DeveloperOverlayManager.recordApiLog("[OpenCL] Test FAILED - " + result);
                 }
             }).exceptionally(throwable -> {
-                LOGGER.warning("OpenCL test task exception: " + throwable.getMessage());
+                if (!quiet) {
+                    LOGGER.warning("OpenCL test task exception: " + throwable.getMessage());
+                }
                 return null;
             });
         } catch (Exception e) {
-            LOGGER.warning("Failed to create/run OpenCL test task: " + e.getMessage());
+            if (!quiet) {
+                LOGGER.warning("Failed to create/run OpenCL test task: " + e.getMessage());
+            }
+        }
+    }
+
+    public static void switchDevice(String preferredDeviceId) {
+        CompletableFuture.runAsync(() -> {
+            synchronized (probeMutex) {
+                try {
+                    if (preferredDeviceId != null && !preferredDeviceId.isBlank()
+                        && !"auto".equalsIgnoreCase(preferredDeviceId.trim())) {
+                        forcedDeviceId.set(preferredDeviceId.trim());
+                    } else {
+                        forcedDeviceId.set(null);
+                    }
+                    cleanupAfterFailure();
+                    initialized.set(true);
+                    boolean ready = performProbe(ProbeOptions.switching(), preferredDeviceId);
+                    String deviceName = (capabilities != null && capabilities.device() != null)
+                        ? capabilities.device().name()
+                        : "Unknown GPU";
+                    boolean ok = ready && runSwitchTest(deviceName);
+                    if (!ok) {
+                        cleanupAfterFailure();
+                        lastRuntimeStatus = RuntimeStatus.failed("OpenCL test failed after GPU switch");
+                    }
+                    recordSwitchLog(deviceName, ok);
+                } catch (Throwable t) {
+                    String deviceName = (capabilities != null && capabilities.device() != null)
+                        ? capabilities.device().name()
+                        : "Unknown GPU";
+                    cleanupAfterFailure();
+                    lastRuntimeStatus = RuntimeStatus.failed("OpenCL switch failed: " + t.getMessage());
+                    recordSwitchLog(deviceName, false);
+                }
+            }
+        }, probeExecutor);
+    }
+
+    private static boolean runSwitchTest(String deviceName) {
+        try {
+            if (!org.admany.quantified.core.common.async.core.AsyncManager.isInitialised()) {
+                OpenCLTestTask testTask = OpenCLTestTask.create("quantified.core", "OpenCL Switch Test", System.nanoTime(), true).build();
+                String result = testTask.executeOnGPU(context);
+                return result != null && result.startsWith("PASSED");
+            }
+            OpenCLTestTask testTask = OpenCLTestTask.create("quantified.core", "OpenCL Switch Test", System.nanoTime(), true).build();
+            String result = submitTask(testTask).get(12, TimeUnit.SECONDS);
+            return result != null && result.startsWith("PASSED");
+        } catch (Exception e) {
+            LOGGER.warning("OpenCL switch test failed on " + deviceName + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    private static void recordSwitchLog(String deviceName, boolean success) {
+        String status = success ? "SUCCEEDED" : "FAILED";
+        DeveloperOverlayManager.recordApiLog("[OpenCL] Switched to " + deviceName + " - " + status);
+    }
+
+    private static String getPreferredDeviceId() {
+        String forced = forcedDeviceId.get();
+        if (forced != null && !forced.isBlank() && !"auto".equalsIgnoreCase(forced.trim())) {
+            return forced.trim();
+        }
+        MultithreadingConfig.Config cfg = MultithreadingConfig.CONFIG;
+        return cfg != null ? cfg.openclDeviceId : null;
+    }
+
+    private record ProbeOptions(boolean recordOverlayLogs, boolean runTestTask, boolean quietTest) {
+        private static ProbeOptions standard() {
+            return new ProbeOptions(true, true, false);
+        }
+
+        private static ProbeOptions switching() {
+            return new ProbeOptions(false, false, true);
         }
     }
 

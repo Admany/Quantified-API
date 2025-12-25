@@ -69,12 +69,16 @@ public final class HardwareDetector {
         }
 
         GPUDetector.GPUCapabilities gpuCaps = GPUDetector.GPUCapabilities.UNSUPPORTED;
-        if (results.lwjglAvailable && results.openclRuntimeAvailable && results.meetsVramRequirement) {
+        String preferredDeviceId = MultithreadingConfig.CONFIG != null ? MultithreadingConfig.CONFIG.openclDeviceId : null;
+        if (results.lwjglAvailable && results.openclRuntimeAvailable) {
             try {
-                gpuCaps = GPUDetector.detectCapabilities();
+                gpuCaps = GPUDetector.detectCapabilities(preferredDeviceId);
+                results.openclDeviceDetected = gpuCaps.supported();
                 results.opencl32Capable = gpuCaps.supported() && gpuCaps.supportsOpenCL32();
-                if (!results.opencl32Capable) {
-                    results.failureReason = "No OpenCL 3.2 capable device found";
+                if (!results.openclDeviceDetected) {
+                    results.failureReason = gpuCaps.failureReason() != null
+                        ? gpuCaps.failureReason()
+                        : "No OpenCL-capable device found";
                 }
                 if (probeContext) {
                     results.contextCreationSuccessful = gpuCaps.supported();
@@ -192,6 +196,10 @@ public final class HardwareDetector {
                 openclConfidence += 0.25;
                 gpuConfidence += 0.15;
             }
+            if (results.openclDeviceDetected) {
+                openclConfidence = Math.max(openclConfidence, 0.85);
+                gpuConfidence = Math.max(gpuConfidence, 0.85);
+            }
             if (results.contextCreationSuccessful) {
                 openclConfidence = 1.0;
             }
@@ -262,6 +270,7 @@ public final class HardwareDetector {
         boolean discreteGpuDetected;
         boolean meetsVramRequirement;
         boolean opencl32Capable;
+        boolean openclDeviceDetected;
         public boolean contextCreationSuccessful;
         String failureReason;
         HardwareCapabilities hardwareCapabilities = new HardwareCapabilities();

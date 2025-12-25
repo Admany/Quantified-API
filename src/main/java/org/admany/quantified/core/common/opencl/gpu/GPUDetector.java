@@ -33,17 +33,34 @@ public final class GPUDetector {
     private GPUDetector() {}
 
     public static GPUCapabilities detectCapabilities() {
+        return detectCapabilities(null);
+    }
+
+    public static GPUCapabilities detectCapabilities(String preferredDeviceId) {
         try {
             if (!isOpenCLAvailable()) {
                 LOGGER.info("OpenCL not available on this system");
                 return GPUCapabilities.UNSUPPORTED;
             }
 
-            DeviceCandidate bestDevice = findBestDevice();
+            DeviceCriteria criteria = DeviceCriteria.auto();
+            List<DeviceCandidate> candidates = enumerateAllDevices(criteria);
+            if (candidates.isEmpty()) {
+                LOGGER.info("No suitable OpenCL device found");
+                return new GPUCapabilities(false, null, null, null, null, false,
+                    "No compatible OpenCL GPU devices were detected");
+            }
+
+            DeviceCandidate bestDevice = selectPreferredDevice(preferredDeviceId, candidates);
+            if (bestDevice == null) {
+                bestDevice = candidates.stream()
+                    .max((a, b) -> Double.compare(a.score(), b.score()))
+                    .orElse(null);
+            }
             if (bestDevice == null) {
                 LOGGER.info("No suitable OpenCL device found");
                 return new GPUCapabilities(false, null, null, null, null, false,
-                    "No OpenCL 3.2 discrete GPU with at least 2 GB VRAM was detected");
+                    "No compatible OpenCL GPU devices were detected");
             }
 
             String info = "OpenCL device selected: " + bestDevice.device().name() +
@@ -75,22 +92,103 @@ public final class GPUDetector {
         }
     }
 
-    private static DeviceCandidate findBestDevice() {
+    public static List<OpenCLDeviceInfo> listDevices() {
         if (!isOpenCLAvailable()) {
-            return null;
+            return List.of();
         }
-
-        List<DeviceCandidate> candidates = enumerateAllDevices();
-        if (candidates.isEmpty()) {
-            return null;
+        List<DeviceCandidate> candidates = enumerateAllDevices(DeviceCriteria.listing());
+        java.util.LinkedHashMap<String, DeviceCandidate> unique = new java.util.LinkedHashMap<>();
+        for (DeviceCandidate candidate : candidates) {
+            String key = normalizeDeviceKey(candidate.device().name());
+            DeviceCandidate existing = unique.get(key);
+            if (existing == null || preferCandidate(candidate, existing)) {
+                unique.put(key, candidate);
+            }
         }
-
-        return candidates.stream()
-            .max((a, b) -> Double.compare(a.score(), b.score()))
-            .orElse(null);
+        List<OpenCLDeviceInfo> devices = new ArrayList<>();
+        for (DeviceCandidate candidate : unique.values()) {
+            devices.add(new OpenCLDeviceInfo(
+                candidate.deviceUUID() != null ? candidate.deviceUUID().toString() : candidate.device().name(),
+                candidate.device().name(),
+                candidate.device().vendor(),
+                candidate.type(),
+                candidate.device().vramBytes(),
+                candidate.device().computeUnits(),
+                candidate.supportsOpenCL32()
+            ));
+        }
+        return devices;
     }
 
-    private static List<DeviceCandidate> enumerateAllDevices() {
+    private static DeviceCandidate selectPreferredDevice(String preferredDeviceId, List<DeviceCandidate> candidates) {
+        if (preferredDeviceId == null) {
+            return null;
+        }
+        String trimmed = preferredDeviceId.trim();
+        if (trimmed.isEmpty() || "auto".equalsIgnoreCase(trimmed)) {
+            return null;
+        }
+        String normalized = normalizeDeviceKey(trimmed);
+        for (DeviceCandidate candidate : candidates) {
+            if (candidate.deviceUUID() != null) {
+                if (candidate.deviceUUID().toString().equalsIgnoreCase(trimmed)) {
+                    return candidate;
+                }
+                if (normalizeDeviceKey(candidate.deviceUUID().toString()).equals(normalized)) {
+                    return candidate;
+                }
+            }
+            String name = candidate.device().name();
+            if (name != null && normalizeDeviceKey(name).equals(normalized)) {
+                return candidate;
+            }
+            String vendorName = (candidate.device().vendor() + " " + candidate.device().name()).trim();
+            if (!vendorName.isBlank() && normalizeDeviceKey(vendorName).equals(normalized)) {
+                return candidate;
+            }
+        }
+        for (DeviceCandidate candidate : candidates) {
+            String name = candidate.device().name();
+            if (name != null && normalizeDeviceKey(name).contains(normalized)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private static String normalizeDeviceKey(String value) {
+        return value == null ? "" : value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", "");
+    }
+
+    private static boolean preferCandidate(DeviceCandidate candidate, DeviceCandidate existing) {
+        boolean candidateLegacy = candidate.type() == DeviceType.LEGACY;
+        boolean existingLegacy = existing.type() == DeviceType.LEGACY;
+        if (existingLegacy && !candidateLegacy) {
+            return true;
+        }
+        if (!existingLegacy && candidateLegacy) {
+            return false;
+        }
+        String candidateVendor = candidate.device().vendor() != null ? candidate.device().vendor().toLowerCase(Locale.ROOT) : "";
+        String existingVendor = existing.device().vendor() != null ? existing.device().vendor().toLowerCase(Locale.ROOT) : "";
+        boolean candidateMicrosoft = candidateVendor.contains("microsoft");
+        boolean existingMicrosoft = existingVendor.contains("microsoft");
+        if (existingMicrosoft && !candidateMicrosoft) {
+            return true;
+        }
+        if (!existingMicrosoft && candidateMicrosoft) {
+            return false;
+        }
+        if (candidate.device().vramBytes() != existing.device().vramBytes()) {
+            return candidate.device().vramBytes() > existing.device().vramBytes();
+        }
+        if (candidate.device().computeUnits() != existing.device().computeUnits()) {
+            return candidate.device().computeUnits() > existing.device().computeUnits();
+        }
+        return candidate.score() > existing.score();
+    }
+
+    private static List<DeviceCandidate> enumerateAllDevices(DeviceCriteria criteria) {
         List<DeviceCandidate> devices = new ArrayList<>();
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -126,7 +224,7 @@ public final class GPUDetector {
 
                 LOGGER.fine(String.format("Found OpenCL platform: %s version %s", platformName, platformVersion));
 
-                List<DeviceCandidate> platformDevices = enumeratePlatformDevices(platformId, platformVersion, platformCaps);
+                List<DeviceCandidate> platformDevices = enumeratePlatformDevices(platformId, platformVersion, platformCaps, criteria);
                 devices.addAll(platformDevices);
             }
         } catch (Exception e) {
@@ -136,13 +234,16 @@ public final class GPUDetector {
         return devices;
     }
 
-    private static List<DeviceCandidate> enumeratePlatformDevices(long platformId, String platformVersion, CLCapabilities platformCaps) {
+    private static List<DeviceCandidate> enumeratePlatformDevices(long platformId, String platformVersion, CLCapabilities platformCaps, DeviceCriteria criteria) {
         List<DeviceCandidate> devices = new ArrayList<>();
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
             int[] deviceTypes = {CL10.CL_DEVICE_TYPE_GPU, CL10.CL_DEVICE_TYPE_ACCELERATOR, CL10.CL_DEVICE_TYPE_CPU};
 
             for (int deviceType : deviceTypes) {
+                if (deviceType == CL10.CL_DEVICE_TYPE_CPU && !criteria.allowCpu()) {
+                    continue;
+                }
                 try {
                     IntBuffer deviceCount = stack.mallocInt(1);
                     int err = CL10.clGetDeviceIDs(platformId, deviceType, null, deviceCount);
@@ -159,7 +260,7 @@ public final class GPUDetector {
 
                     for (int i = 0; i < count; i++) {
                         long deviceId = deviceIds.get(i);
-                        DeviceCandidate candidate = evaluateDevice(platformId, platformVersion, deviceId, platformCaps);
+                        DeviceCandidate candidate = evaluateDevice(platformId, platformVersion, deviceId, platformCaps, criteria);
                         if (candidate != null) {
                             devices.add(candidate);
                         }
@@ -173,7 +274,7 @@ public final class GPUDetector {
         return devices;
     }
 
-    private static DeviceCandidate evaluateDevice(long platformId, String platformVersion, long deviceId, CLCapabilities platformCaps) {
+    private static DeviceCandidate evaluateDevice(long platformId, String platformVersion, long deviceId, CLCapabilities platformCaps, DeviceCriteria criteria) {
         try {
             String deviceName = getDeviceInfoString(deviceId, CL10.CL_DEVICE_NAME);
             String deviceVendor = getDeviceInfoString(deviceId, CL10.CL_DEVICE_VENDOR);
@@ -202,18 +303,18 @@ public final class GPUDetector {
                 return null;
             }
 
-            if (!deviceCaps.cl_khr_fp64 && !deviceCaps.cl_amd_fp64) {
+            boolean supportsFp64 = deviceCaps.cl_khr_fp64 || deviceCaps.cl_amd_fp64;
+            if (criteria.requireFp64() && !supportsFp64) {
                 LOGGER.fine(String.format("Device %s rejected: requires double precision support", deviceName));
                 return null;
             }
 
             DeviceType deviceType = classifyDevice(deviceTypeFlags, deviceName, deviceVendor, unifiedMemory, computeUnits);
-            if (deviceType != DeviceType.DISCRETE) {
+            if (criteria.requireDiscrete() && deviceType != DeviceType.DISCRETE) {
                 LOGGER.fine(String.format("Device %s rejected: requires discrete GPU", deviceName));
                 return null;
             }
-
-            if (!hasAdequateResources(vramBytes, computeUnits)) {
+            if (criteria.requireMinResources() && !hasAdequateResources(vramBytes, computeUnits)) {
                 LOGGER.fine(String.format("Device %s rejected: insufficient resources (CU=%d, VRAM=%s)",
                     deviceName, computeUnits, humanReadableVram(vramBytes)));
                 return null;
@@ -506,6 +607,16 @@ public final class GPUDetector {
         String extensions
     ) {}
 
+    public record OpenCLDeviceInfo(
+        String id,
+        String name,
+        String vendor,
+        DeviceType type,
+        long vramBytes,
+        int computeUnits,
+        boolean supportsOpenCL32
+    ) {}
+
     private record DeviceCandidate(
         OpenCLDevice device,
         DeviceType type,
@@ -514,4 +625,19 @@ public final class GPUDetector {
         UUID driverUUID,
         boolean supportsOpenCL32
     ) {}
+
+    private record DeviceCriteria(
+        boolean requireFp64,
+        boolean requireDiscrete,
+        boolean requireMinResources,
+        boolean allowCpu
+    ) {
+        static DeviceCriteria auto() {
+            return new DeviceCriteria(false, false, false, false);
+        }
+
+        static DeviceCriteria listing() {
+            return new DeviceCriteria(false, false, false, false);
+        }
+    }
 }
