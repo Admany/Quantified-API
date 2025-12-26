@@ -18,6 +18,7 @@ public final class QuantifiedTask<T> {
     private final Optional<Duration> timeout;
     private final boolean gpuPreferred;
     private final boolean gpuRequired;
+    private final String batchKey;
 
     private QuantifiedTask(Builder<T> builder) {
         this.modId = builder.modId;
@@ -29,6 +30,7 @@ public final class QuantifiedTask<T> {
         this.timeout = Optional.ofNullable(builder.timeout);
         this.gpuPreferred = builder.gpuPreferred;
         this.gpuRequired = builder.gpuRequired;
+        this.batchKey = builder.batchKey;
     }
 
     public String modId() {
@@ -67,6 +69,10 @@ public final class QuantifiedTask<T> {
         return gpuRequired;
     }
 
+    public String batchKey() {
+        return batchKey;
+    }
+
     public static <T> Builder<T> builder(String modId, String name, Supplier<T> work) {
         return new Builder<>(modId, name, work);
     }
@@ -81,6 +87,7 @@ public final class QuantifiedTask<T> {
         private Duration timeout;
         private boolean gpuPreferred = false;
         private boolean gpuRequired = false;
+        private String batchKey;
 
         private Builder(String modId, String name, Supplier<T> work) {
             this.modId = Objects.requireNonNull(modId, "modId");
@@ -133,6 +140,11 @@ public final class QuantifiedTask<T> {
 
         public Builder<T> gpuRequired() {
             this.gpuRequired = true;
+            return this;
+        }
+
+        public Builder<T> batchKey(String batchKey) {
+            this.batchKey = batchKey;
             return this;
         }
 

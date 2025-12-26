@@ -1,6 +1,7 @@
 package org.admany.quantified.core.common.async.core;
 
 import org.admany.quantified.core.common.async.control.AdaptiveLoadController;
+import org.admany.quantified.core.common.async.cpu.CpuTaskDispatcher;
 import org.admany.quantified.core.common.async.gpu.GpuBatchTelemetry;
 import org.admany.quantified.core.common.async.gpu.GpuTaskDispatcher;
 import org.admany.quantified.core.common.async.gpu.GpuWorkloadRegistry;
@@ -46,6 +47,7 @@ public final class AsyncManager {
     private static PriorityScheduler scheduler;
     private static ScheduledExecutorService coalescer;
     private static GpuTaskDispatcher gpuDispatcher;
+    private static CpuTaskDispatcher cpuDispatcher;
 
     private AsyncManager() {}
 
@@ -67,6 +69,7 @@ public final class AsyncManager {
 
         coalescer = coalesceExecutor;
         gpuDispatcher = new GpuTaskDispatcher(scheduler, coalesceExecutor);
+        cpuDispatcher = new CpuTaskDispatcher(scheduler, coalesceExecutor);
     }
 
     public static void shutdown() {
@@ -75,10 +78,12 @@ public final class AsyncManager {
         if (scheduler != null) scheduler.stop();
         if (coalescer != null) coalescer.shutdownNow();
         if (gpuDispatcher != null) gpuDispatcher.shutdown();
+        if (cpuDispatcher != null) cpuDispatcher.shutdown();
 
         scheduler = null;
         coalescer = null;
         gpuDispatcher = null;
+        cpuDispatcher = null;
 
         TASKS.clear();
         LAST_REQUEST_NANOS.clear();
@@ -334,6 +339,7 @@ public final class AsyncManager {
         PriorityTask task = new PriorityTask(key, type, modScore, payload, entry.metadata, entry.modId);
 
         if (gpuDispatcher != null && gpuDispatcher.trySchedule(task)) return;
+        if (cpuDispatcher != null && cpuDispatcher.trySchedule(task)) return;
 
         enqueue(task);
     }

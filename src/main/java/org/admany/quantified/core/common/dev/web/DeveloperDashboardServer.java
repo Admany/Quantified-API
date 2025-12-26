@@ -39,6 +39,7 @@ import org.admany.quantified.core.common.opencl.gpu.GPUDetector;
 import org.admany.quantified.core.common.opencl.gpu.GPUMonitor;
 import org.admany.quantified.core.common.opencl.gpu.probe.GpuTelemetryService;
 import org.admany.quantified.core.common.opencl.task.OpenCLTaskManager;
+import org.admany.quantified.core.common.telemetry.TaskKindTelemetry;
 import org.admany.quantified.core.common.util.TaskScheduler;
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -60,7 +61,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
@@ -87,11 +87,10 @@ public final class DeveloperDashboardServer {
     private static final int EXPORT_HISTORY_MAX = 500;
     private static final Deque<JsonObject> recentSnapshots = new ArrayDeque<>();
     private static final Object HISTORY_LOCK = new Object();
-    private static final long SENSOR_REFRESH_INTERVAL_MS = 10_000L;
+    private static final long SENSOR_REFRESH_INTERVAL_MS = 2_500L;
     private static final AtomicLong LAST_CPU_SENSOR_QUERY = new AtomicLong(0L);
     private static final AtomicReference<Double> LAST_CPU_SENSOR_VALUE = new AtomicReference<>(Double.NaN);
-    private static final long CPU_SENSOR_RETRY_INTERVAL_MS = 60_000L;
-    private static final AtomicLong LAST_CPU_SENSOR_REFRESH = new AtomicLong(0L);
+    private static final AtomicReference<Boolean> CPU_TEMP_UNAVAILABLE = new AtomicReference<>(false);
     private static final AtomicLong LAST_CPU_LOAD_QUERY = new AtomicLong(0L);
     private static final AtomicReference<long[]> LAST_CPU_TICKS = new AtomicReference<>();
     private static final AtomicReference<Double> LAST_CPU_LOAD = new AtomicReference<>(Double.NaN);
@@ -122,6 +121,15 @@ public final class DeveloperDashboardServer {
             if (sensorsLogger != null) {
                 sensorsLogger.setLevel(Level.OFF);
             }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Class<?> configurator = Class.forName("org.apache.logging.log4j.core.config.Configurator");
+            Class<?> levelClass = Class.forName("org.apache.logging.log4j.Level");
+            Object levelOff = java.lang.Enum.valueOf((Class<? extends java.lang.Enum>) levelClass, "OFF");
+            java.lang.reflect.Method setLevel = configurator.getMethod("setLevel", String.class, levelClass);
+            setLevel.invoke(null, "oshi.util.platform.windows.WmiQueryHandler", levelOff);
+            setLevel.invoke(null, "oshi.hardware.platform.windows.WindowsSensors", levelOff);
         } catch (Throwable ignored) {
         }
     }
@@ -634,6 +642,26 @@ public final class DeveloperDashboardServer {
             cacheArray.add(cache);
         });
         payload.add("caches", cacheArray);
+
+        TaskKindTelemetry.Snapshot taskSnapshot = TaskKindTelemetry.snapshot();
+        JsonArray taskKinds = new JsonArray();
+        for (TaskKindTelemetry.KindStats entry : taskSnapshot.entries()) {
+            JsonObject task = new JsonObject();
+            task.addProperty("modId", entry.modId);
+            task.addProperty("taskName", entry.taskName);
+            task.addProperty("route", entry.route);
+            task.addProperty("count", entry.count);
+            task.addProperty("lastSeenMs", entry.lastSeenMs);
+            task.addProperty("batchCount", entry.batchCount);
+            double batchAvg = entry.batchCount > 0 ? (double) entry.batchTotal / entry.batchCount : 0.0;
+            task.addProperty("batchAvg", batchAvg);
+            task.addProperty("batchMax", entry.batchMax);
+            taskKinds.add(task);
+        }
+        JsonObject taskKindsPayload = new JsonObject();
+        taskKindsPayload.addProperty("windowMs", taskSnapshot.windowMs());
+        taskKindsPayload.add("entries", taskKinds);
+        payload.add("taskKinds", taskKindsPayload);
 
         Map<String, ModStatistics> modStats = QuantifiedAPI.getAllModStatistics();
         JsonArray modsArray = new JsonArray();
@@ -1403,6 +1431,10 @@ public final class DeveloperDashboardServer {
         if (system == null) {
             return cached;
         }
+        boolean isWindows = normalizeOsFamily(system).contains("windows");
+        if (isWindows && Boolean.TRUE.equals(CPU_TEMP_UNAVAILABLE.get())) {
+            return cached;
+        }
         try {
             Sensors sensors = system.getHardware().getSensors();
             if (sensors == null) {
@@ -1411,28 +1443,15 @@ public final class DeveloperDashboardServer {
             double value = sensors.getCpuTemperature();
             if (!Double.isNaN(value) && value > 0.0d) {
                 LAST_CPU_SENSOR_VALUE.set(value);
+                if (isWindows) {
+                    CPU_TEMP_UNAVAILABLE.set(false);
+                }
                 return value;
             }
         } catch (Throwable ignored) {
         }
-        if (normalizeOsFamily(system).contains("windows")) {
-            long lastRefresh = LAST_CPU_SENSOR_REFRESH.get();
-            if (now - lastRefresh >= CPU_SENSOR_RETRY_INTERVAL_MS) {
-                LAST_CPU_SENSOR_REFRESH.set(now);
-                try {
-                    SystemInfo refreshed = new SystemInfo();
-                    Sensors sensors = refreshed.getHardware().getSensors();
-                    if (sensors != null) {
-                        double value = sensors.getCpuTemperature();
-                        if (!Double.isNaN(value) && value > 0.0d) {
-                            LAST_CPU_SENSOR_VALUE.set(value);
-                            SYSTEM_INFO.set(refreshed);
-                            return value;
-                        }
-                    }
-                } catch (Throwable ignored) {
-                }
-            }
+        if (isWindows) {
+            CPU_TEMP_UNAVAILABLE.set(true);
         }
         return cached;
     }

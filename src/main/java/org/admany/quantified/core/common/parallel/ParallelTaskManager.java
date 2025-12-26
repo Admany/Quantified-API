@@ -9,6 +9,7 @@ import org.admany.quantified.core.common.parallel.metrics.ParallelMetrics;
 import org.admany.quantified.core.common.parallel.policy.ParallelFailurePolicy;
 import org.admany.quantified.core.common.parallel.throttle.ParallelBackpressure;
 import org.admany.quantified.core.common.parallel.throttle.ParallelModTracker;
+import org.admany.quantified.core.common.telemetry.TaskKindTelemetry;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -32,6 +33,9 @@ public final class ParallelTaskManager {
         if (slices.isEmpty()) {
             O value = spec.reducer().apply(List.of());
             return CompletableFuture.completedFuture(value);
+        }
+        if (!TaskKindTelemetry.isInternalBatchName(spec.taskName())) {
+            TaskKindTelemetry.recordParallel(spec.modId(), spec.taskName());
         }
         ParallelMetrics.recordSubmission(spec.modId(), slices.size());
         ExecutorService executor = ParallelScheduler.executor();

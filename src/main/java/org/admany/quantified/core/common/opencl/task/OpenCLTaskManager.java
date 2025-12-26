@@ -8,6 +8,7 @@ import org.admany.quantified.core.common.opencl.core.OpenCLContext;
 import org.admany.quantified.core.common.opencl.core.OpenCLRuntime;
 import org.admany.quantified.core.common.opencl.core.OpenCLTask;
 import org.admany.quantified.core.common.opencl.gpu.GPUMonitor;
+import org.admany.quantified.core.common.telemetry.TaskKindTelemetry;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -119,6 +120,7 @@ public final class OpenCLTaskManager {
 
     private static <T> CompletableFuture<T> executeOnGpuInternal(OpenCLTask<T> task) {
         recordTaskEvent(task, TaskEventType.GPU_EXECUTE, null);
+        TaskKindTelemetry.recordGpu(task.modId(), task.name());
         GPUMonitor.TaskSample sample = monitor != null
             ? monitor.beginTask(task.estimatedVramBytes(), task.estimatedComputeUnits())
             : null;
@@ -405,6 +407,7 @@ public final class OpenCLTaskManager {
     private static <T> CompletableFuture<T> submitToAsync(OpenCLTask<T> task, String reason) {
         LOGGER.fine("Routing OpenCL task to async pool: " + reason + " - " + task.name());
         recordTaskEvent(task, TaskEventType.ROUTED_CPU, reason);
+        TaskKindTelemetry.recordMultithreading(task.modId(), task.name());
 
         return AsyncManager.submitSync(
             task.taskKey(),

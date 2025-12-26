@@ -274,6 +274,13 @@ function formatNumber(value) {
     return value.toLocaleString();
 }
 
+function formatDecimal(value, digits = 1) {
+    if (value === null || value === undefined || Number.isNaN(value)) {
+        return "-";
+    }
+    return Number(value).toFixed(digits);
+}
+
 function renderApiLogLine(line, key, modColorMap) {
     if (line.trim() === "[Quantified]") {
         return html`<div className="log-line" key=${key}><span className="log-prefix log-prefix-quantified">[Quantified] mods using the API</span></div>`;
@@ -386,6 +393,8 @@ const App = () => {
     const [configEdits, setConfigEdits] = useState({});
     const [configLoading, setConfigLoading] = useState(false);
     const [toasts, setToasts] = useState([]);
+    const [expandedTaskMods, setExpandedTaskMods] = useState(() => new Set());
+    const [expandedCacheMods, setExpandedCacheMods] = useState(() => new Set());
     const toastIdRef = useRef(0);
     const configSaveTimers = useRef(new Map());
 
@@ -1247,6 +1256,8 @@ const App = () => {
 
     const diskFiles = resourceData?.diskFiles ?? [];
     const caches = resourceData?.caches ?? [];
+    const taskKinds = resourceData?.taskKinds?.entries ?? [];
+    const taskWindowMs = Number(resourceData?.taskKinds?.windowMs ?? 0);
     const resourceSummary = resourceData?.summary ?? null;
     const selectedCount = selectedFilePayload.length;
     const modColorMap = useMemo(
@@ -1479,8 +1490,77 @@ const App = () => {
                     },
                   { label: "RAM Cache", value: formatBytes(resourceSummary.cacheRamBytes ?? 0), sub: "Heap usage" },
                   { label: "Disk Cache", value: formatBytes(resourceSummary.cacheDiskBytes ?? 0), sub: "Persistent usage" },
-              ]
+                ]
             : [];
+        const taskWindowLabel = taskWindowMs
+            ? `${Math.max(1, Math.round(taskWindowMs / 60000))}m window`
+            : "Recent";
+        const modNameById = new Map(
+            (resourceData?.mods ?? []).map((mod) => [mod.modId, mod.displayName || mod.modId])
+        );
+        const resolveModLabel = (modId) => {
+            if (!modId) return "Unknown Mod";
+            const direct = modNameById.get(modId);
+            if (direct) return direct;
+            if (modId.toLowerCase().startsWith("quantified")) {
+                return "Quantified API";
+            }
+            return modId;
+        };
+        const groupedTaskKinds = taskKinds.reduce((acc, entry) => {
+            const key = entry.modId || "unknown-mod";
+            if (!acc[key]) {
+                acc[key] = [];
+            }
+            acc[key].push(entry);
+            return acc;
+        }, {});
+        const sortedModIds = Object.keys(groupedTaskKinds).sort((a, b) => {
+            const aCount = groupedTaskKinds[a].reduce((sum, entry) => sum + (entry.count || 0), 0);
+            const bCount = groupedTaskKinds[b].reduce((sum, entry) => sum + (entry.count || 0), 0);
+            return bCount - aCount;
+        });
+        const toggleTaskMod = (modId) => {
+            setExpandedTaskMods((prev) => {
+                const next = new Set(prev);
+                if (next.has(modId)) {
+                    next.delete(modId);
+                } else {
+                    next.add(modId);
+                }
+                return next;
+            });
+        };
+        const groupedCaches = caches.reduce((acc, cache) => {
+            const fullName = cache.name || "unknown.cache";
+            const dotIndex = fullName.indexOf(".");
+            let modId = dotIndex > 0 ? fullName.slice(0, dotIndex) : "quantified";
+            const cacheName = dotIndex > 0 ? fullName.slice(dotIndex + 1) : fullName;
+            if (!modId || modId === "unknown") {
+                modId = "quantified";
+            }
+            if (!acc[modId]) {
+                acc[modId] = [];
+            }
+            acc[modId].push({ ...cache, cacheName, modId });
+            return acc;
+        }, {});
+        const sortedCacheModIds = Object.keys(groupedCaches).sort((a, b) => {
+            const aEntries = groupedCaches[a].reduce((sum, entry) => sum + (entry.entries || 0), 0);
+            const bEntries = groupedCaches[b].reduce((sum, entry) => sum + (entry.entries || 0), 0);
+            return bEntries - aEntries;
+        });
+        const toggleCacheMod = (modId) => {
+            setExpandedCacheMods((prev) => {
+                const next = new Set(prev);
+                if (next.has(modId)) {
+                    next.delete(modId);
+                } else {
+                    next.add(modId);
+                }
+                return next;
+            });
+        };
         return html`<section className="view resources-view">
             <${Card}
                 title="Resource Controls"
@@ -1545,23 +1625,105 @@ const App = () => {
                           </table>
                       </div>`
                     : html`<p className="text-muted">No mods reported resource usage yet.</p>`}
-            </${Card}>
-            <${Card} title="Cache Breakdown">
+              </${Card}>
+              <${Card} title="CPU Task Kinds" actions=${html`<span className="card-note">${taskWindowLabel}</span>`}>
+                  ${taskKinds.length
+                      ? html`<div className="task-kind-list">
+                            ${sortedModIds.map((modId) => {
+                                const entries = groupedTaskKinds[modId] || [];
+                                const totalTasks = entries.reduce((sum, entry) => sum + (entry.count || 0), 0);
+                                const totalBatches = entries.reduce((sum, entry) => sum + (entry.batchCount || 0), 0);
+                                const totalBatchSum = entries.reduce(
+                                    (sum, entry) => sum + (entry.batchAvg || 0) * (entry.batchCount || 0),
+                                    0
+                                );
+                                const maxBatch = entries.reduce((max, entry) => Math.max(max, entry.batchMax || 0), 0);
+                                const avgBatch = totalBatches ? totalBatchSum / totalBatches : 0;
+                                const expanded = expandedTaskMods.has(modId);
+                                const modLabel = resolveModLabel(modId);
+                                return html`<div className="task-kind-mod" key=${modId}>
+                                    <button className="task-kind-header" onClick=${() => toggleTaskMod(modId)}>
+                                        <div className="stacked">
+                                            <strong>${modLabel}</strong>
+                                            <span className="text-muted">${modId}</span>
+                                        </div>
+                                        <div className="task-kind-summary">
+                                            <span>${formatNumber(totalTasks)} tasks</span>
+                                            ${totalBatches
+                                                ? html`<span>${formatNumber(totalBatches)} batches · avg ${formatDecimal(avgBatch)} · max ${formatNumber(maxBatch)}</span>`
+                                                : html`<span className="text-muted">No batches yet</span>`}
+                                        </div>
+                                        <span className="task-kind-toggle">${expanded ? "▾" : "▸"}</span>
+                                    </button>
+                                    ${expanded
+                                        ? html`<div className="task-kind-entries">
+                                              ${entries.map(
+                                                  (entry, idx) => html`<div className="list-row" key=${idx}>
+                                                      <div className="stacked">
+                                                          <strong>${entry.taskName}</strong>
+                                                      </div>
+                                                      <div className="stacked right">
+                                                          <span>${entry.route}</span>
+                                                          <span className="text-muted">${formatNumber(entry.count || 0)} tasks</span>
+                                                          ${entry.batchCount
+                                                              ? html`<span className="text-muted">
+                                                                    ${formatNumber(entry.batchCount)} batches · avg ${formatDecimal(entry.batchAvg)} · max ${formatNumber(entry.batchMax || 0)}
+                                                                </span>`
+                                                              : null}
+                                                      </div>
+                                                  </div>`
+                                              )}
+                                          </div>`
+                                        : null}
+                                </div>`;
+                            })}
+                        </div>`
+                      : html`<p className="text-muted">No task activity recorded yet.</p>`}
+              </${Card}>
+              <${Card} title="Cache Breakdown">
                 ${caches.length
-                    ? html`<div className="cache-list">
-                          ${caches.map(
-                              (cache, idx) => html`<div className="cache-row" key=${idx}>
-                                  <div className="stacked">
-                                      <strong>${cache.name}</strong>
-                                      <span className="text-muted">${formatNumber(cache.entries)} entries</span>
-                                  </div>
-                                  <div className="cache-stats">
-                                      <span>Hit ${formatPercent(cache.hitRate)}</span>
-                                      <span>${formatNumber(cache.hitCount || 0)} hits</span>
-                                      <span>${formatNumber(cache.missCount || 0)} misses</span>
-                                  </div>
-                              </div>`
-                          )}
+                    ? html`<div className="cache-breakdown-list">
+                          ${sortedCacheModIds.map((modId) => {
+                              const entries = groupedCaches[modId] || [];
+                              const totalEntries = entries.reduce((sum, entry) => sum + (entry.entries || 0), 0);
+                              const totalHits = entries.reduce((sum, entry) => sum + (entry.hitCount || 0), 0);
+                              const totalMisses = entries.reduce((sum, entry) => sum + (entry.missCount || 0), 0);
+                              const totalEvictions = entries.reduce((sum, entry) => sum + (entry.evictions || 0), 0);
+                              const hitRate = totalHits + totalMisses > 0 ? totalHits / (totalHits + totalMisses) : 0;
+                              const expanded = expandedCacheMods.has(modId);
+                              const modLabel = resolveModLabel(modId);
+                              return html`<div className="cache-mod" key=${modId}>
+                                  <button className="cache-header" onClick=${() => toggleCacheMod(modId)}>
+                                      <div className="stacked">
+                                          <strong>${modLabel}</strong>
+                                          <span className="text-muted">${modId}</span>
+                                      </div>
+                                      <div className="cache-summary">
+                                          <span>${formatNumber(totalEntries)} entries</span>
+                                          <span>Hit ${formatPercent(hitRate)}</span>
+                                          <span>${formatNumber(totalEvictions)} evictions</span>
+                                      </div>
+                                      <span className="cache-toggle">${expanded ? "▾" : "▸"}</span>
+                                  </button>
+                                  ${expanded
+                                      ? html`<div className="cache-entries">
+                                            ${entries.map(
+                                                (cache, idx) => html`<div className="cache-row" key=${idx}>
+                                                    <div className="stacked">
+                                                        <strong>${cache.cacheName}</strong>
+                                                        <span className="text-muted">${formatNumber(cache.entries)} entries</span>
+                                                    </div>
+                                                    <div className="cache-stats">
+                                                        <span>Hit ${formatPercent(cache.hitRate)}</span>
+                                                        <span>${formatNumber(cache.hitCount || 0)} hits</span>
+                                                        <span>${formatNumber(cache.missCount || 0)} misses</span>
+                                                    </div>
+                                                </div>`
+                                            )}
+                                        </div>`
+                                      : null}
+                              </div>`;
+                          })}
                       </div>`
                     : html`<p className="text-muted">Cache stats will appear once the API collects inventory data.</p>`}
             </${Card}>

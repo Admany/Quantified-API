@@ -2,6 +2,8 @@ package org.admany.quantified.core.common.async.core;
 
 import org.admany.quantified.core.common.async.task.PriorityTask;
 import org.admany.quantified.core.common.async.task.PriorityTaskType;
+import org.admany.quantified.core.common.async.task.TaskMetadata;
+import org.admany.quantified.core.common.telemetry.TaskKindTelemetry;
 import org.admany.quantified.core.common.threading.core.ThreadRole;
 import org.admany.quantified.core.common.threading.health.ThreadHealthMonitor;
 import org.admany.quantified.core.common.threading.pool.ThreadPoolErrorHandler;
@@ -251,6 +253,13 @@ public final class PriorityScheduler {
         try {
             if (QuantifiedAPI.isPrintDebugLogs()) {
                 LOGGER.fine("[DEBUG] PriorityScheduler: Executing task " + task.taskKey());
+            }
+            TaskMetadata metadata = task.metadata();
+            if (metadata != null && !metadata.gpuPreferred() && !metadata.gpuRequired()) {
+                String affinity = metadata.affinityKey();
+                if (affinity != null && !affinity.isBlank() && !TaskKindTelemetry.isInternalBatchName(affinity)) {
+                    TaskKindTelemetry.recordMultithreading(task.modId(), affinity);
+                }
             }
             task.payload().run();
             counter.incrementAndGet();

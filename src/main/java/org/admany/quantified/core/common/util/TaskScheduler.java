@@ -123,7 +123,7 @@ public final class TaskScheduler {
             recordCpuTaskScheduled();
         }
 
-        TaskMetadata metadata = buildMetadata(analysis, gpuSelected, modId, dataSizeBytes, parallelUnits, complexity, type);
+        TaskMetadata metadata = buildMetadata(analysis, gpuSelected, modId, taskName, dataSizeBytes, parallelUnits, complexity, type);
 
         if (QuantifiedAPI.isPrintDebugLogs()) {
             LOGGER.fine("[DEBUG] TaskScheduler: Routing task " + taskKey + " via AsyncManager (gpuSelected=" + gpuSelected + ")");
@@ -232,6 +232,7 @@ public final class TaskScheduler {
     private static TaskMetadata buildMetadata(TaskAnalysis analysis,
                                               boolean gpuSelected,
                                               String modId,
+                                              String taskName,
                                               long dataSizeBytes,
                                               int parallelUnits,
                                               TaskComplexity complexity,
@@ -239,21 +240,25 @@ public final class TaskScheduler {
         TaskMetadata.Builder builder = TaskMetadata.builder();
         double estimatedCost = Math.max(1.0, dataSizeBytes / 4096.0);
         builder.estimatedCost(estimatedCost);
-        builder.affinityKey(modId + ":" + type.name());
+        if (taskName != null && !taskName.isBlank()) {
+            builder.affinityKey(taskName);
+        } else {
+            builder.affinityKey(modId + ":" + type.name());
+        }
         int preferredBatch = Math.max(4, Math.min(64, Math.max(1, parallelUnits / 64)));
         int preferred = Math.max(1, preferredBatch);
         builder.preferredBatchSize(preferred);
         builder.maximumBatchSize(Math.max(preferred, preferred * 2));
-        if (gpuSelected) {
-            builder.gpuPreferred(true);
-            builder.batchable(true);
-            builder.gpuWorkload(gpuBatchWorkload);
-            if (analysis.dataSizeOptimal() || complexity == TaskComplexity.MASSIVE) {
-                builder.gpuRequired(true);
-            }
-        } else {
-            builder.batchable(false);
-        }
+          if (gpuSelected) {
+              builder.gpuPreferred(true);
+              builder.batchable(true);
+              builder.gpuWorkload(gpuBatchWorkload);
+              if (analysis.dataSizeOptimal() || complexity == TaskComplexity.MASSIVE) {
+                  builder.gpuRequired(true);
+              }
+          } else {
+              builder.batchable(false);
+          }
         return builder.build();
     }
 

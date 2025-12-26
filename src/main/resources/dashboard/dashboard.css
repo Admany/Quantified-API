@@ -347,6 +347,12 @@ body::after {
     flex-wrap: wrap;
 }
 
+.card-note {
+    font-size: 0.82rem;
+    color: var(--text-subtle);
+    letter-spacing: 0.02em;
+}
+
 .meta-label {
     color: var(--text-subtle);
     font-size: 0.85rem;
@@ -633,6 +639,114 @@ body::after {
 .list.dense .list-row {
     padding-top: 8px;
     border-top: 1px solid var(--border);
+}
+
+.cache-breakdown-list {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.cache-mod {
+    border-radius: 16px;
+    border: 1px solid var(--border);
+    background: var(--surface-alt);
+    overflow: hidden;
+}
+
+.cache-header {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 12px 14px;
+    background: transparent;
+    border: none;
+    color: var(--text-main);
+    cursor: pointer;
+    text-align: left;
+}
+
+.cache-header:hover {
+    background: var(--surface-soft);
+}
+
+.cache-summary {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+    color: var(--text-subtle);
+    font-size: 0.85rem;
+}
+
+.cache-toggle {
+    font-size: 1rem;
+    color: var(--text-subtle);
+}
+
+.cache-entries {
+    padding: 10px 14px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.task-kind-list {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.task-kind-mod {
+    border-radius: 16px;
+    border: 1px solid var(--border);
+    background: var(--surface-alt);
+    overflow: hidden;
+}
+
+.task-kind-header {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 12px 14px;
+    background: transparent;
+    border: none;
+    color: var(--text-main);
+    cursor: pointer;
+    text-align: left;
+}
+
+.task-kind-header:hover {
+    background: var(--surface-soft);
+}
+
+.task-kind-summary {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 4px;
+    color: var(--text-subtle);
+    font-size: 0.85rem;
+}
+
+.task-kind-toggle {
+    font-size: 1rem;
+    color: var(--text-subtle);
+}
+
+.task-kind-entries {
+    padding: 10px 14px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
 }
 
 .timeline {

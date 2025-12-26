@@ -102,6 +102,17 @@ public final class QuantifiedHandle {
         final long startTimeNanos = System.nanoTime();
         TaskScheduler.recordExternalCpuTask();
         TaskMetadata.Builder metadataBuilder = TaskMetadata.builder();
+        if (task.threadSafe()) {
+            String affinity = task.batchKey() != null && !task.batchKey().isBlank()
+                ? task.batchKey()
+                : task.name();
+            metadataBuilder.affinityKey(affinity);
+            metadataBuilder.batchable(true);
+            metadataBuilder.preferredBatchSize(12);
+            metadataBuilder.maximumBatchSize(48);
+        } else {
+            metadataBuilder.batchable(false);
+        }
         if (task.gpuPreferred()) {
             metadataBuilder.gpuPreferred(true);
         }
