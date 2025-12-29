@@ -126,12 +126,30 @@ public final class DeveloperDashboardServer {
         try {
             Class<?> configurator = Class.forName("org.apache.logging.log4j.core.config.Configurator");
             Class<?> levelClass = Class.forName("org.apache.logging.log4j.Level");
-            Object levelOff = java.lang.Enum.valueOf((Class<? extends java.lang.Enum>) levelClass, "OFF");
+            Object levelOff = enumConstantOrThrow(levelClass, "OFF");
             java.lang.reflect.Method setLevel = configurator.getMethod("setLevel", String.class, levelClass);
             setLevel.invoke(null, "oshi.util.platform.windows.WmiQueryHandler", levelOff);
             setLevel.invoke(null, "oshi.hardware.platform.windows.WindowsSensors", levelOff);
         } catch (Throwable ignored) {
         }
+    }
+
+    private static Object enumConstantOrThrow(Class<?> enumType, String name) {
+        Objects.requireNonNull(enumType, "enumType");
+        Objects.requireNonNull(name, "name");
+        if (!enumType.isEnum()) {
+            throw new IllegalArgumentException("Not an enum type: " + enumType.getName());
+        }
+        Object[] constants = enumType.getEnumConstants();
+        if (constants != null) {
+            for (Object constant : constants) {
+                Enum<?> enumConstant = (Enum<?>) constant;
+                if (enumConstant.name().equals(name)) {
+                    return constant;
+                }
+            }
+        }
+        throw new IllegalArgumentException("No enum constant " + enumType.getName() + "." + name);
     }
 
     public static void applyConfiguration(boolean enabled, int port, String host, boolean https, boolean auth) {
