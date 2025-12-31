@@ -105,6 +105,10 @@ public final class OpenCLRuntime {
         return LAST_ERROR.get();
     }
 
+    public static boolean isInitialised() {
+        return INITIALISED.get();
+    }
+
     public static String getBindingName() {
         Binding b = BINDING.get();
         return b == null ? "UNKNOWN" : b.name();

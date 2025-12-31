@@ -186,6 +186,12 @@ public final class OpenCLContext implements AutoCloseable {
     public void close() {
         if (!initialized.get()) return;
 
+        if (!OpenCLRuntime.isInitialised()) {
+            resetHandles();
+            LOGGER.fine("OpenCL context closed after runtime shutdown");
+            return;
+        }
+
         try {
             if (programHandle != 0) {
                 releaseProgram(programHandle);
@@ -202,13 +208,32 @@ public final class OpenCLContext implements AutoCloseable {
                 contextHandle = 0;
             }
 
-            deviceId = 0;
-            initialized.set(false);
+            resetHandles();
             LOGGER.info("OpenCL context cleaned up");
 
+        } catch (IllegalStateException e) {
+            if (isLibraryNotLoaded(e)) {
+                resetHandles();
+                LOGGER.fine("OpenCL context cleanup skipped (library already unloaded)");
+                return;
+            }
+            LOGGER.log(Level.WARNING, "Error during OpenCL context cleanup", e);
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Error during OpenCL context cleanup", e);
         }
+    }
+
+    private void resetHandles() {
+        programHandle = 0;
+        commandQueueHandle = 0;
+        contextHandle = 0;
+        deviceId = 0;
+        initialized.set(false);
+    }
+
+    private boolean isLibraryNotLoaded(IllegalStateException e) {
+        String msg = e.getMessage();
+        return msg != null && msg.toLowerCase(java.util.Locale.ROOT).contains("opencl library has not been loaded");
     }
 
     private long createContext(GPUDetector.OpenCLDevice device) {
