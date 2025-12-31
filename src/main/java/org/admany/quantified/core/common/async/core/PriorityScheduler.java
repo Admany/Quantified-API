@@ -131,9 +131,9 @@ public final class PriorityScheduler {
             LOGGER.log(Level.FINEST, "Scheduler not running, dropping task {0}", task);
             return;
         }
-        if ((foregroundQueue.size() + backgroundQueue.size()) > queueBound) {
+        int queued = foregroundQueue.size() + backgroundQueue.size();
+        if (queued > queueBound) {
             droppedTasks.incrementAndGet();
-            return;
         }
         tasksSubmitted.incrementAndGet();
         if (QuantifiedAPI.isPrintDebugLogs()) {
@@ -170,14 +170,12 @@ public final class PriorityScheduler {
                     TimeUnit.MILLISECONDS.sleep(50);
                     continue;
                 }
-                double load = SystemLoadMonitor.currentSystemLoad();
-                if (load > 0.8) {
-                    Thread.yield();
-                    TimeUnit.MILLISECONDS.sleep(10); 
-                    continue;
-                }
                 PriorityTask task = foregroundQueue.poll(250, TimeUnit.MILLISECONDS);
                 if (task == null) {
+                    if (SystemLoadMonitor.currentSystemLoad() > 0.9) {
+                        Thread.yield();
+                        TimeUnit.MILLISECONDS.sleep(10);
+                    }
                     continue;
                 }
                 if (QuantifiedAPI.isPrintDebugLogs()) {
@@ -215,15 +213,12 @@ public final class PriorityScheduler {
                     TimeUnit.MILLISECONDS.sleep(75);
                     continue;
                 }
-                // Yield if system is contended (high load from other apps)
-                double load = SystemLoadMonitor.currentSystemLoad();
-                if (load > 0.8) {
-                    Thread.yield(); // Allow other threads/apps to proceed
-                    TimeUnit.MILLISECONDS.sleep(10); // Brief pause
-                    continue;
-                }
                 PriorityTask task = backgroundQueue.poll(500, TimeUnit.MILLISECONDS);
                 if (task == null) {
+                    if (SystemLoadMonitor.currentSystemLoad() > 0.9) {
+                        Thread.yield();
+                        TimeUnit.MILLISECONDS.sleep(10);
+                    }
                     continue;
                 }
                 if (QuantifiedAPI.isPrintDebugLogs()) {
