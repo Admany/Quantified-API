@@ -1,6 +1,7 @@
 package org.admany.quantified.api.opencl;
 
 import org.admany.quantified.core.common.opencl.core.OpenCLContext;
+import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.util.TaskScheduler;
 import org.admany.quantified.core.common.util.TaskScheduler.TaskComplexity;
 import org.admany.quantified.core.common.util.TaskScheduler.TaskType;
@@ -58,6 +59,27 @@ public final class QuantifiedOpenCL {
 
     public static <T> Builder<T> builder(String modId, String taskName, long taskKey) {
         return new Builder<>(modId, taskName, taskKey);
+    }
+
+    public static void registerGpuAvailabilityListener(GpuAvailabilityListener listener) {
+        Objects.requireNonNull(listener, "listener");
+        if (!isCoreAvailable()) {
+            return;
+        }
+        OpenCLManager.registerAvailabilityListener(listener::onGpuReady);
+    }
+
+    public static boolean isGpuReady() {
+        return isCoreAvailable() && OpenCLManager.isAvailable();
+    }
+
+    private static boolean isCoreAvailable() {
+        try {
+            Class.forName("org.admany.quantified.core.common.opencl.core.OpenCLManager");
+            return true;
+        } catch (ClassNotFoundException e) {
+            return false;
+        }
     }
 
     public static final class Builder<T> {

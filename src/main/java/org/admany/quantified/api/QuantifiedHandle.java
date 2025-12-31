@@ -176,7 +176,7 @@ public final class QuantifiedHandle {
                 cache.put(cacheKey, result);
                 if (modMetrics != null) {
                     modMetrics.recordCacheEntryAdded();
-                    modMetrics.updateCacheSize(cache.size());
+                    refreshModCacheTotals(modMetrics);
                 }
             }
         });
@@ -211,7 +211,7 @@ public final class QuantifiedHandle {
         cache.put(key, computed);
         if (modMetrics != null) {
             modMetrics.recordCacheEntryAdded();
-            modMetrics.updateCacheSize(cache.size());
+            refreshModCacheTotals(modMetrics);
         }
         QuantifiedCoreForge.touchMod(modId);
         return computed;
@@ -335,6 +335,15 @@ public final class QuantifiedHandle {
                 : ttl;
             return CacheManager.register(name, effectiveSize, effectiveTtl, false, persistence);
         });
+    }
+
+    private void refreshModCacheTotals(ConnectedModImpl modMetrics) {
+        long totalEntries = 0L;
+        for (ThreadSafeCache<String, Object> cache : caches.values()) {
+            totalEntries += cache.size();
+        }
+        long totalBytes = totalEntries * 512L;
+        modMetrics.updateCacheStats(totalEntries, totalBytes);
     }
 }
 

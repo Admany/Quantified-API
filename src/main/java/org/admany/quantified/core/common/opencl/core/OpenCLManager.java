@@ -32,6 +32,8 @@ public final class OpenCLManager {
 
     private static volatile TieredGpuCache tieredCache;
     private static volatile RuntimeStatus lastRuntimeStatus = RuntimeStatus.failed("OpenCL not initialized");
+    private static final CopyOnWriteArrayList<Runnable> availabilityListeners = new CopyOnWriteArrayList<>();
+    private static final AtomicBoolean availabilityAnnounced = new AtomicBoolean(false);
 
     private static final ExecutorService probeExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "Quantified-OpenCL-Probe");
@@ -76,6 +78,7 @@ public final class OpenCLManager {
             DeveloperOverlayManager.recordApiLog("[OpenCL] Already initialized");
             if (isAvailable()) {
                 lastRuntimeStatus = RuntimeStatus.available();
+                notifyAvailabilityListeners();
             }
             return;
         }
@@ -94,6 +97,19 @@ public final class OpenCLManager {
                context != null &&
                context.isHealthy() &&
                monitor != null;
+    }
+
+    public static void registerAvailabilityListener(Runnable listener) {
+        if (listener == null) {
+            return;
+        }
+        availabilityListeners.add(listener);
+        if (isAvailable()) {
+            try {
+                listener.run();
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     public static void cachePut(String modId, String key, ByteBuffer data) {
@@ -204,6 +220,7 @@ public final class OpenCLManager {
         OpenCLTaskManager.setDependencies(monitor, context, tieredCache);
 
         lastRuntimeStatus = RuntimeStatus.available();
+        notifyAvailabilityListeners();
         if (options.runTestTask()) {
             runTestTask(options.quietTest());
         }
@@ -332,6 +349,7 @@ public final class OpenCLManager {
         AsyncProbeScheduler.reset();
         OpenCLTaskManager.setDependencies(null, null, null);
         lastRuntimeStatus = RuntimeStatus.failed("OpenCL shutdown");
+        availabilityAnnounced.set(false);
         LOGGER.fine("OpenCL acceleration shutdown");
     }
 
@@ -383,6 +401,22 @@ public final class OpenCLManager {
         }
         capabilities = null;
         OpenCLRuntime.destroy();
+        availabilityAnnounced.set(false);
+    }
+
+    private static void notifyAvailabilityListeners() {
+        if (!isAvailable()) {
+            return;
+        }
+        if (!availabilityAnnounced.compareAndSet(false, true)) {
+            return;
+        }
+        for (Runnable listener : availabilityListeners) {
+            try {
+                listener.run();
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     // -------------------- CLBuffer --------------------

@@ -31,6 +31,7 @@ public class ConnectedModImpl implements ConnectedMod {
     private final ModStatisticsImpl statistics;
     private final ConcurrentMap<String, ThreadSafeCache<String, Object>> caches = new ConcurrentHashMap<>();
     private volatile boolean disconnected = false;
+    private static final long ESTIMATED_CACHE_ENTRY_BYTES = 512L;
 
     public ConnectedModImpl(String modId, String version, String displayName) {
         this.modId = modId;
@@ -128,6 +129,19 @@ public class ConnectedModImpl implements ConnectedMod {
 
     public void updateCacheSize(long size) {
         statistics.updateCacheSize(size);
+    }
+
+    public void updateCacheStats(long entries, long bytes) {
+        statistics.updateCacheStats(entries, bytes);
+    }
+
+    private void refreshLocalCacheTotals() {
+        long totalEntries = 0L;
+        for (ThreadSafeCache<String, Object> cache : caches.values()) {
+            totalEntries += cache.size();
+        }
+        long totalBytes = totalEntries * ESTIMATED_CACHE_ENTRY_BYTES;
+        statistics.updateCacheStats(totalEntries, totalBytes);
     }
 
     public void recordPacketSent() {
@@ -340,18 +354,18 @@ public class ConnectedModImpl implements ConnectedMod {
             statistics.recordCacheMiss();
             T value = loader.get();
             cache.put(key, value);
-            statistics.recordCacheEntryAdded();
-            statistics.updateCacheSize(cache.size());
-            return value;
-        }
+                statistics.recordCacheEntryAdded();
+                refreshLocalCacheTotals();
+                return value;
+            }
 
         @Override
-        public <T> void put(String key, T value) {
-            ThreadSafeCache<String, Object> cache = getOrCreateCache();
-            cache.put(key, value);
-            statistics.recordCacheEntryAdded();
-            statistics.updateCacheSize(cache.size());
-        }
+            public <T> void put(String key, T value) {
+                ThreadSafeCache<String, Object> cache = getOrCreateCache();
+                cache.put(key, value);
+                statistics.recordCacheEntryAdded();
+                refreshLocalCacheTotals();
+            }
 
         @Override
         public boolean contains(String key) {
@@ -361,22 +375,22 @@ public class ConnectedModImpl implements ConnectedMod {
         @Override
         public void remove(String key) {
             ThreadSafeCache<String, Object> cache = getOrCreateCache();
-            Object removed = cache.getIfPresent(key);
-            if (removed != null) {
-                cache.invalidate(key);
-                statistics.recordCacheEntryRemoved();
-                statistics.updateCacheSize(cache.size());
+                Object removed = cache.getIfPresent(key);
+                if (removed != null) {
+                    cache.invalidate(key);
+                    statistics.recordCacheEntryRemoved();
+                    refreshLocalCacheTotals();
+                }
             }
-        }
 
         @Override
-        public void clear() {
-            ThreadSafeCache<String, Object> cache = caches.remove(cacheName);
-            if (cache != null) {
-                cache.invalidateAll();
-                statistics.updateCacheSize(0);
+            public void clear() {
+                ThreadSafeCache<String, Object> cache = caches.remove(cacheName);
+                if (cache != null) {
+                    cache.invalidateAll();
+                    refreshLocalCacheTotals();
+                }
             }
-        }
 
         @Override
         public void invalidatePattern(String pattern) {
@@ -663,10 +677,12 @@ public class ConnectedModImpl implements ConnectedMod {
         private final AtomicLong cacheHits = new AtomicLong();
         private final AtomicLong cacheMisses = new AtomicLong();
         private final AtomicLong totalCacheEntries = new AtomicLong();
+        private final AtomicLong totalCacheBytes = new AtomicLong();
         private final AtomicLong totalGPUTimeNanos = new AtomicLong();
         private final AtomicLong peakVRAMUsage = new AtomicLong();
         private final AtomicLong cpuFallbackCount = new AtomicLong();
         private volatile Instant lastActivity = Instant.now();
+        private static final long ESTIMATED_ENTRY_BYTES = 512L;
 
         public ModStatisticsImpl(String modId, String version) {
             this.modId = modId;
@@ -728,8 +744,20 @@ public class ConnectedModImpl implements ConnectedMod {
         }
 
         public void updateCacheSize(long size) {
-            totalCacheEntries.set(Math.max(0, size));
-            if (size > 0) {
+            long entries = Math.max(0, size);
+            totalCacheEntries.set(entries);
+            totalCacheBytes.set(entries * ESTIMATED_ENTRY_BYTES);
+            if (entries > 0) {
+                lastActivity = Instant.now();
+            }
+        }
+
+        public void updateCacheStats(long entries, long bytes) {
+            long safeEntries = Math.max(0L, entries);
+            long safeBytes = Math.max(0L, bytes);
+            totalCacheEntries.set(safeEntries);
+            totalCacheBytes.set(safeBytes);
+            if (safeEntries > 0 || safeBytes > 0) {
                 lastActivity = Instant.now();
             }
         }
@@ -788,7 +816,7 @@ public class ConnectedModImpl implements ConnectedMod {
         @Override public long getCacheSize() { return totalCacheEntries.get(); }
         @Override public long getCacheMaxSize() { return 1000; }
         @Override public long getCacheEvictions() { return 0; }
-        @Override public long getCacheMemoryUsage() { return 0; }
+        @Override public long getCacheMemoryUsage() { return totalCacheBytes.get(); }
 
         @Override public long getPacketsSent() { return packetsSent.get(); }
         @Override public long getPacketsReceived() { return packetsReceived.get(); }

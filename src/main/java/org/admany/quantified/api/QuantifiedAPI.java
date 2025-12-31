@@ -181,6 +181,16 @@ public final class QuantifiedAPI {
         return mod != null ? mod.getStatistics() : null;
     }
 
+    public static void reportCacheUsage(String modId, long entryCount, long bytes) {
+        if (modId == null || modId.isBlank()) {
+            return;
+        }
+        ConnectedModImpl mod = lookupConnectedMod(modId);
+        if (mod != null) {
+            mod.updateCacheStats(entryCount, bytes);
+        }
+    }
+
     public static java.util.Map<String, ModStatistics> getAllModStatistics() {
         java.util.Map<String, ModStatistics> stats = new java.util.HashMap<>();
         for (java.util.Map.Entry<String, ConnectedMod> entry : connectedMods.entrySet()) {
@@ -260,12 +270,9 @@ public final class QuantifiedAPI {
                 return mapped;
             }
 
-            // Registration is intentionally best-effort and idempotent.
-            // Mods should not have to re-register on every thread or after transient lifecycle events.
             try {
                 register(modId);
             } catch (Throwable ignored) {
-                // fall through to lazy handle creation
             }
 
             QuantifiedHandle created = handlesByMod.computeIfAbsent(modId, id -> {

@@ -285,6 +285,11 @@ public final class GPUMonitor {
             ? memoryManager.getConfiguredVramBytes()
             : totalMemoryBytes;
         long usedBytes = telemetrySample.usedMemoryBytes();
+        long activeVramBytes = Math.max(0L, taskTracker.getActiveVramBytes());
+        if (usedBytes <= 0L && activeVramBytes > 0L) {
+            // Telemetry can report 0 on some systems; fall back to task estimates.
+            usedBytes = activeVramBytes;
+        }
         if (configuredTotal > 0L) {
             usedBytes = Math.max(0L, Math.min(usedBytes, configuredTotal));
         } else {
@@ -298,6 +303,10 @@ public final class GPUMonitor {
         long cappedUsage = Math.min(apiUsageBytes, apiBudgetBytes);
 
         double computeUtil = telemetrySample.computeUtilization();
+        int activeCompute = Math.max(0, taskTracker.getActiveComputeUnits());
+        if ((Double.isNaN(computeUtil) || computeUtil <= 0.0d) && activeCompute > 0) {
+            computeUtil = Math.min(1.0d, activeCompute / (double) Math.max(1, totalComputeUnits));
+        }
         if (Double.isNaN(computeUtil) || computeUtil < 0.0d) {
             computeUtil = Math.min(1.0d, Math.max(0.0d,
                 taskTracker.getActiveComputeUnits() / (double) Math.max(1, totalComputeUnits)));
