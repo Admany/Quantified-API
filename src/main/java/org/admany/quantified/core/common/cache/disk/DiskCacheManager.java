@@ -1,5 +1,6 @@
 package org.admany.quantified.core.common.cache.disk;
 
+import org.admany.quantified.core.common.util.QuantifiedPaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,8 +35,8 @@ public final class DiskCacheManager {
         if (initialized) return;
 
         try {
-            String gameDir = System.getProperty("user.dir");
-            baseCachePath = Paths.get(gameDir, "QuantifiedAPI");
+            QuantifiedPaths.ensureCacheLayout(LOGGER);
+            baseCachePath = QuantifiedPaths.getCacheDir();
             Files.createDirectories(baseCachePath);
 
             LOGGER.info("Initialized disk cache at: {}", baseCachePath);

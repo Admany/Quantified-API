@@ -3,12 +3,12 @@ package org.admany.quantified.core.common.opencl.cache;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.reflect.TypeToken;
-import net.minecraftforge.fml.loading.FMLPaths;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
 import org.admany.quantified.core.common.opencl.core.OpenCLContext;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager.CLBuffer;
 import org.admany.quantified.core.common.opencl.gpu.GPUDetector;
 import org.admany.quantified.core.common.opencl.gpu.GPUMonitor;
+import org.admany.quantified.core.common.util.QuantifiedPaths;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -22,7 +22,6 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -697,7 +696,8 @@ public final class TieredGpuCache {
 
         DiskManifest(String modId) {
             this.modId = modId;
-            Path base = FMLPaths.GAMEDIR.get().resolve(Paths.get("QuantifiedAPI", modId));
+            QuantifiedPaths.ensureCacheLayout();
+            Path base = QuantifiedPaths.getCacheDir().resolve(modId);
             this.cacheDir = base.resolve("gpuCache");
             this.manifestPath = base.resolve("gpu-manifest.json");
             try {

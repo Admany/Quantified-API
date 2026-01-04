@@ -18,14 +18,14 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 import org.admany.quantified.core.common.cache.interfaces.ThreadSafeCache;
+import org.admany.quantified.core.common.util.QuantifiedPaths;
 
 public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
 
     private static final Logger LOGGER = Logger.getLogger(PersistentCache.class.getName());
-    private static final String QUANTIFIED_API_FOLDER = "QuantifiedAPI";
-
     public static Path cacheRootDirectory() {
-        return Paths.get(QUANTIFIED_API_FOLDER);
+        QuantifiedPaths.ensureCacheLayout();
+        return QuantifiedPaths.getCacheDir();
     }
 
     private final ThreadSafeCache<K, V> delegate;
@@ -56,7 +56,7 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
     private volatile boolean closed = false;
 
     public PersistentCache(ThreadSafeCache<K, V> delegate, String modId, String cacheName, boolean compression) {
-        this(delegate, modId, cacheName, compression, Paths.get(QUANTIFIED_API_FOLDER));
+        this(delegate, modId, cacheName, compression, cacheRootDirectory());
     }
 
     public PersistentCache(ThreadSafeCache<K, V> delegate, String modId, String cacheName, boolean compression, Path baseDir) {

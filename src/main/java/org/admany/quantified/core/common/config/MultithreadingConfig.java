@@ -4,7 +4,9 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.fml.loading.FMLEnvironment;
+import net.minecraftforge.fml.loading.FMLPaths;
 import net.minecraftforge.server.ServerLifecycleHooks;
+import org.admany.quantified.core.common.util.QuantifiedPaths;
 import org.slf4j.Logger;
 
 import java.io.*;
@@ -81,7 +83,7 @@ public class MultithreadingConfig {
         public boolean enableMetrics = true; // Enable performance metrics collection
         public int metricsIntervalSeconds = 30; // Metrics collection interval in seconds
         public boolean exportMetricsToFile = false; // Export metrics to JSON file
-        public String metricsExportPath = "config/quantified/metrics/"; // Path for metrics export
+        public String metricsExportPath = "config/QuantifiedAPI/metrics/"; // Path for metrics export
         public int maxMetricsHistoryHours = 24; // Maximum metrics history retention in hours
 
         // === Security and Safety ===
@@ -97,7 +99,7 @@ public class MultithreadingConfig {
         public boolean debugShowTimings = false; // Show timing information for operations
         public boolean debugShowThreading = false; // Show thread creation/destruction logs
         public boolean debugSaveToFile = false; // Save debug output to file
-        public String debugLogFile = "config/quantified/debug.log"; // Debug log file path
+        public String debugLogFile = "config/QuantifiedAPI/debug.log"; // Debug log file path
         public int debugMaxLogSizeMb = 10; // Maximum debug log file size in MB
 
         // === Experimental Features ===
@@ -114,8 +116,11 @@ public class MultithreadingConfig {
      * ensuring the system always has a valid configuration to operate with.
      */
     public static Config loadOrCreateConfig(Logger logger) {
-        String path = "config/quantified/quantified_config.json";
-        String legacyPath = "config/quantified.json";
+        java.nio.file.Path configPath = QuantifiedPaths.getConfigFile();
+        String path = configPath.toString();
+        String legacyPath = FMLPaths.CONFIGDIR.get().resolve("quantified.json").toString();
+        java.nio.file.Path legacyConfigPath = FMLPaths.CONFIGDIR.get().resolve("quantified").resolve("quantified_config.json");
+        java.nio.file.Path legacyRootConfigPath = FMLPaths.GAMEDIR.get().resolve("QuantifiedAPI").resolve("quantified_config.json");
         // Treat as server if we positively detect a dedicated server, even if Dist is misreported
         boolean physIsServer = FMLEnvironment.dist == Dist.DEDICATED_SERVER;
         boolean detectedServer = isDedicatedServerEnv();
@@ -132,8 +137,11 @@ public class MultithreadingConfig {
         }
 
         try {
+            QuantifiedPaths.migrateLegacyConfig(legacyConfigPath);
+            QuantifiedPaths.migrateLegacyConfig(legacyRootConfigPath);
+
             // Try to load existing config
-            File configFile = new File(path);
+            File configFile = configPath.toFile();
             if (configFile.exists()) {
                 try (FileReader reader = new FileReader(configFile)) {
                     // Read the entire file content
@@ -217,12 +225,15 @@ public class MultithreadingConfig {
         if (isServer && config.developerStressTest) {
             config.developerStressTest = false;
         }
+
+        config.metricsExportPath = normalizeLegacyPath(config.metricsExportPath, "metrics/");
+        config.debugLogFile = normalizeLegacyPath(config.debugLogFile, "debug.log");
     }
 
     private static void migrateLegacyConfigIfNeeded(String legacyPath, String newPath) {
         try {
             File legacyFile = new File(legacyPath);
-            if (legacyFile.exists()) {
+            if (legacyFile.exists() && !QuantifiedPaths.getConfigFile().toFile().exists()) {
                 LOGGER.info("Migrating legacy config from " + legacyPath + " to " + newPath);
                 // Load legacy config
                 try (FileReader reader = new FileReader(legacyFile)) {
@@ -296,13 +307,28 @@ public class MultithreadingConfig {
         }
     }
 
+    private static String normalizeLegacyPath(String value, String defaultSuffix) {
+        String defaultPath = "config/QuantifiedAPI/" + defaultSuffix;
+        if (value == null || value.isBlank()) {
+            return defaultPath;
+        }
+        String normalized = value.replace('\\', '/');
+        if (normalized.startsWith("config/quantified/")) {
+            return "config/QuantifiedAPI/" + normalized.substring("config/quantified/".length());
+        }
+        if (normalized.startsWith("config/quantified")) {
+            return "config/QuantifiedAPI" + normalized.substring("config/quantified".length());
+        }
+        return value;
+    }
+
     /**
      * Generates a pretty ADM-style JSON config file with an ASCII header,
      * grouped commented sections, and standard JSON fields.
      * This approach makes the config file self-documenting and easy for users to edit.
      */
     public static void writePrettyJsonConfig(Config config) {
-        String path = "config/quantified/quantified_config.json";
+        String path = QuantifiedPaths.getConfigFile().toString();
         File configFile = new File(path);
         File parentDir = configFile.getParentFile();
         if (parentDir != null && !parentDir.exists()) parentDir.mkdirs();
