@@ -12,11 +12,16 @@ import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class QuantifiedPaths {
     private static final Logger LOGGER = LoggerFactory.getLogger(QuantifiedPaths.class);
     private static final String ROOT_FOLDER = "QuantifiedAPI";
+    private static final String LEGACY_ROOT_LOWER = "quantified";
+    private static final String LEGACY_ROOT_SPACED = "Quantified API";
     private static final String CACHE_FOLDER = "cache";
     private static final String CONFIG_FILE = "quantified_config.json";
     private static final AtomicBoolean MIGRATED = new AtomicBoolean(false);
@@ -36,16 +41,14 @@ public final class QuantifiedPaths {
         return getConfigDir().resolve(CONFIG_FILE);
     }
 
-    private static Path getLegacyCacheDir() {
-        return FMLPaths.GAMEDIR.get().resolve(ROOT_FOLDER);
-    }
-
     public static void ensureCacheLayout() {
         ensureCacheLayout(LOGGER);
     }
 
     public static void ensureCacheLayout(Logger logger) {
-        if (!MIGRATED.compareAndSet(false, true)) {
+        boolean initialRun = MIGRATED.compareAndSet(false, true);
+        boolean legacyPresent = hasLegacyRoots();
+        if (!initialRun && !legacyPresent) {
             return;
         }
         Path cacheDir = getCacheDir();
@@ -57,6 +60,9 @@ public final class QuantifiedPaths {
             }
         }
         migrateLegacyCache(cacheDir, logger);
+        if (legacyPresent && hasLegacyRoots()) {
+            MIGRATED.set(false);
+        }
     }
 
     public static void migrateLegacyConfig(Path legacyConfigPath) {
@@ -76,7 +82,16 @@ public final class QuantifiedPaths {
     }
 
     private static void migrateLegacyCache(Path cacheDir, Logger logger) {
-        Path legacyRoot = getLegacyCacheDir();
+        Path configRoot = getConfigDir();
+        for (Path legacyRoot : legacyRoots()) {
+            if (legacyRoot.equals(configRoot)) {
+                continue;
+            }
+            migrateLegacyRoot(legacyRoot, cacheDir, configRoot, logger);
+        }
+    }
+
+    private static void migrateLegacyRoot(Path legacyRoot, Path cacheDir, Path configRoot, Logger logger) {
         if (!Files.exists(legacyRoot) || !Files.isDirectory(legacyRoot)) {
             return;
         }
@@ -91,7 +106,9 @@ public final class QuantifiedPaths {
                     migrateLegacyCacheFolder(entry, cacheDir, logger);
                     continue;
                 }
-                Path target = cacheDir.resolve(entry.getFileName());
+                Path target = shouldMoveToConfigRoot(entry)
+                    ? configRoot.resolve(entry.getFileName())
+                    : cacheDir.resolve(entry.getFileName());
                 moveEntry(entry, target, logger);
             }
         } catch (IOException e) {
@@ -197,5 +214,43 @@ public final class QuantifiedPaths {
                 return FileVisitResult.CONTINUE;
             }
         });
+    }
+
+    private static List<Path> legacyRoots() {
+        List<Path> roots = new ArrayList<>();
+        Path gameDir = FMLPaths.GAMEDIR.get();
+        roots.add(gameDir.resolve(ROOT_FOLDER));
+        roots.add(gameDir.resolve(LEGACY_ROOT_LOWER));
+        roots.add(gameDir.resolve(LEGACY_ROOT_SPACED));
+        Path configDir = FMLPaths.CONFIGDIR.get();
+        roots.add(configDir.resolve(LEGACY_ROOT_LOWER));
+        roots.add(configDir.resolve(LEGACY_ROOT_SPACED));
+        return roots;
+    }
+
+    private static boolean hasLegacyRoots() {
+        Path configRoot = getConfigDir();
+        for (Path root : legacyRoots()) {
+            if (root.equals(configRoot)) {
+                continue;
+            }
+            if (Files.exists(root)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean shouldMoveToConfigRoot(Path entry) throws IOException {
+        if (!Files.isDirectory(entry)) {
+            return false;
+        }
+        String name = entry.getFileName().toString().toLowerCase(Locale.ROOT);
+        return name.equals("metrics")
+            || name.equals("logs")
+            || name.equals("telemetry")
+            || name.equals("debug")
+            || name.equals("reports")
+            || name.equals("dashboard");
     }
 }

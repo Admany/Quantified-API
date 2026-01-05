@@ -36,9 +36,9 @@ public class MultithreadingConfig {
         public String logLevel = "INFO"; // Logging level (TRACE, DEBUG, INFO, WARN, ERROR)
 
         // === Parallel Execution ===
-        public int parallelMaxThreads = Math.max(4, Runtime.getRuntime().availableProcessors());
-        public int parallelQueueLimit = 4096;
-        public int parallelMaxSlicesPerMod = 512;
+        public int parallelMaxThreads = Math.max(4, Runtime.getRuntime().availableProcessors() * 2);
+        public int parallelQueueLimit = 15000;
+        public int parallelMaxSlicesPerMod = 2048;
         public String parallelFailurePolicy = "FAIL_FAST";
 
         // === Networking Configuration ===

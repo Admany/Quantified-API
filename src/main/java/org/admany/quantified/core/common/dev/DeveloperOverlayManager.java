@@ -4,6 +4,7 @@ import org.admany.quantified.api.model.QuantifiedStats;
 import org.admany.quantified.core.common.async.core.AsyncManager;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.opencl.gpu.GPUMonitor;
+import org.admany.quantified.core.common.parallel.metrics.ParallelMetrics;
 import org.admany.quantified.core.common.telemetry.TelemetryService;
 import org.admany.quantified.core.common.threading.pool.ThreadPoolStats;
 import org.admany.quantified.core.common.threading.scaling.SystemLoadMonitor;
@@ -162,6 +163,22 @@ public final class DeveloperOverlayManager {
             }
             if (schedulerSnapshot != null) {
                 execRate = schedulerSnapshot.execRate;
+            }
+
+            long parallelActive = 0L;
+            try {
+                ParallelMetrics.Snapshot parallelSnapshot = ParallelMetrics.snapshot();
+                if (parallelSnapshot != null && parallelSnapshot.modActiveSlices() != null) {
+                    parallelActive = parallelSnapshot.modActiveSlices().values().stream()
+                        .mapToLong(Long::longValue)
+                        .sum();
+                }
+            } catch (Throwable ignored) {
+            }
+
+            if (parallelActive > 0L) {
+                long combined = (long) queueDepth + parallelActive;
+                queueDepth = combined >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) combined;
             }
             // Debug: log queue stats during stress test
             if (DeveloperFeatures.isStressTestEnabled() && LOGGER.isLoggable(Level.FINE)) {

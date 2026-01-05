@@ -604,7 +604,7 @@ public final class DeveloperDashboardServer {
     private static JsonObject buildResourcePayload(DeveloperOverlayManager.DeveloperDiagnosticsView diagnostics) {
         JsonObject payload = new JsonObject();
         payload.addProperty("generatedAt", System.currentTimeMillis());
-        payload.addProperty("queueWarningThreshold", 2000);
+        payload.addProperty("queueWarningThreshold", org.admany.quantified.core.common.parallel.config.ParallelConfig.queueLimit());
 
         CacheManager.CacheUsage usage = CacheManager.cacheUsageSnapshot();
         JsonObject summary = new JsonObject();
@@ -616,7 +616,7 @@ public final class DeveloperDashboardServer {
         long vramCacheBytes = Math.max(0L, OpenCLManager.cacheVramUsageBytes());
         long vramTaskBytes = Math.max(0L, OpenCLManager.activeTaskVramBytes());
         long vramContextBytes = Math.max(0L, vramTelemetryBytes - vramCacheBytes - vramTaskBytes);
-        long vramEffectiveBytes = Math.max(0L, vramTelemetryBytes - vramContextBytes);
+        long vramEffectiveBytes = Math.max(vramTelemetryBytes, vramCacheBytes + vramTaskBytes);
         summary.addProperty("vramUsedBytes", vramEffectiveBytes);
         summary.addProperty("vramBudgetBytes", Math.max(0L, diagnostics.snapshot().gpuVramBudgetBytes()));
         payload.add("summary", summary);
@@ -1195,7 +1195,7 @@ public final class DeveloperDashboardServer {
         long vramCacheBytes = Math.max(0L, OpenCLManager.cacheVramUsageBytes());
         long vramTaskBytes = Math.max(0L, OpenCLManager.activeTaskVramBytes());
         long vramContextBytes = Math.max(0L, vramTelemetryBytes - vramCacheBytes - vramTaskBytes);
-        long vramEffectiveBytes = Math.max(0L, vramTelemetryBytes - vramContextBytes);
+        long vramEffectiveBytes = Math.max(vramTelemetryBytes, vramCacheBytes + vramTaskBytes);
         payload.addProperty("gpuVramBudgetBytes", diagnostics.snapshot().gpuVramBudgetBytes());
         payload.addProperty("gpuVramUsedBytes", vramEffectiveBytes);
         payload.addProperty("gpuVramUsedTelemetryBytes", vramTelemetryBytes);

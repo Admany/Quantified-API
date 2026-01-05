@@ -27,7 +27,7 @@ public record AsyncManagerBootstrap(int foregroundThreads,
         int fgMax = Math.max(2, maxThreads * 3 / 4);
         int bgMax = Math.max(2, maxThreads / 4);
 
-        return new AsyncManagerBootstrap(fgMin, bgMin, fgMax, bgMax, 2048, Duration.ofMillis(250),
+        return new AsyncManagerBootstrap(fgMin, bgMin, fgMax, bgMax, 15000, Duration.ofMillis(250),
             ThreadPoolErrorHandler.logging(java.util.logging.Logger.getLogger(PriorityScheduler.class.getName())));
     }
 
