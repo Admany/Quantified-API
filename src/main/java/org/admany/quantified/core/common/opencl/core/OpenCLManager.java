@@ -356,6 +356,7 @@ public final class OpenCLManager {
     public static void clearGPUCaches() {
         TieredGpuCache cache = tieredCache;
         if (cache != null) cache.clear();
+        evictBufferPool(true);
         if (monitor != null) {
             monitor.clearMemoryTracking();
             DeveloperOverlayManager.recordApiLog("[OpenCL] GPU memory tracking cleared");
@@ -383,6 +384,12 @@ public final class OpenCLManager {
 
     public static boolean canAcceptTask(OpenCLTask<?> task) { return OpenCLTaskManager.canAcceptTask(task); }
     public static <T> CompletableFuture<T> executeOnGpu(OpenCLTask<T> task) { return OpenCLTaskManager.executeOnGpu(task); }
+    public static void evictBufferPool(boolean aggressive) {
+        OpenCLContext current = context;
+        if (current != null) {
+            current.trimBufferPool(aggressive);
+        }
+    }
 
     private static void cleanupAfterFailure() {
         TieredGpuCache cache = tieredCache;

@@ -109,6 +109,10 @@ public final class QuantifiedCoreForge {
         });
 
         AsyncManagerBootstrap bootstrap = AsyncManagerBootstrap.defaults(availableProcessors);
+        int configuredQueueBound = MultithreadingConfig.CONFIG != null ? MultithreadingConfig.CONFIG.taskQueueSize : 0;
+        if (configuredQueueBound > 0) {
+            bootstrap = bootstrap.withQueueBound(configuredQueueBound);
+        }
         LOGGER.info("Async scheduler configured with " + bootstrap.foregroundThreads()
             + " foreground and " + bootstrap.backgroundThreads() + " background threads (" + availableProcessors + " cores detected)");
         String startupMsg3 = "[Quantified] Quantified Async Pool Start";

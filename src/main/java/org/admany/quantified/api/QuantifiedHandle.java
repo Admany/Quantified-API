@@ -29,7 +29,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
 public final class QuantifiedHandle {
@@ -85,6 +87,10 @@ public final class QuantifiedHandle {
     private static final long MIN_CACHE_SAMPLES = 16L;
 
     private static final Duration DEFAULT_CACHE_TTL = Duration.ofMinutes(5);
+    private static final long CACHE_TOTAL_REFRESH_MIN_INTERVAL_NS = TimeUnit.MILLISECONDS.toNanos(250);
+
+    private final AtomicLong lastCacheRefreshNs = new AtomicLong();
+    private final AtomicBoolean cacheRefreshScheduled = new AtomicBoolean();
 
     <T> CompletableFuture<T> submitTask(QuantifiedTask<T> task) {
         Objects.requireNonNull(task, "task");
@@ -338,12 +344,64 @@ public final class QuantifiedHandle {
     }
 
     private void refreshModCacheTotals(ConnectedModImpl modMetrics) {
+        if (modMetrics == null) {
+            return;
+        }
+        long now = System.nanoTime();
+        long last = lastCacheRefreshNs.get();
+        if (now - last < CACHE_TOTAL_REFRESH_MIN_INTERVAL_NS) {
+            return;
+        }
+        if (!lastCacheRefreshNs.compareAndSet(last, now)) {
+            return;
+        }
+
+        if (isServerThread()) {
+            scheduleCacheTotalsRefresh();
+            return;
+        }
+
+        applyCacheTotals(modMetrics);
+    }
+
+    private void scheduleCacheTotalsRefresh() {
+        if (!cacheRefreshScheduled.compareAndSet(false, true)) {
+            return;
+        }
+        long key = ThreadLocalRandom.current().nextLong();
+        AsyncManager.submitSync(
+            key,
+            PriorityTaskType.BACKGROUND,
+            0.0,
+            () -> {
+                try {
+                    ConnectedModImpl modMetrics = QuantifiedAPI.lookupConnectedMod(modId);
+                    if (modMetrics != null) {
+                        applyCacheTotals(modMetrics);
+                    }
+                } finally {
+                    cacheRefreshScheduled.set(false);
+                }
+                return null;
+            },
+            null,
+            true,
+            modId
+        );
+    }
+
+    private void applyCacheTotals(ConnectedModImpl modMetrics) {
         long totalEntries = 0L;
         for (ThreadSafeCache<String, Object> cache : caches.values()) {
             totalEntries += cache.size();
         }
         long totalBytes = totalEntries * 512L;
         modMetrics.updateCacheStats(totalEntries, totalBytes);
+    }
+
+    private static boolean isServerThread() {
+        String name = Thread.currentThread().getName();
+        return name != null && name.contains("Server thread");
     }
 }
 

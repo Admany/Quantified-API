@@ -57,6 +57,11 @@ public final class QuantifiedOpenCL {
         T execute(Context context) throws Exception;
     }
 
+    public interface CacheCodec<T> {
+        ByteBuffer encode(T value);
+        T decode(ByteBuffer data);
+    }
+
     public static <T> Builder<T> builder(String modId, String taskName, long taskKey) {
         return new Builder<>(modId, taskName, taskKey);
     }
@@ -94,6 +99,8 @@ public final class QuantifiedOpenCL {
         private WorkloadKind kind = WorkloadKind.GENERAL;
         private Duration timeout;
         private boolean allowMainThreadRerouting = true;
+        private String cacheKey;
+        private CacheCodec<T> cacheCodec;
 
         private Builder(String modId, String taskName, long taskKey) {
             this.modId = Objects.requireNonNull(modId, "modId");
@@ -142,6 +149,16 @@ public final class QuantifiedOpenCL {
 
         public Builder<T> allowMainThreadRerouting(boolean allowMainThreadRerouting) {
             this.allowMainThreadRerouting = allowMainThreadRerouting;
+            return this;
+        }
+
+        public Builder<T> cacheKey(String cacheKey) {
+            this.cacheKey = cacheKey;
+            return this;
+        }
+
+        public Builder<T> cacheCodec(CacheCodec<T> cacheCodec) {
+            this.cacheCodec = cacheCodec;
             return this;
         }
 
@@ -203,6 +220,14 @@ public final class QuantifiedOpenCL {
 
         public boolean allowMainThreadRerouting() {
             return allowMainThreadRerouting;
+        }
+
+        public String cacheKey() {
+            return cacheKey;
+        }
+
+        public CacheCodec<T> cacheCodec() {
+            return cacheCodec;
         }
 
         private void validate() {
@@ -305,6 +330,14 @@ public final class QuantifiedOpenCL {
 
         public Optional<Duration> timeout() {
             return Optional.ofNullable(spec.timeout());
+        }
+
+        public String cacheKey() {
+            return spec.cacheKey();
+        }
+
+        public CacheCodec<T> cacheCodec() {
+            return spec.cacheCodec();
         }
     }
 

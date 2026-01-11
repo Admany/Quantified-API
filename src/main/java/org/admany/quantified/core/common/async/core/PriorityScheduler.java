@@ -36,6 +36,7 @@ public final class PriorityScheduler {
     private final PriorityBlockingQueue<PriorityTask> foregroundQueue;
     private final BlockingQueue<PriorityTask> backgroundQueue;
     private final ConcurrentHashMap<Long, PriorityTask> coalesceMap = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, Boolean> promotedKeys = new ConcurrentHashMap<>();
 
     private final ExecutorService foregroundPool;
     private final ExecutorService backgroundPool;
@@ -131,10 +132,6 @@ public final class PriorityScheduler {
             LOGGER.log(Level.FINEST, "Scheduler not running, dropping task {0}", task);
             return;
         }
-        int queued = foregroundQueue.size() + backgroundQueue.size();
-        if (queued > queueBound) {
-            droppedTasks.incrementAndGet();
-        }
         tasksSubmitted.incrementAndGet();
         if (QuantifiedAPI.isPrintDebugLogs()) {
             LOGGER.fine("[DEBUG] PriorityScheduler: Submitting task " + task.taskKey() + " to queue");
@@ -145,12 +142,39 @@ public final class PriorityScheduler {
             duplicatesSuppressed.incrementAndGet();
             return;
         }
+
+        // Superseded any earlier task for this key; allow future promotion.
+        promotedKeys.remove(task.taskKey());
+
+        int queued = foregroundQueue.size() + backgroundQueue.size();
+        int uniquePending = coalesceMap.size();
+        boolean critical = task.type() == PriorityTaskType.FOREGROUND
+            || (task.metadata() != null && task.metadata().gpuRequired())
+            || task.score() >= 0.9;
+
+        // Enforce a real bound under overload. Prefer to drop non-critical tasks.
+        if ((queued >= queueBound || uniquePending > queueBound) && (!critical || queued >= (queueBound * 2))) {
+            droppedTasks.incrementAndGet();
+            coalesceMap.remove(task.taskKey(), task);
+            return;
+        }
+
         if (shouldRouteForeground(task)) {
+            if (foregroundQueue.size() >= queueBound && !critical) {
+                droppedTasks.incrementAndGet();
+                coalesceMap.remove(task.taskKey(), task);
+                return;
+            }
             foregroundQueue.offer(task);
             if (QuantifiedAPI.isPrintDebugLogs()) {
                 LOGGER.fine("[DEBUG] PriorityScheduler: Task " + task.taskKey() + " routed to foreground queue");
             }
         } else {
+            if (backgroundQueue.size() >= queueBound && !critical) {
+                droppedTasks.incrementAndGet();
+                coalesceMap.remove(task.taskKey(), task);
+                return;
+            }
             backgroundQueue.offer(task);
             if (QuantifiedAPI.isPrintDebugLogs()) {
                 LOGGER.fine("[DEBUG] PriorityScheduler: Task " + task.taskKey() + " routed to background queue");
@@ -185,6 +209,7 @@ public final class PriorityScheduler {
                 if (current == null || current != task) {
                     continue; // superseded
                 }
+                promotedKeys.remove(task.taskKey());
                 executeTask(current, foregroundExecuted);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
@@ -228,6 +253,7 @@ public final class PriorityScheduler {
                 if (current == null || current != task) {
                     continue;
                 }
+                promotedKeys.remove(task.taskKey());
                 executeTask(current, backgroundExecuted);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
@@ -296,8 +322,14 @@ public final class PriorityScheduler {
                 continue; // Don't promote background tasks to prevent imbalance
             }
             if (now - task.enqueuedAtNanos() >= promoteAfter) {
-                task.adjustScore(0.1);
-                foregroundQueue.offer(task);
+                // Prevent runaway queue growth: only promote a given key once until it executes.
+                if (foregroundQueue.size() >= queueBound) {
+                    continue;
+                }
+                if (promotedKeys.putIfAbsent(task.taskKey(), Boolean.TRUE) == null) {
+                    task.adjustScore(0.1);
+                    foregroundQueue.offer(task);
+                }
             }
         }
         adjustScaling();

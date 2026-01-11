@@ -8,6 +8,10 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Function;
 
@@ -16,6 +20,18 @@ import org.admany.quantified.core.common.cache.interfaces.ThreadSafeCache;
 
 public class CaffeineThreadSafeCache<K, V> implements TTLCache<K, V> {
 
+    private static final int EVICTION_SAMPLE_SIZE = Math.max(8,
+        Integer.getInteger("quantified.cache.evictSample", 64));
+    private static final int EVICTION_MAX_REMOVALS = Math.max(1,
+        Integer.getInteger("quantified.cache.evictMax", 64));
+    private static final long EVICTION_MIN_INTERVAL_NS = TimeUnit.MILLISECONDS.toNanos(Math.max(1,
+        Integer.getInteger("quantified.cache.evictMinIntervalMs", 5)));
+    private static final ExecutorService EVICTION_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "quantified-cache-evictor");
+        thread.setDaemon(true);
+        return thread;
+    });
+
     private final ConcurrentMap<K, CacheEntry<V>> storage;
     private final long maximumSize;
     private final long ttlNanos;
@@ -23,6 +39,8 @@ public class CaffeineThreadSafeCache<K, V> implements TTLCache<K, V> {
     private final LongAdder hitCount = new LongAdder();
     private final LongAdder missCount = new LongAdder();
     private final LongAdder evictionCount = new LongAdder();
+    private final AtomicBoolean evictionScheduled = new AtomicBoolean(false);
+    private volatile long lastEvictionNanos;
 
     private CaffeineThreadSafeCache(CacheBuilderSpec spec) {
     this.ttlNanos = spec.ttl() == null ? -1L : spec.ttl().toNanos();
@@ -181,25 +199,61 @@ public class CaffeineThreadSafeCache<K, V> implements TTLCache<K, V> {
         if (maximumSize <= 0) {
             return;
         }
-        long overshoot = storage.size() - maximumSize;
-        while (overshoot > 0) {
-            K oldestKey = null;
-            long oldestAccess = Long.MAX_VALUE;
-            for (Map.Entry<K, CacheEntry<V>> entry : storage.entrySet()) {
-                long access = entry.getValue().lastAccessNanos();
-                if (access < oldestAccess) {
-                    oldestAccess = access;
-                    oldestKey = entry.getKey();
+        if (storage.size() <= maximumSize) {
+            return;
+        }
+        scheduleEviction();
+    }
+
+    private void scheduleEviction() {
+        long now = System.nanoTime();
+        if ((now - lastEvictionNanos) < EVICTION_MIN_INTERVAL_NS) {
+            return;
+        }
+        if (!evictionScheduled.compareAndSet(false, true)) {
+            return;
+        }
+        EVICTION_EXECUTOR.execute(this::runEviction);
+    }
+
+    private void runEviction() {
+        try {
+            int removals = 0;
+            while (removals < EVICTION_MAX_REMOVALS && storage.size() > maximumSize) {
+                K candidate = pickEvictionCandidate();
+                if (candidate == null) {
+                    break;
+                }
+                if (storage.remove(candidate) != null) {
+                    evictionCount.increment();
+                    removals++;
                 }
             }
-            if (oldestKey == null) {
+        } finally {
+            lastEvictionNanos = System.nanoTime();
+            evictionScheduled.set(false);
+            if (storage.size() > maximumSize) {
+                scheduleEviction();
+            }
+        }
+    }
+
+    private K pickEvictionCandidate() {
+        K oldestKey = null;
+        long oldestAccess = Long.MAX_VALUE;
+        int sampled = 0;
+        for (Map.Entry<K, CacheEntry<V>> entry : storage.entrySet()) {
+            long access = entry.getValue().lastAccessNanos();
+            if (access < oldestAccess) {
+                oldestAccess = access;
+                oldestKey = entry.getKey();
+            }
+            sampled++;
+            if (sampled >= EVICTION_SAMPLE_SIZE) {
                 break;
             }
-            if (storage.remove(oldestKey) != null) {
-                evictionCount.increment();
-            }
-            overshoot = storage.size() - maximumSize;
         }
+        return oldestKey;
     }
 
     @Override

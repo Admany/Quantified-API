@@ -37,8 +37,8 @@ public class MultithreadingConfig {
 
         // === Parallel Execution ===
         public int parallelMaxThreads = Math.max(4, Runtime.getRuntime().availableProcessors() * 2);
-        public int parallelQueueLimit = 15000;
-        public int parallelMaxSlicesPerMod = 2048;
+        public int parallelQueueLimit = 4096;
+        public int parallelMaxSlicesPerMod = 4096;
         public String parallelFailurePolicy = "FAIL_FAST";
 
         // === Networking Configuration ===

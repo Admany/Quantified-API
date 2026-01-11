@@ -24,6 +24,7 @@ public final class OpenCLContext implements AutoCloseable {
     private volatile long programHandle = 0;
     @SuppressWarnings("unused")
     private volatile long deviceId = 0;
+    private final BufferPool bufferPool = new BufferPool();
 
     private OpenCLContext() {}
 
@@ -87,6 +88,12 @@ public final class OpenCLContext implements AutoCloseable {
     }
 
     public long createBuffer(long flags, long size) {
+        if (bufferPool.isEnabled() && bufferPool.isPoolable(flags)) {
+            long pooled = bufferPool.acquire(flags, size);
+            if (pooled != 0L) {
+                return pooled;
+            }
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             IntBuffer errcode = stack.mallocInt(1);
             ByteBuffer hostPtr = null;
@@ -105,6 +112,7 @@ public final class OpenCLContext implements AutoCloseable {
                 buffer = CL10.clCreateBuffer(contextHandle, flags, size, errcode);
             }
             checkCleError(errcode.get(0), "clCreateBuffer");
+            bufferPool.register(buffer, flags, size);
             return buffer;
         }
     }
@@ -175,6 +183,9 @@ public final class OpenCLContext implements AutoCloseable {
     }
 
     public void releaseBuffer(long buffer) {
+        if (bufferPool.release(buffer)) {
+            return;
+        }
         CL10.clReleaseMemObject(buffer);
     }
 
@@ -208,6 +219,7 @@ public final class OpenCLContext implements AutoCloseable {
                 contextHandle = 0;
             }
 
+            bufferPool.clear();
             resetHandles();
             LOGGER.info("OpenCL context cleaned up");
 
@@ -234,6 +246,10 @@ public final class OpenCLContext implements AutoCloseable {
     private boolean isLibraryNotLoaded(IllegalStateException e) {
         String msg = e.getMessage();
         return msg != null && msg.toLowerCase(java.util.Locale.ROOT).contains("opencl library has not been loaded");
+    }
+
+    public void trimBufferPool(boolean aggressive) {
+        bufferPool.trim(aggressive);
     }
 
     private long createContext(GPUDetector.OpenCLDevice device) {
@@ -441,6 +457,153 @@ public final class OpenCLContext implements AutoCloseable {
     private void checkCleError(int errcode, String operation) {
         if (errcode != CL10.CL_SUCCESS) {
             throw new IllegalStateException(operation + " failed with error code " + errcode);
+        }
+    }
+
+    private final class BufferPool {
+        private final java.util.Map<BufferKey, java.util.ArrayDeque<PooledBuffer>> buckets = new java.util.HashMap<>();
+        private final java.util.Map<Long, PooledBuffer> byHandle = new java.util.HashMap<>();
+        private long totalBytes = 0L;
+        private final long maxBytes = Math.max(64L * 1024L * 1024L,
+            Long.getLong("quantified.opencl.buffer_pool.max_bytes", 256L * 1024L * 1024L));
+        private final long maxIdleNanos = java.util.concurrent.TimeUnit.SECONDS.toNanos(
+            Math.max(5L, Long.getLong("quantified.opencl.buffer_pool.max_idle_seconds", 45L)));
+        private final Object mutex = new Object();
+
+        boolean isEnabled() {
+            return maxBytes > 0L;
+        }
+
+        boolean isPoolable(long flags) {
+            return (flags & (CL10.CL_MEM_COPY_HOST_PTR | CL10.CL_MEM_USE_HOST_PTR)) == 0;
+        }
+
+        long acquire(long flags, long size) {
+            if (size <= 0L) {
+                return 0L;
+            }
+            synchronized (mutex) {
+                BufferKey key = new BufferKey(flags, size);
+                java.util.ArrayDeque<PooledBuffer> queue = buckets.get(key);
+                if (queue != null) {
+                    while (!queue.isEmpty()) {
+                        PooledBuffer buffer = queue.pollFirst();
+                        if (buffer == null || buffer.released) {
+                            continue;
+                        }
+                        if (buffer.inUse) {
+                            continue;
+                        }
+                        buffer.inUse = true;
+                        buffer.lastUsed = System.nanoTime();
+                        return buffer.handle;
+                    }
+                }
+            }
+            return 0L;
+        }
+
+        void register(long handle, long flags, long size) {
+            if (!isEnabled() || !isPoolable(flags) || handle == 0L || size <= 0L) {
+                return;
+            }
+            synchronized (mutex) {
+                if (byHandle.containsKey(handle)) {
+                    return;
+                }
+                if (totalBytes + size > maxBytes) {
+                    return;
+                }
+                PooledBuffer buffer = new PooledBuffer(handle, flags, size);
+                buffer.inUse = true;
+                byHandle.put(handle, buffer);
+                totalBytes += size;
+            }
+        }
+
+        boolean release(long handle) {
+            if (!isEnabled() || handle == 0L) {
+                return false;
+            }
+            synchronized (mutex) {
+                PooledBuffer buffer = byHandle.get(handle);
+                if (buffer == null || buffer.released) {
+                    return false;
+                }
+                buffer.inUse = false;
+                buffer.lastUsed = System.nanoTime();
+                buckets.computeIfAbsent(buffer.key, k -> new java.util.ArrayDeque<>()).addLast(buffer);
+                trim(false);
+                return true;
+            }
+        }
+
+        void trim(boolean aggressive) {
+            synchronized (mutex) {
+                long now = System.nanoTime();
+                java.util.Iterator<java.util.Map.Entry<Long, PooledBuffer>> it = byHandle.entrySet().iterator();
+                while (it.hasNext()) {
+                    PooledBuffer buffer = it.next().getValue();
+                    if (buffer == null || buffer.released) {
+                        it.remove();
+                        continue;
+                    }
+                    if (buffer.inUse) {
+                        continue;
+                    }
+                    boolean idle = (now - buffer.lastUsed) >= maxIdleNanos;
+                    boolean overBudget = totalBytes > maxBytes;
+                    if (aggressive || idle || overBudget) {
+                        releaseBufferHandle(buffer);
+                        it.remove();
+                    }
+                }
+            }
+        }
+
+        void clear() {
+            synchronized (mutex) {
+                for (PooledBuffer buffer : byHandle.values()) {
+                    if (buffer != null && !buffer.released) {
+                        releaseBufferHandle(buffer);
+                    }
+                }
+                byHandle.clear();
+                buckets.clear();
+                totalBytes = 0L;
+            }
+        }
+
+        private void releaseBufferHandle(PooledBuffer buffer) {
+            try {
+                CL10.clReleaseMemObject(buffer.handle);
+            } catch (Throwable ignored) {
+            }
+            buffer.released = true;
+            totalBytes = Math.max(0L, totalBytes - buffer.size);
+            java.util.ArrayDeque<PooledBuffer> queue = buckets.get(buffer.key);
+            if (queue != null) {
+                queue.remove(buffer);
+            }
+        }
+
+        private record BufferKey(long flags, long size) {
+        }
+
+        private final class PooledBuffer {
+            final long handle;
+            final BufferKey key;
+            final long size;
+            boolean inUse;
+            boolean released;
+            long lastUsed;
+
+            PooledBuffer(long handle, long flags, long size) {
+                this.handle = handle;
+                this.key = new BufferKey(flags, size);
+                this.size = size;
+                this.lastUsed = System.nanoTime();
+            }
         }
     }
 

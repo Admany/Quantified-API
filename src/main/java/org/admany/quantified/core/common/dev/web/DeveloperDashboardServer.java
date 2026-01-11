@@ -609,6 +609,8 @@ public final class DeveloperDashboardServer {
         CacheManager.CacheUsage usage = CacheManager.cacheUsageSnapshot();
         JsonObject summary = new JsonObject();
         summary.addProperty("queueDepth", diagnostics.snapshot().queueDepth());
+        summary.addProperty("parallelActiveSlices", diagnostics.snapshot().parallelActiveSlices());
+        summary.addProperty("totalWork", diagnostics.snapshot().totalWork());
         summary.addProperty("cacheEntryCount", usage.entryCount());
         summary.addProperty("cacheRamBytes", usage.heapBytes());
         summary.addProperty("cacheDiskBytes", usage.diskBytes());
@@ -618,6 +620,7 @@ public final class DeveloperDashboardServer {
         long vramContextBytes = Math.max(0L, vramTelemetryBytes - vramCacheBytes - vramTaskBytes);
         long vramEffectiveBytes = Math.max(vramTelemetryBytes, vramCacheBytes + vramTaskBytes);
         summary.addProperty("vramUsedBytes", vramEffectiveBytes);
+        summary.addProperty("vramContextBytes", Math.max(0L, vramContextBytes));
         summary.addProperty("vramBudgetBytes", Math.max(0L, diagnostics.snapshot().gpuVramBudgetBytes()));
         payload.add("summary", summary);
 
@@ -881,7 +884,7 @@ public final class DeveloperDashboardServer {
     private static String formatOpenClDeviceLabel(GPUDetector.OpenCLDeviceInfo device) {
         String type = device.type() != null ? device.type().name().toLowerCase(Locale.ROOT) : "gpu";
         String vram = device.vramBytes() > 0 ? formatBytes(device.vramBytes()) : "unknown VRAM";
-        return device.name() + " (" + device.vendor() + " · " + type + " · " + vram + " · CU " + device.computeUnits() + ")";
+        return device.name() + " (" + device.vendor() + " / " + type + " / " + vram + " / CU " + device.computeUnits() + ")";
     }
 
     private static void applyConfigUpdates(JsonObject request) {
@@ -1265,6 +1268,8 @@ public final class DeveloperDashboardServer {
 
         json.addProperty("deviceName", snapshot.deviceName());
         json.addProperty("queueDepth", snapshot.queueDepth());
+        json.addProperty("parallelActiveSlices", snapshot.parallelActiveSlices());
+        json.addProperty("totalWork", snapshot.totalWork());
         json.addProperty("foregroundQueue", snapshot.foregroundQueue());
         json.addProperty("backgroundQueue", snapshot.backgroundQueue());
         json.addProperty("desiredForegroundWorkers", snapshot.desiredForegroundWorkers());
@@ -2748,11 +2753,11 @@ public final class DeveloperDashboardServer {
                         <p>Lock the dashboard behind strong credentials, choose the bind address and port, and opt into HTTPS when deploying beyond your LAN.</p>
                         <div class="callouts">
                             <div class="callout">
-                                <div class="icon">🔒</div>
-                                <div>Setup won’t move forward until your password meets every security requirement. That way, all development data stays locked behind strong authentication right from the start.</div>
+                                <div class="icon">!</div>
+                                <div>Setup won't move forward until your password meets every security requirement. That way, all development data stays locked behind strong authentication right from the start.</div>
                             </div>
                             <div class="callout">
-                                <div class="icon">🌐</div>
+                                <div class="icon">i</div>
                                 <div>Turn on HTTPS once you have your keystore ready. You can always change these settings later in the Quantified config file.</div>
                             </div>
                         </div>
@@ -3097,3 +3102,4 @@ public final class DeveloperDashboardServer {
         exchange.close();
     }
 }
+

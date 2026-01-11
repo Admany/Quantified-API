@@ -256,15 +256,15 @@ function cleanDiskLabel(disk) {
 function getHintIcon(hint) {
     const message = hint.message.toLowerCase();
     if (message.includes("overheating") || message.includes("choking") || message.includes("close to safety guardrails") || message.includes("cpu load > 80%")) {
-        return "⚠️";
+        return "!!";
     }
     if (hint.severity === "WARNING") {
-        return "🟡";
+        return "!";
     }
     if (hint.severity === "INFO") {
-        return "ℹ️";
+        return "i";
     }
-    return "✅";
+    return ".";
 }
 
 function formatNumber(value) {
@@ -506,6 +506,8 @@ const App = () => {
             const historyEntry = {
                 timestamp: snapshot.timestamp || Date.now(),
                 queueDepth: Number(snapshot.queueDepth ?? 0),
+                parallelActiveSlices: Number(snapshot.parallelActiveSlices ?? 0),
+                totalWork: Number(snapshot.totalWork ?? 0),
                 cpuCompute: Number(snapshot.cpuComputeUtil ?? snapshot.gpuComputeUtil ?? 0),
                 gpuCompute: Number(snapshot.gpuComputeUtil ?? 0),
                 gpuMemory: gpuMemoryRatio,
@@ -1067,9 +1069,11 @@ const App = () => {
         }
     }, [fetchResources]);
 
-    const queueThreshold = resourceData?.queueWarningThreshold ?? 2000;
+    const queueThreshold = resourceData?.queueWarningThreshold ?? 15000;
     const snapshot = state?.snapshot ?? {};
     const queueDepth = Number(snapshot.queueDepth ?? 0);
+    const parallelActiveSlices = Number(snapshot.parallelActiveSlices ?? 0);
+    const totalWork = Number(snapshot.totalWork ?? (queueDepth + parallelActiveSlices));
     const queueWarning = queueThreshold * 0.7;
     const gpuCompute = Number(snapshot.gpuComputeUtil ?? 0);
     const gpuMemory = Number(snapshot.gpuMemoryUtil ?? 0);
@@ -1137,7 +1141,7 @@ const App = () => {
             return "ok";
         };
 
-        const queueVariant = variantFor(queueDepth, queueWarning, queueThreshold);
+        const queueVariant = variantFor(totalWork, queueWarning, queueThreshold);
         const gpuVariant = variantFor(gpuCompute, 0.75, 0.9);
             const memoryVariant = variantFor(vramRatio, 0.8, 0.95);
         const cpuVariant = variantFor(cpuSystemLoad, 0.65, 0.85);
@@ -1154,10 +1158,12 @@ const App = () => {
             },
             {
                 label: "Queue",
-                badge: queueDepth >= queueThreshold ? "Max" : queueDepth >= queueWarning ? "Busy" : "Nominal",
+                badge: totalWork >= queueThreshold ? "Max" : totalWork >= queueWarning ? "Busy" : "Nominal",
                 variant: queueVariant,
-                detail: `${formatNumber(queueDepth)} tasks`,
-                message: `Soft limit ${formatNumber(queueThreshold)} before throttling`,
+                detail: parallelActiveSlices > 0
+                    ? `${formatNumber(queueDepth)} tasks / ${formatNumber(parallelActiveSlices)} slices`
+                    : `${formatNumber(queueDepth)} tasks`,
+                message: `Soft limit ${formatNumber(queueThreshold)} total work units before throttling`,
             },
             {
                 label: "GPU",
@@ -1178,7 +1184,7 @@ const App = () => {
                 badge: `${formatNumber(cacheEntryCount)} entries`,
                 variant: cacheVariant,
                 detail: `${formatBytes(ramCacheBytes)} RAM / ${formatBytes(diskCacheBytes)} disk`,
-                message: `Mods cache ${formatNumber(modsCacheSize)} · Stress cache ${formatNumber(stressCacheSize)}`,
+                message: `Mods cache ${formatNumber(modsCacheSize)} / Stress cache ${formatNumber(stressCacheSize)}`,
             },
             {
                 label: "Network",
@@ -1191,6 +1197,8 @@ const App = () => {
     }, [
         state,
         queueDepth,
+        parallelActiveSlices,
+        totalWork,
         queueWarning,
         queueThreshold,
         gpuCompute,
@@ -1650,10 +1658,10 @@ const App = () => {
                                         <div className="task-kind-summary">
                                             <span>${formatNumber(totalTasks)} tasks</span>
                                             ${totalBatches
-                                                ? html`<span>${formatNumber(totalBatches)} batches · avg ${formatDecimal(avgBatch)} · max ${formatNumber(maxBatch)}</span>`
+                                                ? html`<span>${formatNumber(totalBatches)} batches / avg ${formatDecimal(avgBatch)} / max ${formatNumber(maxBatch)}</span>`
                                                 : html`<span className="text-muted">No batches yet</span>`}
                                         </div>
-                                        <span className="task-kind-toggle">${expanded ? "▾" : "▸"}</span>
+                                        <span className="task-kind-toggle">${expanded ? "-" : "+"}</span>
                                     </button>
                                     ${expanded
                                         ? html`<div className="task-kind-entries">
@@ -1667,7 +1675,7 @@ const App = () => {
                                                           <span className="text-muted">${formatNumber(entry.count || 0)} tasks</span>
                                                           ${entry.batchCount
                                                               ? html`<span className="text-muted">
-                                                                    ${formatNumber(entry.batchCount)} batches · avg ${formatDecimal(entry.batchAvg)} · max ${formatNumber(entry.batchMax || 0)}
+                                                                    ${formatNumber(entry.batchCount)} batches / avg ${formatDecimal(entry.batchAvg)} / max ${formatNumber(entry.batchMax || 0)}
                                                                 </span>`
                                                               : null}
                                                       </div>
@@ -1703,7 +1711,7 @@ const App = () => {
                                           <span>Hit ${formatPercent(hitRate)}</span>
                                           <span>${formatNumber(totalEvictions)} evictions</span>
                                       </div>
-                                      <span className="cache-toggle">${expanded ? "▾" : "▸"}</span>
+                                      <span className="cache-toggle">${expanded ? "-" : "+"}</span>
                                   </button>
                                   ${expanded
                                       ? html`<div className="cache-entries">
@@ -2233,3 +2241,10 @@ if (container) {
     const root = createRoot(container);
     root.render(html`<${App} />`);
 }
+
+
+
+
+
+
+

@@ -34,4 +34,15 @@ public record AsyncManagerBootstrap(int foregroundThreads,
     public AsyncManagerBootstrap withErrorHandler(ThreadPoolErrorHandler handler) {
         return new AsyncManagerBootstrap(foregroundThreads, backgroundThreads, maxForegroundThreads, maxBackgroundThreads, queueBound, promotionDelay, handler);
     }
+
+    public AsyncManagerBootstrap withQueueBound(int desiredQueueBound) {
+        return new AsyncManagerBootstrap(
+            foregroundThreads,
+            backgroundThreads,
+            maxForegroundThreads,
+            maxBackgroundThreads,
+            Math.max(256, desiredQueueBound),
+            promotionDelay,
+            errorHandler);
+    }
 }

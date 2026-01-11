@@ -52,6 +52,19 @@ public final class GPUDetector {
             }
 
             DeviceCandidate bestDevice = selectPreferredDevice(preferredDeviceId, candidates);
+            if (bestDevice == null && (preferredDeviceId == null || preferredDeviceId.isBlank()
+                || "auto".equalsIgnoreCase(preferredDeviceId.trim()))) {
+                List<DeviceCandidate> discrete = candidates.stream()
+                    .filter(candidate -> candidate.type() == DeviceType.DISCRETE)
+                    .toList();
+                if (!discrete.isEmpty()) {
+                    candidates = discrete;
+                } else {
+                    LOGGER.info("No discrete OpenCL GPU detected (auto selection). Specify openclDeviceId to use an integrated device.");
+                    return new GPUCapabilities(false, null, null, null, null, false,
+                        "No discrete OpenCL GPU detected; set openclDeviceId to select an integrated GPU");
+                }
+            }
             if (bestDevice == null) {
                 bestDevice = candidates.stream()
                     .max((a, b) -> Double.compare(a.score(), b.score()))

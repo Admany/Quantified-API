@@ -2,9 +2,28 @@ package org.admany.quantified.api.util;
 
 public final class ForgeMetadataUtil {
 
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> DISPLAY_NAME_CACHE =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> VERSION_CACHE =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
     private ForgeMetadataUtil() {}
 
     public static String getModDisplayNameFromForge(String modId) {
+        if (modId == null || modId.isBlank()) {
+            return "unknown";
+        }
+        return DISPLAY_NAME_CACHE.computeIfAbsent(modId, ForgeMetadataUtil::resolveDisplayName);
+    }
+
+    public static String getModVersionFromForge(String modId) {
+        if (modId == null || modId.isBlank()) {
+            return "unknown";
+        }
+        return VERSION_CACHE.computeIfAbsent(modId, ForgeMetadataUtil::resolveVersion);
+    }
+
+    private static String resolveDisplayName(String modId) {
         try {
             Object modInfo = getModInfo(modId);
             if (modInfo != null) {
@@ -16,7 +35,7 @@ public final class ForgeMetadataUtil {
         return modId.substring(0, 1).toUpperCase() + modId.substring(1).replace('_', ' ');
     }
 
-    public static String getModVersionFromForge(String modId) {
+    private static String resolveVersion(String modId) {
         try {
             Object modInfo = getModInfo(modId);
             if (modInfo != null) {

@@ -29,6 +29,13 @@ public final class ParallelMetrics {
         SLICES_DISPATCHED.increment();
     }
 
+    public static void recordDispatch(String modId, int slices) {
+        if (slices <= 0) {
+            return;
+        }
+        SLICES_DISPATCHED.add(slices);
+    }
+
     public static void recordCompletion(String modId, boolean success) {
         if (success) {
             SLICES_COMPLETED.increment();
@@ -38,6 +45,25 @@ public final class ParallelMetrics {
         LongAdder adder = MOD_ACTIVE.get(modId);
         if (adder != null) {
             adder.decrement();
+        }
+    }
+
+    public static void recordCompletion(String modId, int successCount, int failureCount) {
+        if (successCount <= 0 && failureCount <= 0) {
+            return;
+        }
+        if (successCount > 0) {
+            SLICES_COMPLETED.add(successCount);
+        }
+        if (failureCount > 0) {
+            SLICES_FAILED.add(failureCount);
+        }
+        long total = (long) successCount + failureCount;
+        if (total > 0) {
+            LongAdder adder = MOD_ACTIVE.get(modId);
+            if (adder != null) {
+                adder.add(-total);
+            }
         }
     }
 

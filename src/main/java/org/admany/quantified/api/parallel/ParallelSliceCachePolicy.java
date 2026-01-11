@@ -13,6 +13,7 @@ public final class ParallelSliceCachePolicy<S, R> {
     private final long maxEntries;
     private final boolean persistent;
     private final boolean compression;
+    private final boolean copyOnWrite;
 
     public ParallelSliceCachePolicy(String cacheName,
                                     Function<S, String> keyFunction,
@@ -22,6 +23,18 @@ public final class ParallelSliceCachePolicy<S, R> {
                                     long maxEntries,
                                     boolean persistent,
                                     boolean compression) {
+        this(cacheName, keyFunction, serializer, deserializer, ttl, maxEntries, persistent, compression, false);
+    }
+
+    public ParallelSliceCachePolicy(String cacheName,
+                                    Function<S, String> keyFunction,
+                                    Function<R, byte[]> serializer,
+                                    Function<byte[], R> deserializer,
+                                    Duration ttl,
+                                    long maxEntries,
+                                    boolean persistent,
+                                    boolean compression,
+                                    boolean copyOnWrite) {
         this.cacheName = Objects.requireNonNull(cacheName, "cacheName");
         this.keyFunction = Objects.requireNonNull(keyFunction, "keyFunction");
         this.serializer = Objects.requireNonNull(serializer, "serializer");
@@ -30,6 +43,7 @@ public final class ParallelSliceCachePolicy<S, R> {
         this.maxEntries = Math.max(64L, maxEntries);
         this.persistent = persistent;
         this.compression = compression;
+        this.copyOnWrite = copyOnWrite;
     }
 
     public String cacheName() {
@@ -62,5 +76,9 @@ public final class ParallelSliceCachePolicy<S, R> {
 
     public boolean compression() {
         return compression;
+    }
+
+    public boolean copyOnWrite() {
+        return copyOnWrite;
     }
 }

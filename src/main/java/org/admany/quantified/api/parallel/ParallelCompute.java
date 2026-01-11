@@ -95,7 +95,30 @@ public final class ParallelCompute {
                 ttl,
                 maxEntries,
                 true,
-                compression
+                compression,
+                false
+            );
+            return this;
+        }
+
+        public Builder<S, R, O> persistentSliceCache(String cacheName,
+                                                     Function<S, String> keyFunction,
+                                                     Function<R, byte[]> serializer,
+                                                     Function<byte[], R> deserializer,
+                                                     Duration ttl,
+                                                     long maxEntries,
+                                                     boolean compression,
+                                                     boolean copyOnWrite) {
+            this.cachePolicy = new ParallelSliceCachePolicy<>(
+                cacheName,
+                keyFunction,
+                serializer,
+                deserializer,
+                ttl,
+                maxEntries,
+                true,
+                compression,
+                copyOnWrite
             );
             return this;
         }
@@ -114,7 +137,29 @@ public final class ParallelCompute {
                 ttl,
                 maxEntries,
                 false,
+                false,
                 false
+            );
+            return this;
+        }
+
+        public Builder<S, R, O> memorySliceCache(String cacheName,
+                                                 Function<S, String> keyFunction,
+                                                 Function<R, byte[]> serializer,
+                                                 Function<byte[], R> deserializer,
+                                                 Duration ttl,
+                                                 long maxEntries,
+                                                 boolean copyOnWrite) {
+            this.cachePolicy = new ParallelSliceCachePolicy<>(
+                cacheName,
+                keyFunction,
+                serializer,
+                deserializer,
+                ttl,
+                maxEntries,
+                false,
+                false,
+                copyOnWrite
             );
             return this;
         }

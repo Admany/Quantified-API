@@ -86,7 +86,17 @@ public final class OpenClBatchWorkload implements TaskMetadata.GpuBatchWorkload 
             RuntimeException firstFailure = null;
             for (OpenCLTask<?> task : tasks) {
                 try {
+                    Object cached = org.admany.quantified.core.common.opencl.task.OpenCLTaskManager.tryLoadCached(task);
+                    if (cached != null) {
+                        GpuWorkloadRegistry.complete(task.taskKey(), cached);
+                        continue;
+                    }
+                    long startNanos = System.nanoTime();
                     Object result = task.executeOnGPU(context);
+                    org.admany.quantified.core.common.util.TaskScheduler.recordGpuKernelDuration(System.nanoTime() - startNanos);
+                    @SuppressWarnings("unchecked")
+                    OpenCLTask<Object> typedTask = (OpenCLTask<Object>) task;
+                    org.admany.quantified.core.common.opencl.task.OpenCLTaskManager.recordCachedResult(typedTask, result);
                     GpuWorkloadRegistry.complete(task.taskKey(), result);
                 } catch (Throwable throwable) {
                     GpuWorkloadRegistry.completeExceptionally(task.taskKey(), throwable);

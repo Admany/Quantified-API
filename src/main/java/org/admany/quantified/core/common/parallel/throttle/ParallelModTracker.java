@@ -6,13 +6,15 @@ import java.util.concurrent.Semaphore;
 import org.admany.quantified.core.common.parallel.config.ParallelConfig;
 
 public final class ParallelModTracker {
-    private static final ConcurrentHashMap<String, Semaphore> SEMAPHORES = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, ResizableSemaphore> SEMAPHORES = new ConcurrentHashMap<>();
 
     private ParallelModTracker() {
     }
 
     public static Semaphore semaphore(String modId) {
         int permits = ParallelConfig.maxSlicesPerMod();
-        return SEMAPHORES.computeIfAbsent(modId, ignored -> new Semaphore(permits, false));
+        ResizableSemaphore semaphore = SEMAPHORES.computeIfAbsent(modId, ignored -> new ResizableSemaphore(permits, false));
+        semaphore.resize(permits);
+        return semaphore;
     }
 }

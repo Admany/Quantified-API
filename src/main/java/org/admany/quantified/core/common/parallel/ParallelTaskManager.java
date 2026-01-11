@@ -15,13 +15,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.ForkJoinWorkerThread;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.Consumer;
 
 public final class ParallelTaskManager {
@@ -40,17 +38,19 @@ public final class ParallelTaskManager {
         ParallelMetrics.recordSubmission(spec.modId(), slices.size());
         ExecutorService executor = ParallelScheduler.executor();
         int jobParallelism = Math.max(1, Math.min(spec.maxParallelism(), ParallelConfig.maxThreads()));
-        int pumpCount = Math.min(jobParallelism, slices.size());
+        int workerCount = Math.min(jobParallelism, slices.size());
+        BatchSizing sizing = resolveBatchSizing(slices.size(), workerCount);
+        AdaptiveBatchSizer adaptiveBatchSizer = new AdaptiveBatchSizer(
+            sizing.initial(),
+            sizing.min(),
+            sizing.max(),
+            sizing.targetNanos()
+        );
 
-        List<CompletableFuture<R>> orchestrated = new ArrayList<>(slices.size());
-        AtomicReferenceArray<R> results = new AtomicReferenceArray<>(slices.size());
+        Object[] results = new Object[slices.size()];
         AtomicBoolean failFast = new AtomicBoolean(false);
         AtomicReference<Throwable> firstFailure = new AtomicReference<>();
         AtomicBoolean resultCompleted = new AtomicBoolean(false);
-
-        for (int i = 0; i < slices.size(); i++) {
-            orchestrated.add(new CompletableFuture<>());
-        }
 
         final AtomicInteger cursor = new AtomicInteger(0);
         final Semaphore modSemaphore = ParallelModTracker.semaphore(spec.modId());
@@ -71,9 +71,11 @@ public final class ParallelTaskManager {
                 return;
             }
             try {
-                List<R> collected = new ArrayList<>(results.length());
-                for (int i = 0; i < results.length(); i++) {
-                    collected.add(results.get(i));
+                List<R> collected = new ArrayList<>(results.length);
+                for (Object entry : results) {
+                    @SuppressWarnings("unchecked")
+                    R cast = (R) entry;
+                    collected.add(cast);
                 }
                 result.complete(spec.reducer().apply(collected));
             } catch (Throwable t) {
@@ -81,78 +83,133 @@ public final class ParallelTaskManager {
             }
         };
 
-        Runnable pump = new Runnable() {
+        final ParallelSliceCachePolicy<S, R> cachePolicy = spec.cachePolicy();
+        final Consumer<R> listener = spec.sliceListener();
+        final ParallelFailurePolicy failurePolicy = spec.failurePolicy();
+
+        class BatchPump implements Runnable {
+            private final int[] indices = new int[sizing.max()];
+            private final Object[] pending = new Object[sizing.max()];
+            private final int minBackoffMs = Math.max(1, Integer.getInteger("quantified.parallel.backoffMs", 4));
+            private final int maxBackoffMs = Math.max(minBackoffMs, Integer.getInteger("quantified.parallel.backoffMaxMs", 50));
+            private int backoffMs = minBackoffMs;
+
             @Override
             public void run() {
-                // Fast path: consume cached slices without additional executor hops.
-                while (true) {
+                if (failFast.get()) {
+                    return;
+                }
+
+                int currentBatchSize = adaptiveBatchSizer.size();
+                int permittedBatchSize = resolvePermittedBatchSize(currentBatchSize, modSemaphore);
+                if (permittedBatchSize <= 0) {
+                    rescheduleWithBackoff();
+                    return;
+                }
+                if (!tryAcquirePermits(modSemaphore, permittedBatchSize)) {
+                    rescheduleWithBackoff();
+                    return;
+                }
+                resetBackoff();
+
+                int start = cursor.getAndAdd(permittedBatchSize);
+                if (start >= slices.size()) {
+                    releasePermits(modSemaphore, permittedBatchSize);
+                    return;
+                }
+                int end = Math.min(slices.size(), start + permittedBatchSize);
+                int acquiredPermits = end - start;
+                if (acquiredPermits <= 0) {
+                    releasePermits(modSemaphore, permittedBatchSize);
+                    return;
+                }
+                if (acquiredPermits < permittedBatchSize) {
+                    releasePermits(modSemaphore, permittedBatchSize - acquiredPermits);
+                }
+
+                if (failFast.get()) {
+                    recordSkippedBatch(end - start);
+                    releasePermits(modSemaphore, acquiredPermits);
+                    return;
+                }
+
+                int pendingCount = 0;
+                int cachedCount = 0;
+
+                for (int i = start; i < end; i++) {
                     if (failFast.get()) {
-                        ParallelMetrics.recordCompletion(spec.modId(), false);
-                        return;
+                        recordSkippedBatch(end - i);
+                        break;
                     }
-                    int index = cursor.getAndIncrement();
-                    if (index >= slices.size()) {
-                        return;
-                    }
-
-                    CompletableFuture<R> targetFuture = orchestrated.get(index);
-                    if (targetFuture.isDone()) {
-                        continue;
-                    }
-
-                    S slice = slices.get(index);
-
-                    ParallelSliceCachePolicy<S, R> cachePolicy = spec.cachePolicy();
+                    S slice = slices.get(i);
                     if (cachePolicy != null) {
                         R cached = ParallelResultCache.tryLoad(spec, cachePolicy, slice);
                         if (cached != null) {
-                            results.set(index, cached);
-                            Consumer<R> listener = spec.sliceListener();
+                            results[i] = cached;
                             if (listener != null) {
                                 try {
                                     listener.accept(cached);
                                 } catch (Throwable ignored) {
                                 }
                             }
-                            ParallelMetrics.recordCompletion(spec.modId(), true);
-                            targetFuture.complete(cached);
-
-                            if (remaining.decrementAndGet() == 0) {
-                                tryFinish.run();
-                            }
+                            cachedCount++;
                             continue;
                         }
                     }
+                    indices[pendingCount] = i;
+                    pending[pendingCount] = slice;
+                    pendingCount++;
+                }
 
-                    // Not cached: acquire backpressure + mod permits, then start the slice.
-                    try {
-                        acquireManaged(ParallelBackpressure.class, 1);
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        ParallelMetrics.recordCompletion(spec.modId(), false);
-                        targetFuture.completeExceptionally(interrupted);
+                if (acquiredPermits > pendingCount) {
+                    releasePermits(modSemaphore, acquiredPermits - pendingCount);
+                }
 
-                        if (remaining.decrementAndGet() == 0) {
+                final int cachedCountFinal = cachedCount;
+                final int pendingCountFinal = pendingCount;
+
+                if (pendingCountFinal == 0) {
+                    if (cachedCountFinal > 0) {
+                        ParallelMetrics.recordCompletion(spec.modId(), cachedCountFinal, 0);
+                        if (remaining.addAndGet(-cachedCountFinal) == 0) {
                             tryFinish.run();
                         }
-                        return;
                     }
+                    if (!failFast.get()) {
+                        executor.execute(this);
+                    }
+                    return;
+                }
 
-                    try {
-                        acquireManaged(modSemaphore);
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        ParallelMetrics.recordCompletion(spec.modId(), false);
-                        ParallelBackpressure.release(1);
-                        targetFuture.completeExceptionally(interrupted);
+                if (failFast.get()) {
+                    recordBatchFailure(cachedCountFinal, pendingCountFinal, null);
+                    return;
+                }
 
-                        if (remaining.decrementAndGet() == 0) {
-                            tryFinish.run();
+                ParallelMetrics.recordDispatch(spec.modId(), pendingCountFinal);
+                final long batchStartNanos = System.nanoTime();
+
+                AtomicInteger batchRemaining = new AtomicInteger(pendingCountFinal);
+                AtomicInteger batchSuccess = new AtomicInteger();
+                AtomicInteger batchFailure = new AtomicInteger();
+
+                for (int i = 0; i < pendingCountFinal; i++) {
+                    if (failFast.get() && failurePolicy == ParallelFailurePolicy.FAIL_FAST) {
+                        int skipped = pendingCountFinal - i;
+                        for (int j = i; j < pendingCountFinal; j++) {
+                            results[indices[j]] = null;
                         }
-                        return;
+                        batchFailure.addAndGet(skipped);
+                        if (batchRemaining.addAndGet(-skipped) == 0) {
+                            finishBatch(cachedCountFinal, pendingCountFinal, batchSuccess, batchFailure, batchStartNanos);
+                        }
+                        break;
                     }
 
-                    ParallelMetrics.recordDispatch(spec.modId());
+                    int index = indices[i];
+                    @SuppressWarnings("unchecked")
+                    S slice = (S) pending[i];
+
                     CompletableFuture<R> sliceFuture;
                     try {
                         sliceFuture = spec.sliceExecutor().apply(slice);
@@ -160,155 +217,227 @@ public final class ParallelTaskManager {
                             throw new IllegalStateException("Slice executor returned null future");
                         }
                     } catch (Throwable throwable) {
-                        modSemaphore.release();
-                        ParallelBackpressure.release(1);
-
-                        if (spec.failurePolicy() == ParallelFailurePolicy.BEST_EFFORT) {
-                            ParallelMetrics.recordCompletion(spec.modId(), false);
-                            firstFailure.compareAndSet(null, throwable);
-                            results.set(index, null);
-                            targetFuture.complete(null);
-                            if (remaining.decrementAndGet() == 0) {
-                                tryFinish.run();
-                            }
-                            executor.execute(this);
-                            return;
+                        results[index] = null;
+                        batchFailure.incrementAndGet();
+                        if (failurePolicy == ParallelFailurePolicy.FAIL_FAST) {
+                            triggerFailFast(spec, throwable, failFast, firstFailure, resultCompleted, result, remaining, cursor, slices.size());
                         }
-
-                        handleSliceFailure(spec, targetFuture, throwable, failFast, firstFailure, orchestrated);
-
-                        if (remaining.decrementAndGet() == 0) {
-                            tryFinish.run();
+                        if (batchRemaining.decrementAndGet() == 0) {
+                            finishBatch(cachedCountFinal, pendingCountFinal, batchSuccess, batchFailure, batchStartNanos);
                         }
-                        return;
+                        continue;
                     }
 
-                    sliceFuture.whenComplete((result, error) -> {
-                        modSemaphore.release();
-                        ParallelBackpressure.release(1);
+                    sliceFuture.whenComplete((value, error) -> {
                         if (error != null) {
-                            if (spec.failurePolicy() == ParallelFailurePolicy.BEST_EFFORT) {
-                                ParallelMetrics.recordCompletion(spec.modId(), false);
-                                firstFailure.compareAndSet(null, error);
-                                results.set(index, null);
-                                targetFuture.complete(null);
-                            } else {
-                                handleSliceFailure(spec, targetFuture, error, failFast, firstFailure, orchestrated);
+                            results[index] = null;
+                            batchFailure.incrementAndGet();
+                            if (failurePolicy == ParallelFailurePolicy.FAIL_FAST) {
+                                triggerFailFast(spec, error, failFast, firstFailure, resultCompleted, result, remaining, cursor, slices.size());
                             }
                         } else {
-                            ParallelMetrics.recordCompletion(spec.modId(), true);
-                            results.set(index, result);
-                            ParallelSliceCachePolicy<S, R> policy = spec.cachePolicy();
-                            if (policy != null) {
-                                ParallelResultCache.store(spec, policy, slice, result);
+                            results[index] = value;
+                            batchSuccess.incrementAndGet();
+                            if (cachePolicy != null) {
+                                ParallelResultCache.store(spec, cachePolicy, slice, value);
                             }
-                            Consumer<R> listener = spec.sliceListener();
                             if (listener != null) {
                                 try {
-                                    listener.accept(result);
+                                    listener.accept(value);
                                 } catch (Throwable ignored) {
                                 }
                             }
-                            targetFuture.complete(result);
                         }
 
-                        if (remaining.decrementAndGet() == 0) {
-                            tryFinish.run();
-                            return;
-                        }
-
-                        // Kick the pump again (on the parallel executor) to start the next slice.
-                        if (!failFast.get()) {
-                            executor.execute(this);
+                        if (batchRemaining.decrementAndGet() == 0) {
+                            finishBatch(cachedCountFinal, pendingCountFinal, batchSuccess, batchFailure, batchStartNanos);
                         }
                     });
-                    return;
                 }
             }
-        };
 
-        for (int i = 0; i < pumpCount; i++) {
-            executor.execute(pump);
+            private void finishBatch(int cachedCount,
+                                     int pendingCount,
+                                     AtomicInteger batchSuccess,
+                                     AtomicInteger batchFailure,
+                                     long batchStartNanos) {
+                modSemaphore.release(pendingCount);
+                ParallelBackpressure.release(pendingCount);
+
+                int successes = cachedCount + batchSuccess.get();
+                int failures = batchFailure.get();
+                ParallelMetrics.recordCompletion(spec.modId(), successes, failures);
+                adaptiveBatchSizer.update(System.nanoTime() - batchStartNanos);
+
+                if (remaining.addAndGet(-(cachedCount + pendingCount)) == 0) {
+                    tryFinish.run();
+                }
+
+                if (!failFast.get()) {
+                    executor.execute(this);
+                }
+            }
+
+            private void recordBatchFailure(int cachedCount, int pendingCount, Throwable error) {
+                releasePermits(modSemaphore, pendingCount);
+                for (int i = 0; i < pendingCount; i++) {
+                    results[indices[i]] = null;
+                }
+                if (failurePolicy == ParallelFailurePolicy.FAIL_FAST && error != null) {
+                    triggerFailFast(spec, error, failFast, firstFailure,
+                        resultCompleted, result, remaining, cursor, slices.size());
+                }
+                ParallelMetrics.recordCompletion(spec.modId(), cachedCount, pendingCount);
+                if (remaining.addAndGet(-(cachedCount + pendingCount)) == 0) {
+                    tryFinish.run();
+                }
+            }
+
+            private void recordSkippedBatch(int count) {
+                if (count <= 0) {
+                    return;
+                }
+                ParallelMetrics.recordCompletion(spec.modId(), 0, count);
+                if (remaining.addAndGet(-count) == 0) {
+                    tryFinish.run();
+                }
+            }
+
+            private void rescheduleWithBackoff() {
+                if (failFast.get()) {
+                    return;
+                }
+                ParallelMetrics.recordRejection();
+                int delay = backoffMs;
+                backoffMs = Math.min(maxBackoffMs, backoffMs * 2);
+                CompletableFuture.delayedExecutor(delay, TimeUnit.MILLISECONDS, executor).execute(this);
+            }
+
+            private void resetBackoff() {
+                backoffMs = minBackoffMs;
+            }
+        }
+
+        for (int i = 0; i < workerCount; i++) {
+            executor.execute(new BatchPump());
         }
 
         return result;
     }
 
-    private static void acquireManaged(Semaphore semaphore) throws InterruptedException {
-        if (semaphore.tryAcquire()) {
+    private static int resolveBatchSize(int sliceCount, int workers) {
+        if (sliceCount <= 0 || workers <= 0) {
+            return 1;
+        }
+        int min = Math.max(1, Integer.getInteger("quantified.parallel.batchMin", 8));
+        int max = Math.max(min, Integer.getInteger("quantified.parallel.batchMax", 256));
+        int base = Math.max(1, sliceCount / workers);
+        return Math.min(sliceCount, Math.min(max, Math.max(min, base)));
+    }
+
+    private static BatchSizing resolveBatchSizing(int sliceCount, int workers) {
+        int min = Math.max(1, Integer.getInteger("quantified.parallel.batchMin", 8));
+        int max = Math.max(min, Integer.getInteger("quantified.parallel.batchMax", 256));
+        long targetMs = Math.max(1L, Long.getLong("quantified.parallel.batchTargetMs", 4L));
+        int initial = resolveBatchSize(sliceCount, workers);
+        return new BatchSizing(initial, min, max, targetMs * 1_000_000L);
+    }
+
+    private record BatchSizing(int initial, int min, int max, long targetNanos) {
+    }
+
+    private static int resolvePermittedBatchSize(int desired, Semaphore modSemaphore) {
+        if (desired <= 0) {
+            return 0;
+        }
+        int modAvailable = Math.max(0, modSemaphore.availablePermits());
+        int globalAvailable = Math.max(0, ParallelBackpressure.availablePermits());
+        int allowed = Math.min(desired, Math.min(modAvailable, globalAvailable));
+        return Math.max(0, allowed);
+    }
+
+    private static boolean tryAcquirePermits(Semaphore modSemaphore, int permits) {
+        if (permits <= 0) {
+            return false;
+        }
+        if (!ParallelBackpressure.tryAcquire(permits)) {
+            return false;
+        }
+        if (!modSemaphore.tryAcquire(permits)) {
+            ParallelBackpressure.release(permits);
+            return false;
+        }
+        return true;
+    }
+
+    private static void releasePermits(Semaphore modSemaphore, int permits) {
+        if (permits <= 0) {
             return;
         }
-        if (Thread.currentThread() instanceof ForkJoinWorkerThread) {
-            ForkJoinPool.managedBlock(new SemaphoreBlocker(semaphore));
-        } else {
-            semaphore.acquire();
-        }
+        modSemaphore.release(permits);
+        ParallelBackpressure.release(permits);
     }
 
-    private static void acquireManaged(Class<?> ignored, int permits) throws InterruptedException {
-        if (ParallelBackpressure.tryAcquire(permits)) {
-            return;
-        }
-        if (Thread.currentThread() instanceof ForkJoinWorkerThread) {
-            ForkJoinPool.managedBlock(new PermitBlocker(permits));
-        } else {
-            ParallelBackpressure.acquire(permits);
-        }
-    }
+    private static final class AdaptiveBatchSizer {
+        private static final double SHRINK_FACTOR = 0.70;
+        private static final double GROW_FACTOR = 1.20;
 
-    private static final class SemaphoreBlocker implements ForkJoinPool.ManagedBlocker {
-        private final Semaphore semaphore;
+        private final int min;
+        private final int max;
+        private final long targetNanos;
+        private final AtomicInteger current;
 
-        private SemaphoreBlocker(Semaphore semaphore) {
-            this.semaphore = semaphore;
+        private AdaptiveBatchSizer(int initial, int min, int max, long targetNanos) {
+            this.min = min;
+            this.max = Math.max(min, max);
+            this.targetNanos = Math.max(1L, targetNanos);
+            this.current = new AtomicInteger(Math.max(min, Math.min(this.max, initial)));
         }
 
-        @Override
-        public boolean block() throws InterruptedException {
-            semaphore.acquire();
-            return true;
+        private int size() {
+            return current.get();
         }
 
-        @Override
-        public boolean isReleasable() {
-            return semaphore.tryAcquire();
-        }
-    }
-
-    private static final class PermitBlocker implements ForkJoinPool.ManagedBlocker {
-        private final int permits;
-
-        private PermitBlocker(int permits) {
-            this.permits = Math.max(1, permits);
-        }
-
-        @Override
-        public boolean block() throws InterruptedException {
-            ParallelBackpressure.acquire(permits);
-            return true;
-        }
-
-        @Override
-        public boolean isReleasable() {
-            return ParallelBackpressure.tryAcquire(permits);
-        }
-    }
-
-    private static <R, O> void handleSliceFailure(ParallelTaskSpec<?, R, O> spec,
-                                                  CompletableFuture<R> targetFuture,
-                                                  Throwable error,
-                                                  AtomicBoolean failFast,
-                                                  AtomicReference<Throwable> firstFailure,
-                                                  List<CompletableFuture<R>> allFutures) {
-        ParallelMetrics.recordCompletion(spec.modId(), false);
-        targetFuture.completeExceptionally(error);
-        firstFailure.compareAndSet(null, error);
-        if (spec.failurePolicy() == ParallelFailurePolicy.FAIL_FAST && failFast.compareAndSet(false, true)) {
-            for (CompletableFuture<R> future : allFutures) {
-                if (!future.isDone()) {
-                    future.cancel(true);
-                }
+        private void update(long elapsedNanos) {
+            if (elapsedNanos <= 0) {
+                return;
             }
+            int prev = current.get();
+            int next = prev;
+            if (elapsedNanos > targetNanos && prev > min) {
+                next = Math.max(min, (int) Math.floor(prev * SHRINK_FACTOR));
+            } else if (elapsedNanos < (targetNanos / 2) && prev < max) {
+                next = Math.min(max, (int) Math.ceil(prev * GROW_FACTOR));
+            }
+            if (next == prev) {
+                return;
+            }
+            current.compareAndSet(prev, next);
         }
     }
+
+    private static <O> void triggerFailFast(ParallelTaskSpec<?, ?, O> spec,
+                                            Throwable error,
+                                            AtomicBoolean failFast,
+                                            AtomicReference<Throwable> firstFailure,
+                                            AtomicBoolean resultCompleted,
+                                            CompletableFuture<O> result,
+                                            AtomicInteger remaining,
+                                            AtomicInteger cursor,
+                                            int totalSlices) {
+        if (!failFast.compareAndSet(false, true)) {
+            return;
+        }
+        firstFailure.compareAndSet(null, error);
+        int claimed = Math.min(totalSlices, cursor.get());
+        int unassigned = totalSlices - claimed;
+        if (unassigned > 0) {
+            ParallelMetrics.recordCompletion(spec.modId(), 0, unassigned);
+            remaining.addAndGet(-unassigned);
+        }
+        if (resultCompleted.compareAndSet(false, true)) {
+            result.completeExceptionally(error);
+        }
+    }
+
 }

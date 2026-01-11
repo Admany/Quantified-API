@@ -12,6 +12,7 @@ import org.admany.quantified.core.common.async.task.PriorityTaskType;
 import org.admany.quantified.core.common.async.task.TaskComputation;
 import org.admany.quantified.core.common.async.task.TaskMetadata;
 import org.admany.quantified.core.common.async.validation.TaskSubmissionValidator;
+import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.threading.core.MainThreadExecutor;
 import org.admany.quantified.core.common.threading.core.ThreadRole;
 import org.admany.quantified.core.common.threading.health.ThreadHealthMonitor;
@@ -19,6 +20,7 @@ import org.admany.quantified.core.common.threading.health.ThreadHealthSnapshot;
 import org.admany.quantified.core.common.threading.pool.ThreadPoolStats;
 
 import java.time.Duration;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -43,6 +45,8 @@ public final class AsyncManager {
     private static final ModPriorityManager MOD_MANAGER = new ModPriorityManager();
 
     private static final AtomicBoolean INITIALISED = new AtomicBoolean(false);
+    private static final boolean FORCE_RENDER_REROUTE = Boolean.parseBoolean(System.getProperty("quantified.forceMainThreadForRender", "true"));
+    private static final AtomicBoolean RENDER_REROUTE_LOGGED = new AtomicBoolean(false);
 
     private static PriorityScheduler scheduler;
     private static ScheduledExecutorService coalescer;
@@ -190,6 +194,11 @@ public final class AsyncManager {
 
         TaskSubmissionValidator.ValidatedSubmission<T> v =
             TaskSubmissionValidator.validate(key, type, score, computation, timeout, threadSafeOverride, METRICS, LOGGER);
+        boolean threadSafe = v.threadSafe();
+        if (shouldForceMainThread(threadSafe)) {
+            threadSafe = false;
+        }
+        final boolean effectiveThreadSafe = threadSafe;
 
         long now = System.nanoTime();
         Long prev = LAST_REQUEST_NANOS.put(key, now);
@@ -215,7 +224,7 @@ public final class AsyncManager {
 
             TaskEntry<T> entry = new TaskEntry<>(
                 v.computation(),
-                v.threadSafe(),
+                effectiveThreadSafe,
                 v.timeout(),
                 modId,
                 metadata
@@ -246,6 +255,11 @@ public final class AsyncManager {
 
         TaskSubmissionValidator.ValidatedSubmission<T> v =
             TaskSubmissionValidator.validate(key, type, score, computation, timeout, METRICS, LOGGER);
+        boolean threadSafe = v.threadSafe();
+        if (shouldForceMainThread(threadSafe)) {
+            threadSafe = false;
+        }
+        final boolean effectiveThreadSafe = threadSafe;
 
         long now = System.nanoTime();
         Long prev = LAST_REQUEST_NANOS.put(key, now);
@@ -271,7 +285,7 @@ public final class AsyncManager {
 
             TaskEntry<T> entry = new TaskEntry<>(
                 v.computation(),
-                v.threadSafe(),
+                effectiveThreadSafe,
                 v.timeout(),
                 modId,
                 metadata
@@ -347,10 +361,15 @@ public final class AsyncManager {
     private static void enqueue(PriorityTask task) {
         PriorityScheduler.SchedulerSnapshot s = scheduler.snapshot();
 
+        int configuredCapacityHint = 0;
+        if (MultithreadingConfig.CONFIG != null) {
+            configuredCapacityHint = MultithreadingConfig.CONFIG.taskQueueSize;
+        }
+
         AdaptiveLoadController.LoadSnapshot load = new AdaptiveLoadController.LoadSnapshot(
             (int) Math.max(0, s.submitted() - s.executed()),
             s.coalesced(),
-            Math.max(32, s.foregroundQueue() + s.backgroundQueue()),
+            Math.max(32, configuredCapacityHint),
             Math.min(1.0, TASKS.size() / 2048.0)
         );
 
@@ -381,6 +400,27 @@ public final class AsyncManager {
 
     private static void cancelTimeout(ScheduledFuture<?> f) {
         if (f != null) f.cancel(false);
+    }
+
+    private static boolean shouldForceMainThread(boolean threadSafe) {
+        if (!threadSafe || !FORCE_RENDER_REROUTE) {
+            return false;
+        }
+        if (MainThreadExecutor.executor().isEmpty()) {
+            return false;
+        }
+        String name = Thread.currentThread().getName();
+        if (name == null || name.isEmpty()) {
+            return false;
+        }
+        String lower = name.toLowerCase(Locale.ROOT);
+        if (lower.contains("render thread") || lower.contains("client thread") || lower.contains("minecraft client")) {
+            if (RENDER_REROUTE_LOGGED.compareAndSet(false, true)) {
+                LOGGER.log(Level.INFO, "Forcing main-thread reroute for task submissions from {0}. Set quantified.forceMainThreadForRender=false to disable.", name);
+            }
+            return true;
+        }
+        return false;
     }
 
     private static void pruneIfNecessary() {

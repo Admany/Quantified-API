@@ -4,12 +4,16 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinWorkerThread;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Logger;
 
 import org.admany.quantified.core.common.parallel.config.ParallelConfig;
 
 public final class ParallelScheduler {
+    private static final Logger LOGGER = Logger.getLogger(ParallelScheduler.class.getName());
     private static final AtomicInteger COUNTER = new AtomicInteger();
     private static volatile ForkJoinPool SHARED;
+    private static final AtomicBoolean PARALLELISM_WARNED = new AtomicBoolean(false);
 
     private ParallelScheduler() {
     }
@@ -17,13 +21,10 @@ public final class ParallelScheduler {
     public static ExecutorService executor() {
         ForkJoinPool current = SHARED;
         int desiredParallelism = ParallelConfig.maxThreads();
-        if (current == null || current.getParallelism() != desiredParallelism) {
+        if (current == null) {
             synchronized (ParallelScheduler.class) {
                 current = SHARED;
-                if (current == null || current.getParallelism() != desiredParallelism) {
-                    if (current != null) {
-                        current.shutdownNow();
-                    }
+                if (current == null) {
                     SHARED = new ForkJoinPool(
                         desiredParallelism,
                         pool -> {
@@ -38,6 +39,9 @@ public final class ParallelScheduler {
                     current = SHARED;
                 }
             }
+        } else if (current.getParallelism() != desiredParallelism && PARALLELISM_WARNED.compareAndSet(false, true)) {
+            LOGGER.warning("Parallel scheduler already initialized; ignoring runtime parallelism change from "
+                + current.getParallelism() + " to " + desiredParallelism);
         }
         return current;
     }

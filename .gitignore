@@ -26,7 +26,7 @@ forge*changelog.txt
 quantified-api.log
 logs/2025-12-26-1.log.gz
 logs/debug-1.log.gz
-logs/latest.log
+logs
 logs/debug.log
 Quantified-API-Description.md
 .gitignore

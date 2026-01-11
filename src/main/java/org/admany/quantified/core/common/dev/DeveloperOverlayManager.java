@@ -176,13 +176,12 @@ public final class DeveloperOverlayManager {
             } catch (Throwable ignored) {
             }
 
-            if (parallelActive > 0L) {
-                long combined = (long) queueDepth + parallelActive;
-                queueDepth = combined >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) combined;
-            }
-            // Debug: log queue stats during stress test
+            int parallelActiveInt = parallelActive >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) parallelActive;
+            long combined = (long) queueDepth + parallelActive;
+            int totalWork = combined >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) combined;
             if (DeveloperFeatures.isStressTestEnabled() && LOGGER.isLoggable(Level.FINE)) {
-                String logMsg = "Stress test active: queueDepth=" + queueDepth + ", fg=" + foregroundQueue + ", bg=" + backgroundQueue + ", execRate=" + execRate;
+                String logMsg = "Stress test active: tasks=" + queueDepth + ", slices=" + parallelActiveInt
+                    + ", fg=" + foregroundQueue + ", bg=" + backgroundQueue + ", execRate=" + execRate;
                 LOGGER.fine(logMsg);
             }
 
@@ -242,13 +241,13 @@ public final class DeveloperOverlayManager {
             long recentFallbacks = fallbackEventsRecent.getAndSet(0L);
 
             if (timelineActive.get()) {
-                maybeEmitAutomaticAlerts(now, queueDepth, gpuMemoryUtil, gpuComputeUtil, gpuTemperature);
+                maybeEmitAutomaticAlerts(now, totalWork, gpuMemoryUtil, gpuComputeUtil, gpuTemperature);
             }
 
             List<TimelineEvent> timelineSnapshot = timelineActive.get() ? snapshotTimeline() : List.of();
 
             List<AutoTuningHint> hints = autoHintsActive.get()
-                ? computeHints(queueDepth, execRate, gpuMemoryUtil, gpuComputeUtil, gpuTemperature, recentFallbacks, desiredFg, desiredBg, systemLoad, gpuAvailable)
+                ? computeHints(totalWork, execRate, gpuMemoryUtil, gpuComputeUtil, gpuTemperature, recentFallbacks, desiredFg, desiredBg, systemLoad, gpuAvailable)
                 : List.of();
             latestHints.set(hints);
 
@@ -270,6 +269,8 @@ public final class DeveloperOverlayManager {
                 queueDepth,
                 foregroundQueue,
                 backgroundQueue,
+                parallelActiveInt,
+                totalWork,
                 desiredFg,
                 desiredBg,
                 execRate,
@@ -311,7 +312,9 @@ public final class DeveloperOverlayManager {
         if ((gpuMemoryUtil > GPU_ALERT_UTIL || gpuComputeUtil > GPU_ALERT_UTIL || gpuTemperature > GPU_ALERT_TEMP)
             && (now - lastGpuAlertMs) > ALERT_COOLDOWN_MS) {
             lastGpuAlertMs = now;
-            String message = gpuTemperature > 90.0 ? "GPU HOT! Temperature exceeds 90°C" : "GPU nearing safety thresholds";
+            String message = gpuTemperature > GPU_ALERT_TEMP
+                ? "GPU temperature exceeds 90C"
+                : "GPU nearing safety thresholds";
             recordTimelineEvent(new TimelineEvent(
                 now,
                 TimelineEventType.GPU_SAFEGUARD,
@@ -373,10 +376,10 @@ public final class DeveloperOverlayManager {
             ));
         }
 
-        if (gpuMemoryUtil > 0.85 || gpuComputeUtil > 0.85 || gpuTemperature > 90.0) {
+        if (gpuMemoryUtil > 0.85 || gpuComputeUtil > 0.85 || gpuTemperature > GPU_ALERT_TEMP) {
             hints.add(new AutoTuningHint(
                 HintSeverity.WARNING,
-                "GPU nearing safety thresholds - increased fallbacks to CPU are likely."
+                "GPU is under heavy load. Increased fallbacks to CPU are likely."
             ));
         }
 
@@ -402,14 +405,7 @@ public final class DeveloperOverlayManager {
             ));
         }
 
-        if (gpuTemperature > 75.0 && gpuTemperature <= 90.0) {
-            hints.add(new AutoTuningHint(
-                HintSeverity.INFO,
-                "GPU temperature elevated!"
-            ));
-        }
-
-        if (queueDepth > 0 && execRate == 0.0) {
+        if (gpuTemperature > 75.0 && gpuTemperature <= GPU_ALERT_TEMP && execRate == 0.0) {
             hints.add(new AutoTuningHint(
                 HintSeverity.WARNING,
                 "Tasks are queuing but not being processed - verify worker threads are active and not blocked by long operations or deadlocks."
@@ -609,6 +605,8 @@ public final class DeveloperOverlayManager {
                                   int queueDepth,
                                   int foregroundQueue,
                                   int backgroundQueue,
+                                  int parallelActiveSlices,
+                                  int totalWork,
                                   int desiredForegroundWorkers,
                                   int desiredBackgroundWorkers,
                                   double schedulerExecRate,
@@ -629,6 +627,8 @@ public final class DeveloperOverlayManager {
                 0L,
                 0.0d,
                 "Unknown GPU",
+                0,
+                0,
                 0,
                 0,
                 0,
@@ -710,4 +710,5 @@ public final class DeveloperOverlayManager {
     }
 
 }
+
 

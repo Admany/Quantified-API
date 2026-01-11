@@ -55,6 +55,10 @@ public final class OpenCLTaskManager {
     }
 
     public static <T> CompletableFuture<T> submitTask(OpenCLTask<T> task) {
+        T cached = tryLoadCached(task);
+        if (cached != null) {
+            return CompletableFuture.completedFuture(cached);
+        }
         if (taskThrottle != null && !taskThrottle.tryAcquire()) {
             LOGGER.warning("Task rejected due to high GPU load: " + task.name());
             recordTaskEvent(task, TaskEventType.GPU_THROTTLED, "semaphore limit reached");
@@ -99,6 +103,10 @@ public final class OpenCLTaskManager {
 
     public static <T> CompletableFuture<T> executeOnGpu(OpenCLTask<T> task) {
         Objects.requireNonNull(task, "task");
+        T cached = tryLoadCached(task);
+        if (cached != null) {
+            return CompletableFuture.completedFuture(cached);
+        }
         if (taskThrottle != null && !taskThrottle.tryAcquire()) {
             LOGGER.warning("GPU task rejected due to throttle: " + task.name());
             recordTaskEvent(task, TaskEventType.GPU_THROTTLED, "semaphore limit reached");
@@ -126,12 +134,15 @@ public final class OpenCLTaskManager {
             : null;
         try {
             LOGGER.fine("Executing task on GPU: " + task.name());
+            long startNanos = System.nanoTime();
             T result = task.executeOnGPU(context);
+            org.admany.quantified.core.common.util.TaskScheduler.recordGpuKernelDuration(System.nanoTime() - startNanos);
+            recordCachedResult(task, result);
             return CompletableFuture.completedFuture(result);
         } catch (Throwable throwable) {
             recordTaskEvent(task, TaskEventType.GPU_ERROR, throwable.getClass().getSimpleName());
             LOGGER.log(Level.WARNING, "GPU execution failed, falling back to CPU", throwable);
-            DeveloperOverlayManager.recordFallbackEvent("GPU execution error – " + throwable.getClass().getSimpleName(), task.modId());
+            DeveloperOverlayManager.recordFallbackEvent("GPU execution error: " + throwable.getClass().getSimpleName(), task.modId());
             if (monitor != null) {
                 monitor.recordFallback();
             }
@@ -187,6 +198,7 @@ public final class OpenCLTaskManager {
         if (cache != null) {
             cache.clear();
         }
+        org.admany.quantified.core.common.opencl.core.OpenCLManager.evictBufferPool(true);
         if (monitor != null) {
             monitor.clearMemoryTracking();
             LOGGER.info("GPU memory tracking cleared");
@@ -232,7 +244,7 @@ public final class OpenCLTaskManager {
             return;
         }
 
-        String headline = "[OpenCL] VRAM pressure from external usage – deferring cache growth";
+        String headline = "[OpenCL] VRAM pressure from external usage - deferring cache growth";
         DeveloperOverlayManager.recordApiLog(headline);
         LOGGER.info(headline.substring("[OpenCL] ".length()));
 
@@ -275,7 +287,7 @@ public final class OpenCLTaskManager {
             String device = status.deviceName() != null ? status.deviceName() : "Unknown GPU";
 
             builder.append(String.format(Locale.ROOT,
-                " | GPU %s VRAM %d/%d MB (API %.0f%% · system %.0f%%) · Compute %.0f%% · Temp %.1f°C",
+                " | GPU %s VRAM %d/%d MB (API %.0f%% / system %.0f%%) / Compute %.0f%% / Temp %.1fC",
                 device,
                 usedMb,
                 totalMb,
@@ -433,6 +445,52 @@ public final class OpenCLTaskManager {
                              long estimatedVramBytes,
                              TaskEventType type,
                              String detail) {
+    }
+
+    public static <T> T tryLoadCached(OpenCLTask<T> task) {
+        if (!(task instanceof org.admany.quantified.core.common.opencl.core.CacheableOpenCLTask<?> cacheableTask)) {
+            return null;
+        }
+        String key = cacheableTask.cacheKey();
+        if (key == null || key.isBlank()) {
+            return null;
+        }
+        TieredGpuCache cache = tieredCache;
+        if (cache == null) {
+            return null;
+        }
+        TieredGpuCache.CacheHit hit = cache.get(task.modId(), key);
+        if (!hit.present() || hit.data() == null) {
+            return null;
+        }
+        try {
+            @SuppressWarnings("unchecked")
+            T decoded = ((org.admany.quantified.core.common.opencl.core.CacheableOpenCLTask<T>) cacheableTask)
+                .decodeResult(hit.data());
+            return decoded;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    public static <T> void recordCachedResult(OpenCLTask<T> task, T result) {
+        if (!(task instanceof org.admany.quantified.core.common.opencl.core.CacheableOpenCLTask<?> cacheableTask)) {
+            return;
+        }
+        String key = cacheableTask.cacheKey();
+        if (key == null || key.isBlank() || result == null) {
+            return;
+        }
+        try {
+            @SuppressWarnings("unchecked")
+            java.nio.ByteBuffer encoded = ((org.admany.quantified.core.common.opencl.core.CacheableOpenCLTask<T>) cacheableTask)
+                .encodeResult(result);
+            if (encoded == null || !encoded.hasRemaining()) {
+                return;
+            }
+            org.admany.quantified.core.common.opencl.core.OpenCLManager.cachePut(task.modId(), key, encoded);
+        } catch (Throwable ignored) {
+        }
     }
 
     public static class AdaptiveThrottle {
@@ -596,3 +654,5 @@ public final class OpenCLTaskManager {
         }
     }
 }
+
+

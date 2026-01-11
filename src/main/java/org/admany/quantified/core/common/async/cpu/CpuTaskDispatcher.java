@@ -237,10 +237,8 @@ public final class CpuTaskDispatcher {
             Math.min(tasks.size(), ParallelConfig.maxThreads()),
             null
         );
-        try {
-            ParallelTaskManager.submit(spec).join();
-        } catch (Throwable ignored) {
-        }
+        ParallelTaskManager.submit(spec).whenComplete((ignored, throwable) -> {
+        });
     }
 
     private String describeTaskName(PriorityTask task) {

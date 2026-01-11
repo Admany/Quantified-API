@@ -30,8 +30,8 @@ public final class ParallelResultCache {
                 ParallelMetrics.recordCacheMiss();
                 return null;
             }
-            byte[] copy = Arrays.copyOf(payload, payload.length);
-            R restored = policy.deserializer().apply(copy);
+            byte[] materialized = policy.copyOnWrite() ? payload : Arrays.copyOf(payload, payload.length);
+            R restored = policy.deserializer().apply(materialized);
             if (restored != null) {
                 ParallelMetrics.recordCacheHit();
             } else {
@@ -58,7 +58,8 @@ public final class ParallelResultCache {
             if (payload == null || payload.length == 0) {
                 return;
             }
-            cache.put(key, Arrays.copyOf(payload, payload.length));
+            byte[] stored = policy.copyOnWrite() ? payload : Arrays.copyOf(payload, payload.length);
+            cache.put(key, stored);
         } catch (Throwable ignored) {
         }
     }

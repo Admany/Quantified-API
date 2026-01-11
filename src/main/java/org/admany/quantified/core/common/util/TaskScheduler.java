@@ -25,6 +25,10 @@ public final class TaskScheduler {
     private static final long OPTIMAL_GPU_DATA_SIZE = 1024 * 1024 * 50; // 50MB sweet spot
     private static final int MIN_PARALLEL_UNITS = 256; // Minimum parallel work units
     private static final double GPU_SPEEDUP_THRESHOLD = 1.05; // Need at least ~5% speedup to justify GPU
+    private static final long GPU_AGGRESSIVE_MIN_BYTES = 1024; // 1KB minimum for aggressive GPU selection
+    private static final double GPU_AGGRESSIVE_UTIL_LIMIT = 0.70; // Prefer GPU when usage is below this threshold
+    private static final long GPU_BATCH_TARGET_NANOS = 2_000_000L; // ~2ms kernel target
+    private static final double GPU_BATCH_EMA_ALPHA = 0.20d;
 
     // Performance tracking
     private static final AtomicLong totalTasksScheduled = new AtomicLong(0);
@@ -89,6 +93,24 @@ public final class TaskScheduler {
                 (org.admany.quantified.api.opencl.QuantifiedOpenCL.ApiOpenClTask<T>) gpuTask);
         }
 
+        if (effectiveGpuTask instanceof org.admany.quantified.core.common.opencl.core.CacheableOpenCLTask<?> cacheableTask) {
+            String cacheKey = cacheableTask.cacheKey();
+            if (cacheKey != null && !cacheKey.isBlank()) {
+                org.admany.quantified.core.common.opencl.cache.TieredGpuCache.CacheHit hit =
+                    org.admany.quantified.core.common.opencl.core.OpenCLManager.cacheGet(modId, cacheKey);
+                if (hit.present() && hit.data() != null) {
+                    try {
+                        T cached = ((org.admany.quantified.core.common.opencl.core.CacheableOpenCLTask<T>) cacheableTask)
+                            .decodeResult(hit.data());
+                        if (cached != null) {
+                            return CompletableFuture.completedFuture(cached);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
+
         TaskAnalysis analysis = analyzeTask(dataSizeBytes, parallelUnits, complexity, type);
 
         ExecutionPlatform platform = decidePlatform(analysis, effectiveGpuTask);
@@ -97,28 +119,9 @@ public final class TaskScheduler {
             taskName, platform, dataSizeBytes, parallelUnits, complexity));
 
         boolean gpuSelected = platform == ExecutionPlatform.GPU && effectiveGpuTask != null;
-        Supplier<T> effectiveCpu = cpuImplementation;
         if (gpuSelected) {
             recordGpuTaskScheduled();
             GpuWorkloadRegistry.register(taskKey, effectiveGpuTask);
-            effectiveCpu = () -> {
-                CompletableFuture<Object> gpuFuture = GpuWorkloadRegistry.result(taskKey);
-                if (gpuFuture != null) {
-                    try {
-                        T gpuResult = (T) gpuFuture.join();
-                        return gpuResult;
-                    } catch (RuntimeException runtimeException) {
-                        LOGGER.fine(() -> "GPU result unavailable for task " + taskKey + ": " + runtimeException.getMessage());
-                    } finally {
-                        GpuWorkloadRegistry.cancel(taskKey);
-                    }
-                }
-                try {
-                    return cpuImplementation.get();
-                } finally {
-                    GpuWorkloadRegistry.cancel(taskKey);
-                }
-            };
         } else {
             recordCpuTaskScheduled();
         }
@@ -129,11 +132,25 @@ public final class TaskScheduler {
             LOGGER.fine("[DEBUG] TaskScheduler: Routing task " + taskKey + " via AsyncManager (gpuSelected=" + gpuSelected + ")");
         }
 
+        if (gpuSelected) {
+            Supplier<CompletableFuture<T>> asyncSupplier = () -> resolveGpuOrCpu(taskKey, cpuImplementation);
+            return AsyncManager.submitAsync(
+                taskKey,
+                PriorityTaskType.BUILDING,
+                PriorityTaskType.BUILDING.defaultScore(),
+                asyncSupplier,
+                timeout,
+                allowMainThreadRerouting,
+                modId,
+                metadata
+            );
+        }
+
         return AsyncManager.submitSync(
             taskKey,
             PriorityTaskType.BUILDING,
             PriorityTaskType.BUILDING.defaultScore(),
-            effectiveCpu,
+            cpuImplementation,
             timeout,
             allowMainThreadRerouting,
             modId,
@@ -246,6 +263,9 @@ public final class TaskScheduler {
             builder.affinityKey(modId + ":" + type.name());
         }
         int preferredBatch = Math.max(4, Math.min(64, Math.max(1, parallelUnits / 64)));
+        if (gpuSelected) {
+            preferredBatch = adjustGpuPreferredBatch(preferredBatch);
+        }
         int preferred = Math.max(1, preferredBatch);
         builder.preferredBatchSize(preferred);
         builder.maximumBatchSize(Math.max(preferred, preferred * 2));
@@ -287,6 +307,10 @@ public final class TaskScheduler {
             return ExecutionPlatform.GPU;
         }
 
+        if (shouldPreferGpu(analysis)) {
+            return ExecutionPlatform.GPU;
+        }
+
         if (!analysis.dataSizeEfficient) {
             return ExecutionPlatform.CPU;
         }
@@ -304,6 +328,29 @@ public final class TaskScheduler {
         }
 
         return ExecutionPlatform.CPU;
+    }
+
+    private static boolean shouldPreferGpu(TaskAnalysis analysis) {
+        if (analysis == null) {
+            return false;
+        }
+        if (analysis.dataSizeBytes() < GPU_AGGRESSIVE_MIN_BYTES) {
+            return false;
+        }
+        if (analysis.expectedSpeedup() < 1.0d) {
+            return false;
+        }
+        org.admany.quantified.core.common.opencl.gpu.GPUMonitor.GPUStatus status = OpenCLManager.getGPUStatus();
+        if (status == null) {
+            return false;
+        }
+        if (status.computeUtilization() > GPU_AGGRESSIVE_UTIL_LIMIT) {
+            return false;
+        }
+        if (status.memoryUtilization() > GPU_AGGRESSIVE_UTIL_LIMIT) {
+            return false;
+        }
+        return true;
     }
 
     private static boolean canGpuAcceptTask(TaskAnalysis analysis, OpenCLTask<?> gpuTask) {
@@ -407,37 +454,43 @@ public final class TaskScheduler {
             return CompletableFuture.completedFuture(java.util.List.of());
         }
 
-        java.util.Map<ResourceHint, java.util.List<TaskBatchItem<R>>> groupedTasks = tasks.stream()
-            .collect(java.util.stream.Collectors.groupingBy(groupBy));
+        java.util.Map<ResourceHint, java.util.List<IndexedTask<R>>> groupedTasks = new java.util.EnumMap<>(ResourceHint.class);
+        for (int i = 0; i < tasks.size(); i++) {
+            TaskBatchItem<R> task = tasks.get(i);
+            ResourceHint hint = groupBy.apply(task);
+            if (hint == null) {
+                hint = ResourceHint.CPU;
+            }
+            groupedTasks.computeIfAbsent(hint, k -> new java.util.ArrayList<>()).add(new IndexedTask<>(i, task));
+        }
 
-        java.util.List<CompletableFuture<java.util.List<R>>> groupFutures = new java.util.ArrayList<>();
+        Object[] orderedResults = new Object[tasks.size()];
+        java.util.List<CompletableFuture<Void>> groupFutures = new java.util.ArrayList<>(groupedTasks.size());
 
-        for (java.util.Map.Entry<ResourceHint, java.util.List<TaskBatchItem<R>>> entry : groupedTasks.entrySet()) {
+        for (java.util.Map.Entry<ResourceHint, java.util.List<IndexedTask<R>>> entry : groupedTasks.entrySet()) {
             ResourceHint hint = entry.getKey();
-            java.util.List<TaskBatchItem<R>> group = entry.getValue();
+            java.util.List<IndexedTask<R>> group = entry.getValue();
+            java.util.List<TaskBatchItem<R>> groupTasks = new java.util.ArrayList<>(group.size());
+            for (IndexedTask<R> indexed : group) {
+                groupTasks.add(indexed.task);
+            }
 
-            CompletableFuture<java.util.List<R>> groupFuture = submitTaskGroup(modId, batchName, group, hint);
-            groupFutures.add(groupFuture);
+            CompletableFuture<java.util.List<R>> groupFuture = submitTaskGroup(modId, batchName, groupTasks, hint);
+            CompletableFuture<Void> fillFuture = groupFuture.thenAccept(results -> {
+                for (int i = 0; i < results.size(); i++) {
+                    orderedResults[group.get(i).index] = results.get(i);
+                }
+            });
+            groupFutures.add(fillFuture);
         }
 
         return CompletableFuture.allOf(groupFutures.toArray(new CompletableFuture[0]))
             .thenApply(v -> {
-                java.util.List<R> results = new java.util.ArrayList<>(java.util.Collections.nCopies(tasks.size(), null));
-                int offset = 0;
-                for (CompletableFuture<java.util.List<R>> groupFuture : groupFutures) {
-                    java.util.List<R> groupResults = groupFuture.join();
-                    for (int i = 0; i < groupResults.size(); i++) {
-                        TaskBatchItem<R> originalTask = groupedTasks.values().stream()
-                            .flatMap(java.util.List::stream)
-                            .skip(offset + i)
-                            .findFirst()
-                            .orElse(null);
-                        if (originalTask != null) {
-                            int originalIndex = tasks.indexOf(originalTask);
-                            results.set(originalIndex, groupResults.get(i));
-                        }
-                    }
-                    offset += groupResults.size();
+                java.util.List<R> results = new java.util.ArrayList<>(tasks.size());
+                for (Object value : orderedResults) {
+                    @SuppressWarnings("unchecked")
+                    R cast = (R) value;
+                    results.add(cast);
                 }
                 return results;
             });
@@ -483,6 +536,16 @@ public final class TaskScheduler {
 
     public enum ResourceHint {
         CPU, GPU
+    }
+
+    private static final class IndexedTask<R> {
+        private final int index;
+        private final TaskBatchItem<R> task;
+
+        private IndexedTask(int index, TaskBatchItem<R> task) {
+            this.index = index;
+            this.task = task;
+        }
     }
 
     public static record TaskBatchItem<R>(
@@ -540,6 +603,10 @@ public final class TaskScheduler {
         recordGpuTaskScheduled();
     }
 
+    public static void recordGpuKernelDuration(long durationNanos) {
+        AdaptiveGpuBatchSizer.record(durationNanos);
+    }
+
     private static void recordCpuTaskScheduled() {
         totalTasksScheduled.incrementAndGet();
         cpuTasksExecuted.incrementAndGet();
@@ -550,7 +617,56 @@ public final class TaskScheduler {
         gpuTasksExecuted.incrementAndGet();
     }
 
+    private static <T> CompletableFuture<T> resolveGpuOrCpu(long taskKey, Supplier<T> cpuImplementation) {
+        CompletableFuture<Object> gpuFuture = GpuWorkloadRegistry.result(taskKey);
+        CompletableFuture<T> resolved;
+        if (gpuFuture == null) {
+            resolved = CompletableFuture.supplyAsync(cpuImplementation);
+        } else {
+            resolved = gpuFuture.handle((value, error) -> {
+                if (error == null) {
+                    @SuppressWarnings("unchecked")
+                    T cast = (T) value;
+                    return CompletableFuture.completedFuture(cast);
+                }
+                LOGGER.fine(() -> "GPU result unavailable for task " + taskKey + ": " + error.getMessage());
+                return CompletableFuture.supplyAsync(cpuImplementation);
+            }).thenCompose(result -> result);
+        }
+        return resolved.whenComplete((ignored, throwable) -> GpuWorkloadRegistry.cancel(taskKey));
+    }
+
     static void setGpuWorkloadForTesting(TaskMetadata.GpuBatchWorkload workload) {
         gpuBatchWorkload = workload == null ? OpenClBatchWorkload.INSTANCE : workload;
+    }
+
+    private static int adjustGpuPreferredBatch(int base) {
+        return AdaptiveGpuBatchSizer.adjust(base);
+    }
+
+    private static final class AdaptiveGpuBatchSizer {
+        private static final java.util.concurrent.atomic.AtomicLong emaNanos = new java.util.concurrent.atomic.AtomicLong(0L);
+
+        private static void record(long durationNanos) {
+            if (durationNanos <= 0L) {
+                return;
+            }
+            long current = emaNanos.get();
+            long next = current == 0L
+                ? durationNanos
+                : (long) (current * (1.0d - GPU_BATCH_EMA_ALPHA) + durationNanos * GPU_BATCH_EMA_ALPHA);
+            emaNanos.set(next);
+        }
+
+        private static int adjust(int base) {
+            long avg = emaNanos.get();
+            if (avg <= 0L) {
+                return base;
+            }
+            double ratio = (double) GPU_BATCH_TARGET_NANOS / Math.max(1.0d, avg);
+            double scaled = base * Math.max(0.5d, Math.min(4.0d, ratio));
+            int rounded = (int) Math.round(scaled);
+            return Math.max(2, Math.min(256, rounded));
+        }
     }
 }

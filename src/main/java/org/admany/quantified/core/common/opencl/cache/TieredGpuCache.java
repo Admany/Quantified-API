@@ -62,6 +62,8 @@ public final class TieredGpuCache {
     private boolean vramPromotionPaused;
     private long lastVramTrimLogMs;
     private long lastVramPauseLogMs;
+    private final boolean keepVramResident = Boolean.parseBoolean(
+        System.getProperty("quantified.gpu.cache.keep_vram", "true"));
 
     public TieredGpuCache(GPUMonitor monitor, OpenCLContext context, Supplier<GPUDetector.GPUCapabilities> capabilitiesSupplier) {
         this.monitor = monitor;
@@ -110,6 +112,9 @@ public final class TieredGpuCache {
             refreshVramBudget();
             if (!isPromotionPaused() && tryPromoteToVram(entry)) {
                 entry.tier = CacheTier.VRAM;
+                if (keepVramResident) {
+                    setPayload(entry, null);
+                }
             }
 
             rebalance(pressure);
@@ -154,9 +159,16 @@ public final class TieredGpuCache {
                 tryPromoteToVram(entry);
             }
 
-            ByteBuffer dataBuffer = entry.payload != null
-                ? ByteBuffer.wrap(Arrays.copyOf(entry.payload, entry.payload.length)).asReadOnlyBuffer()
-                : null;
+            ByteBuffer dataBuffer = null;
+            if (entry.payload != null) {
+                dataBuffer = ByteBuffer.wrap(Arrays.copyOf(entry.payload, entry.payload.length)).asReadOnlyBuffer();
+            } else if (entry.buffer != null) {
+                ByteBuffer tmp = ByteBuffer.allocateDirect((int) entry.sizeBytes);
+                tmp.clear();
+                entry.buffer.read(tmp, true);
+                tmp.flip();
+                dataBuffer = tmp.asReadOnlyBuffer();
+            }
             CacheHit hit = new CacheHit(true, entry.tier, entry.buffer, dataBuffer, entry.diskPath);
 
             if (entry.diskPath != null) {
@@ -423,6 +435,9 @@ public final class TieredGpuCache {
         buffer.write(ByteBuffer.wrap(source), true);
         setBuffer(entry, buffer);
         entry.tier = CacheTier.VRAM;
+        if (keepVramResident) {
+            setPayload(entry, null);
+        }
         return true;
     }
 
@@ -622,12 +637,12 @@ public final class TieredGpuCache {
         if (usageRatio >= 1.0d) {
             if (!vramPromotionPaused) {
                 vramPromotionPaused = true;
-                logVramPause("VRAM cache paused – dedicated budget exhausted; routing new entries to RAM/disk");
+                logVramPause("VRAM cache paused - dedicated budget exhausted; routing new entries to RAM/disk");
             }
         } else if (vramPromotionPaused && usageRatio <= VRAM_RESUME_THRESHOLD_FRACTION) {
             vramPromotionPaused = false;
             lastVramPauseLogMs = 0L;
-            logVramPause("VRAM cache resumed – usage back under 55% of budget");
+            logVramPause("VRAM cache resumed - usage back under 55% of budget");
         }
 
         if (usageRatio >= VRAM_TRIM_TRIGGER_FRACTION) {
@@ -829,3 +844,5 @@ public final class TieredGpuCache {
         }
     }
 }
+
+
