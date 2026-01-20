@@ -1,0 +1,178 @@
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+def minecraft_version = project.property('minecraft_version_forge_1_19_2')
+def minecraft_version_range = project.property('minecraft_version_range_forge_1_19_2')
+def forge_version = project.property('forge_version_forge_1_19_2')
+def forge_version_range = project.property('forge_version_range_forge_1_19_2')
+def loader_version_range = project.property('loader_version_range_forge_1_19_2')
+
+version = project.property('mod_version')
+group = project.property('mod_group_id')
+
+base {
+    archivesName = "${mod_name}-forge-${minecraft_version}".toLowerCase()
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+println "Java: ${System.getProperty 'java.version'}, JVM: ${System.getProperty 'java.vm.version'} (${System.getProperty 'java.vendor'}), Arch: ${System.getProperty 'os.arch'}"
+
+minecraft {
+    mappings channel: mapping_channel, version: project.property('mapping_version_forge_1_19_2')
+    copyIdeResources = true
+
+    runs {
+        configureEach {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            jvmArgs '--add-opens', 'quantified/org.admany.quantified.core.common.util=ALL-UNNAMED'
+
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+
+        client {
+            property 'forge.enabledGameTestNamespaces', mod_id
+        }
+
+        server {
+            property 'forge.enabledGameTestNamespaces', mod_id
+            args '--nogui'
+        }
+
+        gameTestServer {
+            property 'forge.enabledGameTestNamespaces', mod_id
+        }
+
+        data {
+            workingDirectory project.file('run-data')
+            args '--mod', mod_id, '--all', '--output', file('src/generated/resources/'), '--existing', file('../core/src/main/resources/')
+        }
+    }
+}
+
+sourceSets {
+    main {
+        java {
+            srcDirs = ['src/main/java', '../core/src/main/java']
+        }
+        resources {
+            srcDirs = ['src/main/resources', '../core/src/main/resources', 'src/generated/resources']
+        }
+    }
+}
+
+def lwjglVersion = "3.3.1"
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    implementation "com.github.ben-manes.caffeine:caffeine:3.2.2"
+    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'net.java.dev.jna:jna:5.13.0'
+    implementation 'com.github.oshi:oshi-core:6.9.1'
+    compileOnly 'org.slf4j:slf4j-api:2.0.9'
+
+    compileOnly("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
+    compileOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    minecraftLibrary("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+
+    implementation "org.jocl:jocl:2.0.0"
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
+    testImplementation 'org.mockito:mockito-core:5.5.0'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.5.0'
+    testImplementation 'org.assertj:assertj-core:3.24.2'
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    var replaceProperties = [
+            minecraft_version: minecraft_version, minecraft_version_range: minecraft_version_range,
+            forge_version: forge_version, forge_version_range: forge_version_range,
+            loader_version_range: loader_version_range,
+            mod_id: mod_id, mod_name: mod_name, mod_license: mod_license, mod_version: mod_version,
+            mod_authors: mod_authors, mod_description: mod_description,
+    ]
+    inputs.properties replaceProperties
+    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties + [project: project]
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    enabled = false
+}
+
+tasks.named('shadowJar', Jar).configure {
+    manifest {
+        attributes([
+                'Specification-Title'     : mod_id,
+                'Specification-Vendor'    : mod_authors,
+                'Specification-Version'   : '1',
+                'Implementation-Title'    : project.name,
+                'Implementation-Version'  : project.jar.archiveVersion,
+                'Implementation-Vendor'   : mod_authors,
+                'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+        ])
+    }
+    finalizedBy 'reobfJar'
+}
+
+shadowJar {
+    archiveClassifier.set("")
+    from sourceSets.main.output
+    dependencies {
+        include(dependency('org.jocl:jocl'))
+        include(dependency('org.lwjgl:lwjgl-opencl'))
+        include(dependency('com.github.ben-manes.caffeine:caffeine'))
+        include(dependency('org.bouncycastle:bcprov-jdk15on'))
+        include(dependency('org.bouncycastle:bcpkix-jdk15on'))
+    }
+    exclude 'net/minecraftforge/**'
+    exclude 'net/minecraft/**'
+    relocate 'com.github.benmanes.caffeine', 'org.admany.quantified.shaded.caffeine'
+}
+
+afterEvaluate {
+    tasks.named('reobfJar').configure {
+        input.set shadowJar.archiveFile
+    }
+}
+
+publishing {
+    publications {
+        register('mavenJava', MavenPublication) {
+            artifact shadowJar
+        }
+    }
+    repositories {
+        maven {
+            url "file://${project.projectDir}/mcmodsrepo"
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+tasks.named('test', Test).configure {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+        exceptionFormat "full"
+    }
+}
