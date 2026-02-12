@@ -283,6 +283,8 @@ public final class DeveloperDashboardServer {
     // Static assets must always be accessible so the login page can load resources even before authentication.
     httpServer.createContext("/dashboard.js", wrap(exchange -> handleStatic(exchange, RESOURCE_ROOT + "dashboard.js", "application/javascript;charset=UTF-8")));
     httpServer.createContext("/dashboard.css", wrap(exchange -> handleStatic(exchange, RESOURCE_ROOT + "dashboard.css", "text/css;charset=UTF-8")));
+    httpServer.createContext("/logo_white.png", wrap(exchange -> handleStaticBinary(exchange, RESOURCE_ROOT + "logo_white.png", "image/png")));
+    httpServer.createContext("/dashboard/logo_white.png", wrap(exchange -> handleStaticBinary(exchange, RESOURCE_ROOT + "logo_white.png", "image/png")));
     httpServer.createContext(LOGO_ENDPOINT, wrap(exchange -> handleStaticBinary(exchange, LOGO_RESOURCE, "image/png")));
     httpServer.createContext("/favicon.ico", wrap(DeveloperDashboardServer::handleFavicon));
 
@@ -324,6 +326,7 @@ public final class DeveloperDashboardServer {
                     if (path != null) {
                         if (path.equals("/") || path.equals("/index.html") || path.equals("/favicon.ico")
                             || path.equals("/dashboard.js") || path.equals("/dashboard.css")
+                            || path.equals("/logo_white.png") || path.equals("/dashboard/logo_white.png")
                             || path.equals(LOGO_ENDPOINT)
                             || path.startsWith("/dashboard/")) {
                             isStaticDashboardAsset = true;
@@ -1183,6 +1186,10 @@ public final class DeveloperDashboardServer {
         payload.addProperty("port", boundPort >= 0 ? boundPort : MultithreadingConfig.CONFIG.developerDashboardPort);
         payload.addProperty("timelineSize", diagnostics.timeline().size());
         payload.addProperty("replayFrameCount", diagnostics.replayFrames().size());
+        String playerName = resolveDashboardPlayerName();
+        if (!playerName.isEmpty()) {
+            payload.addProperty("playerName", playerName);
+        }
 
     payload.addProperty("openclForced", MultithreadingConfig.CONFIG.openclForced);
 
@@ -1224,6 +1231,79 @@ public final class DeveloperDashboardServer {
         DeveloperOverlayManager.apiLogLines().forEach(line -> apiArray.add(line));
         payload.add("apiLogs", apiArray);
         return payload;
+    }
+
+    private static String resolveDashboardPlayerName() {
+        try {
+            Class<?> hooksClass = Class.forName("net.minecraftforge.server.ServerLifecycleHooks");
+            Object server = hooksClass.getMethod("getCurrentServer").invoke(null);
+            if (server != null) {
+                Object playerList = server.getClass().getMethod("getPlayerList").invoke(server);
+                if (playerList != null) {
+                    Object playersObj = playerList.getClass().getMethod("getPlayers").invoke(playerList);
+                    if (playersObj instanceof List<?> players) {
+                        for (Object player : players) {
+                            String name = extractPlayerName(player);
+                            if (!name.isEmpty()) {
+                                return name;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            Class<?> minecraftClass = Class.forName("net.minecraft.client.Minecraft");
+            Object minecraft = minecraftClass.getMethod("getInstance").invoke(null);
+            if (minecraft != null) {
+                Object player = minecraftClass.getField("player").get(minecraft);
+                String name = extractPlayerName(player);
+                if (!name.isEmpty()) {
+                    return name;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        return "";
+    }
+
+    private static String extractPlayerName(Object player) {
+        if (player == null) {
+            return "";
+        }
+        try {
+            Object profile = player.getClass().getMethod("getGameProfile").invoke(player);
+            if (profile != null) {
+                Object nameObj = profile.getClass().getMethod("getName").invoke(profile);
+                String name = safeTrim(nameObj == null ? "" : String.valueOf(nameObj));
+                if (!name.isEmpty()) {
+                    return name;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Object component = player.getClass().getMethod("getName").invoke(player);
+            if (component != null) {
+                try {
+                    Object text = component.getClass().getMethod("getString").invoke(component);
+                    String fromComponent = safeTrim(text == null ? "" : String.valueOf(text));
+                    if (!fromComponent.isEmpty()) {
+                        return fromComponent;
+                    }
+                } catch (Throwable ignored) {
+                    String fallback = safeTrim(String.valueOf(component));
+                    if (!fallback.isEmpty()) {
+                        return fallback;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return "";
     }
 
     private static JsonObject parseJsonObject(String raw) {

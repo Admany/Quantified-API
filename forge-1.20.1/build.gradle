@@ -70,6 +70,14 @@ sourceSets {
             srcDirs = ['src/main/resources', '../core/src/main/resources', 'src/generated/resources']
         }
     }
+    test {
+        java {
+            srcDirs = ['src/test/java', '../core/src/test/java']
+        }
+        resources {
+            srcDirs = ['src/test/resources', '../core/src/test/resources']
+        }
+    }
 }
 
 def lwjglVersion = "3.3.1"
@@ -171,6 +179,20 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.named('test', Test).configure {
     useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+        exceptionFormat "full"
+    }
+}
+
+tasks.register('benchmarkSoak', Test) {
+    group = 'verification'
+    description = 'Runs manual stress/soak benchmark suite for async scheduler tuning.'
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    include '**/StressSoakBenchmarkSuite.class'
+    systemProperty 'quantified.benchmarks', 'true'
     testLogging {
         events "passed", "skipped", "failed"
         exceptionFormat "full"

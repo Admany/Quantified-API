@@ -26,14 +26,19 @@ public final class TaskScheduler {
     private static final int MIN_PARALLEL_UNITS = 256; // Minimum parallel work units
     private static final double GPU_SPEEDUP_THRESHOLD = 1.05; // Need at least ~5% speedup to justify GPU
     private static final long GPU_AGGRESSIVE_MIN_BYTES = 1024; // 1KB minimum for aggressive GPU selection
-    private static final double GPU_AGGRESSIVE_UTIL_LIMIT = 0.70; // Prefer GPU when usage is below this threshold
-    private static final long GPU_BATCH_TARGET_NANOS = 2_000_000L; // ~2ms kernel target
+    private static final double DEFAULT_GPU_AGGRESSIVE_UTIL_LIMIT = 0.70; // Prefer GPU when usage is below this threshold
+    private static final long DEFAULT_GPU_BATCH_TARGET_NANOS = 2_000_000L; // ~2ms kernel target
     private static final double GPU_BATCH_EMA_ALPHA = 0.20d;
+    private static final double LATENCY_EMA_ALPHA = 0.15d;
 
     // Performance tracking
     private static final AtomicLong totalTasksScheduled = new AtomicLong(0);
     private static final AtomicLong gpuTasksExecuted = new AtomicLong(0);
     private static final AtomicLong cpuTasksExecuted = new AtomicLong(0);
+    private static final AtomicLong emaCpuNanos = new AtomicLong(0L);
+    private static final AtomicLong emaGpuNanos = new AtomicLong(0L);
+    private static volatile double runtimeGpuAggressiveUtilLimit = DEFAULT_GPU_AGGRESSIVE_UTIL_LIMIT;
+    private static volatile long runtimeGpuBatchTargetNanos = DEFAULT_GPU_BATCH_TARGET_NANOS;
 
     private static TaskMetadata.GpuBatchWorkload gpuBatchWorkload = OpenClBatchWorkload.INSTANCE;
 
@@ -146,11 +151,12 @@ public final class TaskScheduler {
             );
         }
 
+        Supplier<T> measuredCpu = () -> executeMeasuredCpu(cpuImplementation);
         return AsyncManager.submitSync(
             taskKey,
             PriorityTaskType.BUILDING,
             PriorityTaskType.BUILDING.defaultScore(),
-            cpuImplementation,
+            measuredCpu,
             timeout,
             allowMainThreadRerouting,
             modId,
@@ -344,10 +350,11 @@ public final class TaskScheduler {
         if (status == null) {
             return false;
         }
-        if (status.computeUtilization() > GPU_AGGRESSIVE_UTIL_LIMIT) {
+        double adaptiveUtilLimit = resolveAdaptiveGpuUtilLimit();
+        if (status.computeUtilization() > adaptiveUtilLimit) {
             return false;
         }
-        if (status.memoryUtilization() > GPU_AGGRESSIVE_UTIL_LIMIT) {
+        if (status.memoryUtilization() > adaptiveUtilLimit) {
             return false;
         }
         return true;
@@ -360,6 +367,17 @@ public final class TaskScheduler {
 
         if (!OpenCLManager.isAvailable()) {
             return false;
+        }
+        try {
+            org.admany.quantified.core.common.async.core.PriorityScheduler.SchedulerSnapshot schedulerSnapshot = AsyncManager.schedulerSnapshot();
+            int queueDepth = Math.max(0, schedulerSnapshot.foregroundQueue() + schedulerSnapshot.backgroundQueue());
+            if (queueDepth > 0 && shouldTemporarilyPreferCpu(queueDepth)) {
+                if (LOGGER.isLoggable(java.util.logging.Level.FINE)) {
+                    LOGGER.fine("Preferring CPU due to adaptive latency signal (queueDepth=" + queueDepth + ")");
+                }
+                return false;
+            }
+        } catch (Throwable ignored) {
         }
 
         if (OpenCLManager.isInVramPressureCooldown()) {
@@ -604,6 +622,7 @@ public final class TaskScheduler {
     }
 
     public static void recordGpuKernelDuration(long durationNanos) {
+        updateLatencyEma(emaGpuNanos, durationNanos, LATENCY_EMA_ALPHA);
         AdaptiveGpuBatchSizer.record(durationNanos);
     }
 
@@ -619,21 +638,75 @@ public final class TaskScheduler {
 
     private static <T> CompletableFuture<T> resolveGpuOrCpu(long taskKey, Supplier<T> cpuImplementation) {
         CompletableFuture<Object> gpuFuture = GpuWorkloadRegistry.result(taskKey);
-        CompletableFuture<T> resolved;
         if (gpuFuture == null) {
-            resolved = CompletableFuture.supplyAsync(cpuImplementation);
-        } else {
-            resolved = gpuFuture.handle((value, error) -> {
+            try {
+                return CompletableFuture.completedFuture(executeMeasuredCpu(cpuImplementation));
+            } finally {
+                GpuWorkloadRegistry.cancel(taskKey);
+            }
+        }
+        CompletableFuture<T> resolved = new CompletableFuture<>();
+        gpuFuture.whenComplete((value, error) -> {
+            try {
                 if (error == null) {
                     @SuppressWarnings("unchecked")
                     T cast = (T) value;
-                    return CompletableFuture.completedFuture(cast);
+                    resolved.complete(cast);
+                    return;
                 }
                 LOGGER.fine(() -> "GPU result unavailable for task " + taskKey + ": " + error.getMessage());
-                return CompletableFuture.supplyAsync(cpuImplementation);
-            }).thenCompose(result -> result);
+                resolved.complete(executeMeasuredCpu(cpuImplementation));
+            } catch (Throwable fallbackError) {
+                resolved.completeExceptionally(fallbackError);
+            } finally {
+                GpuWorkloadRegistry.cancel(taskKey);
+            }
+        });
+        return resolved;
+    }
+
+    private static <T> T executeMeasuredCpu(Supplier<T> supplier) {
+        long start = System.nanoTime();
+        try {
+            return supplier.get();
+        } finally {
+            long duration = Math.max(0L, System.nanoTime() - start);
+            updateLatencyEma(emaCpuNanos, duration, LATENCY_EMA_ALPHA);
         }
-        return resolved.whenComplete((ignored, throwable) -> GpuWorkloadRegistry.cancel(taskKey));
+    }
+
+    private static void updateLatencyEma(AtomicLong target, long sampleNanos, double alpha) {
+        if (sampleNanos <= 0L) {
+            return;
+        }
+        target.updateAndGet(current -> current == 0L
+            ? sampleNanos
+            : (long) (current * (1.0d - alpha) + sampleNanos * alpha));
+    }
+
+    private static boolean shouldTemporarilyPreferCpu(int queueDepth) {
+        long cpuAvg = emaCpuNanos.get();
+        long gpuAvg = emaGpuNanos.get();
+        if (cpuAvg <= 0L || gpuAvg <= 0L) {
+            return false;
+        }
+        if (queueDepth < 32) {
+            return false;
+        }
+        return gpuAvg > (long) (cpuAvg * 1.10d);
+    }
+
+    private static double resolveAdaptiveGpuUtilLimit() {
+        long cpuAvg = emaCpuNanos.get();
+        long gpuAvg = emaGpuNanos.get();
+        double baseline = runtimeGpuAggressiveUtilLimit;
+        if (cpuAvg <= 0L || gpuAvg <= 0L) {
+            return baseline;
+        }
+        if (gpuAvg <= cpuAvg) {
+            return Math.min(0.85d, baseline + 0.10d);
+        }
+        return Math.max(0.55d, baseline - 0.08d);
     }
 
     static void setGpuWorkloadForTesting(TaskMetadata.GpuBatchWorkload workload) {
@@ -663,10 +736,17 @@ public final class TaskScheduler {
             if (avg <= 0L) {
                 return base;
             }
-            double ratio = (double) GPU_BATCH_TARGET_NANOS / Math.max(1.0d, avg);
+            double ratio = (double) runtimeGpuBatchTargetNanos / Math.max(1.0d, avg);
             double scaled = base * Math.max(0.5d, Math.min(4.0d, ratio));
             int rounded = (int) Math.round(scaled);
             return Math.max(2, Math.min(256, rounded));
         }
+    }
+
+    public static void applyRuntimeTuning(double gpuAggressiveUtilLimit, long gpuBatchTargetNanos) {
+        double clampedUtilLimit = Math.max(0.50d, Math.min(0.90d, gpuAggressiveUtilLimit));
+        long clampedBatchTarget = Math.max(1_000_000L, Math.min(5_000_000L, gpuBatchTargetNanos));
+        runtimeGpuAggressiveUtilLimit = clampedUtilLimit;
+        runtimeGpuBatchTargetNanos = clampedBatchTarget;
     }
 }

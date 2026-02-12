@@ -179,6 +179,59 @@ const MultiLineChart = ({ series = [], min = null, max = null, strokeWidth = 1.6
     </svg>`;
 };
 
+const BarChart = ({ values = [], maxBars = 14 }) => {
+    const safeValues = Array.isArray(values) && values.length ? values.slice(-maxBars) : [0];
+    const maxValue = Math.max(1, ...safeValues);
+    const normalized = safeValues.map((value) => Math.max(4, (Number(value || 0) / maxValue) * 100));
+    const [animated, setAnimated] = useState(() => normalized.map(() => 4));
+    const previousRef = useRef(normalized.map(() => 4));
+
+    useEffect(() => {
+        const prefersReducedMotion =
+            typeof window !== "undefined" &&
+            window.matchMedia &&
+            window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+        if (prefersReducedMotion) {
+            setAnimated(normalized);
+            previousRef.current = normalized;
+            return;
+        }
+
+        const from = previousRef.current.length === normalized.length ? previousRef.current : normalized.map(() => 4);
+        const duration = 360;
+        let raf = 0;
+        let start = 0;
+
+        const tick = (timestamp) => {
+            if (!start) {
+                start = timestamp;
+            }
+            const progress = Math.min(1, (timestamp - start) / duration);
+            const eased = 1 - Math.pow(1 - progress, 3);
+            const next = normalized.map((value, index) => from[index] + (value - from[index]) * eased);
+            setAnimated(next);
+
+            if (progress < 1) {
+                raf = requestAnimationFrame(tick);
+            } else {
+                previousRef.current = normalized;
+            }
+        };
+
+        raf = requestAnimationFrame(tick);
+        return () => cancelAnimationFrame(raf);
+    }, [normalized.join(",")]);
+
+    return html`<div className="bar-chart" role="img" aria-label="Queue trend bar chart">
+        ${animated.map(
+            (height, index) => html`<div className="bar-chart-col" key=${index}>
+                <span className="bar-chart-bar" style=${{ height: `${height.toFixed(2)}%` }}></span>
+            </div>`
+        )}
+    </div>`;
+};
+
 function formatPercent(value) {
     if (value === null || value === undefined || Number.isNaN(value)) {
         return "-";
@@ -237,6 +290,17 @@ function formatMillis(value) {
     return `${Math.round(value)} ms`;
 }
 
+function normalizeLoadRatio(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+        return 0;
+    }
+    if (numeric > 1.5) {
+        return Math.min(1, numeric / 100);
+    }
+    return Math.min(1, numeric);
+}
+
 function escapeRegex(value) {
     return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -265,6 +329,23 @@ function getHintIcon(hint) {
         return "i";
     }
     return ".";
+}
+
+function getHintAction(hint) {
+    const message = String(hint?.message || "").toLowerCase();
+    if (message.includes("queue") || message.includes("backlog")) {
+        return "Reduce burst size or raise worker budget gradually.";
+    }
+    if (message.includes("vram") || message.includes("gpu")) {
+        return "Lower GPU-heavy workload or clear stale cache blocks.";
+    }
+    if (message.includes("cache")) {
+        return "Trim cache TTL and purge cold cache groups.";
+    }
+    if (message.includes("temperature") || message.includes("overheating")) {
+        return "Throttle heavy tasks until thermal headroom recovers.";
+    }
+    return "Monitor this signal and keep current policy under review.";
 }
 
 function formatNumber(value) {
@@ -312,34 +393,66 @@ function renderApiLogLine(line, key, modColorMap) {
     return html`<div className="log-line" key=${key}><span className="log-msg">${line}</span></div>`;
 }
 
-const Sidebar = ({ activeView, onSelect, statusEntries }) =>
-    html`<aside className="sidebar">
-        <div className="sidebar-title">
-            <strong>Navigation</strong>
+const NavIcon = ({ id }) => {
+    switch (id) {
+        case "overview":
+            return html`<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12.5 12 4l9 8.5M6.5 11.5V20h11V11.5"/></svg>`;
+        case "resources":
+            return html`<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="7" rx="2"/><rect x="4" y="13" width="16" height="7" rx="2"/></svg>`;
+        case "logs":
+            return html`<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4h10l3 3v13H7z"/><path d="M14 4v3h3M10 12h7M10 16h7"/></svg>`;
+        case "controls":
+            return html`<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8h9M16 8h3M5 16h3M10 16h9"/><circle cx="13" cy="8" r="2"/><circle cx="8" cy="16" r="2"/></svg>`;
+        case "config":
+            return html`<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.3.9a8 8 0 0 0-1.7-1L14.5 3h-5L9 5.9a8 8 0 0 0-1.7 1L5 6l-2 3.5L5 11a7 7 0 0 0 0 2l-2 1.5L5 18l2.3-.9c.5.4 1.1.8 1.7 1l.5 2.9h5l.5-2.9c.6-.2 1.2-.6 1.7-1l2.3.9 2-3.5-2-1.5c.1-.3.1-.7.1-1z"/></svg>`;
+        case "system":
+            return html`<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="11" rx="2"/><path d="M9 20h6M12 16v4"/></svg>`;
+        default:
+            return html`<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/></svg>`;
+    }
+};
+
+const Sidebar = ({ activeView, onSelect }) =>
+    html`<aside className="sidebar sidebar-rail">
+        <div className="rail-brand">
+            <img
+                src="/logo_white.png"
+                alt=""
+                aria-hidden="true"
+                onError=${(event) => {
+                    const img = event.currentTarget;
+                    if (!img.dataset.try1) {
+                        img.dataset.try1 = "1";
+                        img.src = "/dashboard/logo_white.png";
+                        return;
+                    }
+                    if (!img.dataset.try2) {
+                        img.dataset.try2 = "1";
+                        img.src = "/dashboard-logo.png";
+                        return;
+                    }
+                    if (!img.dataset.try3) {
+                        img.dataset.try3 = "1";
+                        img.src = "/favicon.ico";
+                    }
+                }}
+            />
         </div>
-        <nav className="sidebar-nav">
+        <nav className="sidebar-nav" aria-label="Dashboard navigation">
             ${NAV_ITEMS.map(
                 (item) => html`<button
                     key=${item.id}
                     className=${`nav-item ${item.id === activeView ? "active" : ""}`}
                     onClick=${() => onSelect(item.id)}
+                    title=${item.label}
+                    aria-label=${item.label}
+                    data-tooltip=${item.label}
                 >
-                    ${item.label}
+                    <span className="nav-item-icon"><${NavIcon} id=${item.id} /></span>
+                    <span className="sr-only">${item.label}</span>
                 </button>`
             )}
         </nav>
-        <div className="sidebar-status">
-            <h4>Quick Status</h4>
-            ${statusEntries.slice(0, 3).map(
-                (entry, index) => html`<div className="sidebar-status-row" key=${index}>
-                    <div>
-                        <div className="metric-sub">${entry.label}</div>
-                        <strong>${entry.detail}</strong>
-                    </div>
-                    <${StatusPill} label=${entry.badge} variant=${entry.variant} />
-                </div>`
-            )}
-        </div>
     </aside>`;
 
 const StatusBoard = ({ entries }) =>
@@ -372,6 +485,8 @@ const App = () => {
     const [history, setHistory] = useState([]);
     const [lastUpdated, setLastUpdated] = useState(null);
     const [activeView, setActiveView] = useState("overview");
+    const [configQuery, setConfigQuery] = useState("");
+    const [activeConfigGroup, setActiveConfigGroup] = useState(null);
     const [themeOverride, setThemeOverride] = useState(() => {
         if (typeof window === "undefined") return null;
         const saved =
@@ -407,6 +522,13 @@ const App = () => {
         deadlineHit: false,
         loadError: null,
     });
+
+    useEffect(() => {
+        if (!configGroups.length) return;
+        if (!activeConfigGroup || !configGroups.some((group) => group.name === activeConfigGroup)) {
+            setActiveConfigGroup(configGroups[0].name);
+        }
+    }, [configGroups, activeConfigGroup]);
 
     const removeToast = useCallback((id) => {
         setToasts((prev) => prev.filter((toast) => toast.id !== id));
@@ -476,7 +598,7 @@ const App = () => {
             const stressCacheSize = Number(nextState?.stressCacheSize ?? 0);
             const totalCacheSize = Number(nextState?.totalCacheSize ?? 0);
             const modsCacheSizeNow = Number(nextState?.modsCacheSize ?? Math.max(0, totalCacheSize - stressCacheSize));
-            const cpuSystemLoad = Number(snapshot.cpuSystemLoad ?? nextState?.cpuSystemLoad ?? 0);
+            const cpuSystemLoad = normalizeLoadRatio(snapshot.cpuSystemLoad ?? nextState?.cpuSystemLoad ?? 0);
             const gpuVramBudgetBytes = Number(snapshot.gpuVramBudgetBytes ?? nextState?.gpuVramBudgetBytes ?? 0);
             const gpuVramUsedBytes = Number(nextState?.gpuVramUsedBytes ?? snapshot.gpuVramUsedBytes ?? 0);
             const gpuMemoryRatio =
@@ -508,7 +630,7 @@ const App = () => {
                 queueDepth: Number(snapshot.queueDepth ?? 0),
                 parallelActiveSlices: Number(snapshot.parallelActiveSlices ?? 0),
                 totalWork: Number(snapshot.totalWork ?? 0),
-                cpuCompute: Number(snapshot.cpuComputeUtil ?? snapshot.gpuComputeUtil ?? 0),
+                cpuCompute: normalizeLoadRatio(snapshot.cpuComputeUtil ?? snapshot.cpuSystemLoad ?? 0),
                 gpuCompute: Number(snapshot.gpuComputeUtil ?? 0),
                 gpuMemory: gpuMemoryRatio,
                 gpuTemperature: Number(snapshot.gpuTemperature ?? 0),
@@ -1078,7 +1200,7 @@ const App = () => {
     const gpuCompute = Number(snapshot.gpuComputeUtil ?? 0);
     const gpuMemory = Number(snapshot.gpuMemoryUtil ?? 0);
     const gpuTemperature = Number(snapshot.gpuTemperature ?? state?.systemInfo?.gpuTemperature ?? 0);
-    const cpuSystemLoad = Number(snapshot.cpuSystemLoad ?? state?.cpuSystemLoad ?? 0);
+    const cpuSystemLoad = normalizeLoadRatio(snapshot.cpuSystemLoad ?? state?.cpuSystemLoad ?? 0);
     const schedulerRate = Number(snapshot.schedulerExecRate ?? 0);
     const ramCacheBytes = Number(state?.cacheRamBytes ?? 0);
     const diskCacheBytes = Number(state?.cacheDiskBytes ?? 0);
@@ -1218,6 +1340,7 @@ const App = () => {
 
     const historySeries = useMemo(() => {
         const queueSeries = history.map((entry) => Number(entry.queueDepth ?? 0));
+        const cpuSeries = history.map((entry) => normalizeLoadRatio(entry.cpuSystemLoad ?? entry.cpuCompute ?? 0));
         const gpuComputeSeries = history.map((entry) => Number(entry.gpuCompute ?? 0));
         const gpuMemorySeries = history.map((entry) => Number(entry.gpuMemory ?? 0));
         const cacheRamSeries = history.map((entry) => Number(entry.cacheRamBytes ?? 0) / (1024 * 1024 * 1024));
@@ -1230,6 +1353,7 @@ const App = () => {
 
         return {
             queue: withFallback(queueSeries, queueDepth),
+            cpu: withFallback(cpuSeries, cpuSystemLoad),
             gpuCompute: withFallback(gpuComputeSeries, gpuCompute),
             gpuMemory: withFallback(gpuMemorySeries, gpuMemory),
             cacheRam: withFallback(cacheRamSeries, ramCacheBytes / (1024 * 1024 * 1024)),
@@ -1241,6 +1365,7 @@ const App = () => {
     }, [
         history,
         queueDepth,
+        cpuSystemLoad,
         gpuCompute,
         gpuMemory,
         ramCacheBytes,
@@ -1265,7 +1390,6 @@ const App = () => {
     const diskFiles = resourceData?.diskFiles ?? [];
     const caches = resourceData?.caches ?? [];
     const taskKinds = resourceData?.taskKinds?.entries ?? [];
-    const taskWindowMs = Number(resourceData?.taskKinds?.windowMs ?? 0);
     const resourceSummary = resourceData?.summary ?? null;
     const selectedCount = selectedFilePayload.length;
     const modColorMap = useMemo(
@@ -1294,191 +1418,177 @@ const App = () => {
     }, [scheduleConfigUpdate]);
 
     const renderOverview = () => {
-        const apiMeta = [
-            { label: "Queue Depth", value: formatNumber(queueDepth), sub: `Soft cap ${formatNumber(queueThreshold)}` },
-            { label: "GPU Compute", value: formatPercent(gpuCompute), sub: `Temp ${formatTemperature(gpuTemperature)}` },
-            { label: "API VRAM (telemetry)", value: formatPercent(vramRatio), sub: formatBytes(vramUsedBytes) },
-            { label: "Cache Entries", value: formatNumber(cacheEntryCount), sub: `${formatBytes(ramCacheBytes)} RAM` },
+        const filteredEvents = timelineEvents.slice(-12).reverse();
+        const queueRatioSeries = historySeries.queue.map((value) => Math.max(0, Math.min(1, value / Math.max(1, queueThreshold))));
+        const riskEntries = statusEntries.filter((entry) => entry.variant === "warn" || entry.variant === "error");
+        const riskIntensity = (entry) => {
+            if (entry.variant === "error") return 0.88;
+            if (entry.variant === "warn") return 0.64;
+            return 0.36;
+        };
+        const topMods = modResourceList.length
+            ? modResourceList.slice(0, 5).map((mod) => ({
+                  id: mod.displayName || mod.modId,
+                  queue: formatNumber(mod.queueDepth ?? 0),
+                  memory: formatBytes(Number(mod.ramBytes ?? 0) + Number(mod.diskBytes ?? 0)),
+                  state: mod.online ? (mod.active ? "Active" : "Idle") : "Offline",
+                  variant: mod.online ? (mod.active ? "ok" : "warn") : "error",
+              }))
+            : spotlight.slice(0, 5).map((mod) => ({
+                  id: mod.modId,
+                  queue: formatNumber(mod.tasksInFlight || 0),
+                  memory: formatPercent(mod.cacheHitRate || 0),
+                  state: "Live",
+                  variant: "ok",
+              }));
+        const capacityRows = [
+            {
+                label: "RAM Cache",
+                value: Number(ramCacheBytes),
+                max: Math.max(1, Number(ramCacheBytes) + Number(diskCacheBytes)),
+                summary: formatBytes(ramCacheBytes),
+            },
+            {
+                label: "Disk Cache",
+                value: Number(diskCacheBytes),
+                max: Math.max(1, Number(ramCacheBytes) + Number(diskCacheBytes)),
+                summary: formatBytes(diskCacheBytes),
+            },
+            {
+                label: "VRAM",
+                value: Number(vramUsedBytes),
+                max: Math.max(1, Number(vramBudgetBytes) || Number(vramUsedBytes)),
+                summary: `${formatBytes(vramUsedBytes)} / ${formatBytes(vramBudgetBytes || 0)}`,
+            },
         ];
-        const modOptions = mods.map((mod) => html`<option key=${mod.selectValue} value=${mod.selectValue}>${mod.displayLabel}</option>`);
-        const throttleLabel =
-            modStats && modStats.throttleFactor != null ? `x${Number(modStats.throttleFactor).toFixed(2)}` : "Not throttled";
 
         return html`<section className="view overview-view">
-            <div className="card-grid two">
-                <${Card}
-                    title="API Status"
-                    actions=${html`<div className="card-actions">
-                        <span className="meta-label">Snapshot ${lastUpdated ? formatTime(lastUpdated) : "Pending"}</span>
-                        <${StatusPill} label=${state?.dashboardEnabled ? "Live" : "Paused"} variant=${state?.dashboardEnabled ? "ok" : "warn"} />
-                    </div>`}
-                >
-                    <div className="metrics-row">
-                        ${apiMeta.map((metric, idx) => html`<${Metric} key=${idx} label=${metric.label} value=${metric.value} sub=${metric.sub} />`)}
-                    </div>
-                    <ul className="api-list">
-                        <li><span>Port</span><strong>${state?.port ?? "-"}</strong></li>
-                        <li><span>Timeline Frames</span><strong>${formatNumber(state?.timelineSize ?? 0)}</strong></li>
-                        <li><span>Replay Frames</span><strong>${formatNumber(state?.replayFrameCount ?? 0)}</strong></li>
-                        <li><span>Connected Mods</span><strong>${formatNumber(modsOnlineCount)}</strong></li>
-                    </ul>
-                </${Card}>
-                <${Card} title="Queue Health" className="tall">
-                    <div className="chart-pane">
-                        <${AreaChart} values=${historySeries.queue} color="#8b5cf6" />
-                    </div>
-                    <div className="metrics-row">
-                        <${Metric}
-                            label="Foreground Workers"
-                            value=${formatNumber(snapshot.desiredForegroundWorkers ?? 0)}
-                            sub="Desired threads"
-                        />
-                        <${Metric}
-                            label="Background Workers"
-                            value=${formatNumber(snapshot.desiredBackgroundWorkers ?? 0)}
-                            sub="Desired threads"
-                        />
-                        <${Metric}
-                            label="Scheduler Rate"
-                            value=${formatNumber(Math.max(0, Math.round(schedulerRate)))}
-                            sub="Exec / s"
-                        />
-                    </div>
-                </${Card}>
+            <div className="view-head">
+                <h2>Operations Overview</h2>
+                <p>Live performance, risks, and quick actions in one streamlined workspace.</p>
             </div>
-            <${Card} title="Component Status">
-                <${StatusBoard} entries=${statusEntries} />
-            </${Card}>
-              <div className="card-grid three">
-                  <${Card} title="GPU Activity">
-                    <div className="chart-pane">
-                        <${MultiLineChart}
-                            series=${[
-                                { values: historySeries.gpuCompute, color: "#34d399" },
-                                { values: historySeries.gpuMemory, color: "#60a5fa" },
-                            ]}
-                            min=${0}
-                            max=${1}
-                        />
+            <div className="overview-shell">
+                <div className="overview-column primary">
+                    <div className="overview-kpi-grid">
+                        <div className="card kpi-card">
+                            <p className="kpi-label">Queue</p>
+                            <h3>${formatNumber(queueDepth)}</h3>
+                            <span>Threshold ${formatNumber(queueThreshold)}</span>
+                        </div>
+                        <div className="card kpi-card">
+                            <p className="kpi-label">GPU Compute</p>
+                            <h3>${formatPercent(gpuCompute)}</h3>
+                            <span>VRAM ${formatPercent(vramRatio)}</span>
+                        </div>
+                        <div className="card kpi-card">
+                            <p className="kpi-label">Scheduler</p>
+                            <h3>${formatNumber(Math.max(0, Math.round(schedulerRate)))}</h3>
+                            <span>executions / sec</span>
+                        </div>
+                        <div className="card kpi-card">
+                            <p className="kpi-label">Cache Total</p>
+                            <h3>${formatBytes(ramCacheBytes + diskCacheBytes)}</h3>
+                            <span>${formatNumber(cacheEntryCount)} entries</span>
+                        </div>
                     </div>
-                      <div className="metrics-row">
-                          <${Metric} label="Compute" value=${formatPercent(gpuCompute)} sub="Current load" />
-                          <${Metric} label="API VRAM (telemetry)" value=${formatPercent(vramRatio)} sub="Context excluded" />
-                          <${Metric} label="Temperature" value=${formatTemperature(gpuTemperature)} sub="GPU Sensors" />
-                      </div>
-                  </${Card}>
-                  <${Card} title="GPU Memory Breakdown">
-                      <div className="metrics-row">
-                          <${Metric} label="Cache VRAM" value=${formatBytes(vramCacheBytes)} sub="Tiered GPU cache" />
-                          <${Metric} label="In-flight tasks" value=${formatBytes(vramTaskBytes)} sub="Estimated usage" />
-                          <${Metric} label="OpenCL context" value=${formatBytes(vramContextBytes)} sub="Ignored in API VRAM" />
-                      </div>
-                      <div className="breakdown-note">How this is calculated</div>
-                      <p className="text-muted">
-                          We start with the GPU's reported VRAM use, then subtract what Quantified is actively caching and what tasks are using right now. Anything left is treated as OpenCL context overhead and isn't counted toward the API VRAM ratio.
-                      </p>
-                  </${Card}>
-                  <${Card} title="Cache Footprint">
-                    <div className="chart-pane">
-                        <${MultiLineChart}
-                            series=${[
-                                { values: historySeries.cacheRam, color: "#a5b4fc" },
-                                { values: historySeries.cacheDisk, color: "#fbbf24" },
-                            ]}
-                        />
+
+                    <div className="overview-chart-grid">
+                        <${Card} title="Workload Trend" actions=${html`<span className="card-note">Normalized</span>`}>
+                            <div className="chart-pane">
+                                <${MultiLineChart}
+                                    series=${[
+                                        { values: historySeries.cpu, color: "#1f2937" },
+                                        { values: queueRatioSeries, color: "#7c879a" },
+                                    ]}
+                                    min=${0}
+                                    max=${1}
+                                />
+                            </div>
+                        </${Card}>
+                        <${Card} title="Cache Usage" actions=${html`<span className="card-note">RAM / Disk / VRAM</span>`}>
+                            <div className="chart-pane">
+                                <${MultiLineChart}
+                                    series=${[
+                                        { values: historySeries.cacheRam, color: "#2f3f58" },
+                                        { values: historySeries.cacheDisk, color: "#6f7f95" },
+                                        { values: historySeries.vram, color: "#9aa8bb" },
+                                    ]}
+                                />
+                            </div>
+                            <div className="chart-legend clear-legend">
+                                <span><strong>Dark line:</strong> RAM cache usage (GB)</span>
+                                <span><strong>Mid line:</strong> Disk cache usage (GB)</span>
+                                <span><strong>Light line:</strong> VRAM usage (GB)</span>
+                            </div>
+                        </${Card}>
                     </div>
-                    <div className="metrics-row">
-                        <${Metric} label="RAM Cache" value=${formatBytes(ramCacheBytes)} sub="In-memory" />
-                        <${Metric} label="Disk Cache" value=${formatBytes(diskCacheBytes)} sub="Persistent" />
-                        <${Metric} label="Stress Cache" value=${formatNumber(stressCacheSize)} sub="Entries" />
-                    </div>
-                </${Card}>
-                <${Card} title="Tuning Hints">
-                    <div className="hint-list">
-                        ${hints.length
-                            ? hints.map(
-                                  (hint, idx) => html`<div className="hint-row" key=${idx}>
-                                      <span className="hint-icon">${getHintIcon(hint)}</span>
-                                      <div>
-                                          <div className="hint-title">${hint.severity}</div>
-                                          <p>${hint.message}</p>
-                                      </div>
-                                  </div>`
-                              )
-                            : html`<p className="text-muted">No automatic tuning suggestions at the moment.</p>`}
-                    </div>
-                </${Card}>
-            </div>
-            <div className="card-grid two">
-                <${Card}
-                    title="Mod Inspector"
-                    actions=${html`<select value=${selectedMod || ""} onChange=${(event) => setSelectedMod(event.target.value || null)}>
-                        <option value="">Select mod</option>
-                        ${modOptions}
-                    </select>`}
-                >
-                    ${selectedMod && modStats
-                        ? html`<div className="mod-stat-grid">
-                              <div>
-                                  <span className="stat-label">Mod</span>
-                                  <strong>${modStats.modId}</strong>
-                              </div>
-                              <div>
-                                  <span className="stat-label">Version</span>
-                                  <strong>${modStats.version || "-"}</strong>
-                              </div>
-                              <div>
-                                  <span className="stat-label">Queue Depth</span>
-                                  <strong>${formatNumber(modStats.currentQueueDepth ?? 0)}</strong>
-                              </div>
-                              <div>
-                                  <span className="stat-label">Tasks / s</span>
-                                  <strong>${modStats.tasksPerSecond?.toFixed ? modStats.tasksPerSecond.toFixed(2) : formatNumber(modStats.tasksPerSecond ?? 0)}</strong>
-                              </div>
-                              <div>
-                                  <span className="stat-label">Cache Hit Rate</span>
-                                  <strong>${formatPercent(modStats.cacheHitRate)}</strong>
-                              </div>
-                              <div>
-                                  <span className="stat-label">Peak VRAM</span>
-                                  <strong>${formatBytes(modStats.peakVRAMUsage || 0)}</strong>
-                              </div>
-                              <div>
-                                  <span className="stat-label">Avg Task Time</span>
-                                  <strong>${formatMillis(modStats.averageTaskTimeMs ?? 0)}</strong>
-                              </div>
-                              <div>
-                                  <span className="stat-label">Throttle</span>
-                                  <strong>${throttleLabel}</strong>
-                              </div>
-                          </div>
-                          <div className="status-row">
-                              <${StatusPill}
-                                  label=${modStats.isThrottled ? "Throttled" : "Normal"}
-                                  variant=${modStats.isThrottled ? "warn" : "ok"}
-                              />
-                              <span className="text-muted">Last activity ${formatTime(modStats.lastActivity)}</span>
-                          </div>`
-                        : html`<p className="text-muted">Select a connected mod to inspect live stats.</p>`}
-                </${Card}>
-                <${Card} title="Mod Spotlight">
-                    <div className="spotlight-list">
-                        ${spotlight.length
-                            ? spotlight.map(
-                                  (entry, idx) => html`<div className="spotlight-row" key=${idx}>
-                                      <div>
-                                          <strong>${entry.modId}</strong>
-                                          <div className="text-muted">v${entry.version}</div>
-                                      </div>
-                                      <div className="spotlight-metrics">
-                                          <span>${formatNumber(entry.tasksInFlight || 0)} in flight</span>
-                                          <span>${formatPercent(entry.cacheHitRate)} hit rate</span>
-                                      </div>
-                                  </div>`
-                              )
-                            : html`<p className="text-muted">No spotlight entries right now.</p>`}
-                    </div>
-                </${Card}>
+
+                    <${Card}
+                        title="Recent Activity"
+                        actions=${html`<span className="card-note">${filteredEvents.length} events</span>`}
+                    >
+                        <div className="table-scroll">
+                            <table className="data-table">
+                                <thead><tr><th>Category</th><th>Activity</th><th>Date</th><th>Status</th><th>Queue</th></tr></thead>
+                                <tbody>
+                                    ${filteredEvents.length
+                                        ? filteredEvents.map(
+                                              (event, idx) => html`<tr key=${idx}>
+                                                  <td>${event.type || "-"}</td>
+                                                  <td>${event.message || "-"}</td>
+                                                  <td>${formatTime(event.timestamp)}</td>
+                                                  <td><${StatusPill} label=${formatPercent(event.gpuComputeUtil ?? 0)} variant=${(event.gpuComputeUtil ?? 0) > 0.8 ? "warn" : "ok"} /></td>
+                                                  <td>${formatNumber(event.queueDepth ?? 0)}</td>
+                                              </tr>`
+                                          )
+                                        : html`<tr><td colspan="5"><p className="text-muted">No matching recent activity.</p></td></tr>`}
+                                </tbody>
+                            </table>
+                        </div>
+                    </${Card}>
+                </div>
+
+                <aside className="overview-column secondary">
+                    <${Card} title="Operational Actions">
+                        <div className="action-row">
+                            <button className="btn btn-primary" disabled=${busy || !state} onClick=${runStressCycle}>Run Stress Cycle</button>
+                            <button className="btn btn-secondary" disabled=${busy} onClick=${clearStressCache}>Clear Stress Cache</button>
+                            <button className="btn btn-ghost" disabled=${busy} onClick=${exportDiagnostics}>Export Diagnostics</button>
+                        </div>
+                    </${Card}>
+
+                    <${Card} title="Top Modules">
+                        <div className="top-mods-list">
+                            ${topMods.length
+                                ? topMods.map(
+                                      (mod, idx) => html`<div className="top-mod-row" key=${idx}>
+                                          <div className="stacked">
+                                              <strong>${mod.id}</strong>
+                                              <span className="text-muted">Queue ${mod.queue} • ${mod.memory}</span>
+                                          </div>
+                                          <${StatusPill} label=${mod.state} variant=${mod.variant} />
+                                      </div>`
+                                  )
+                                : html`<p className="text-muted">No mod telemetry available.</p>`}
+                        </div>
+                    </${Card}>
+
+                    <${Card} title="Live utilisation">
+                        <div className="capacity-list">
+                            ${capacityRows.map(
+                                (row, idx) => html`<div className="capacity-item" key=${idx}>
+                                    <div className="capacity-head">
+                                        <strong>${row.label}</strong>
+                                        <span className="text-muted">${row.summary}</span>
+                                    </div>
+                                    <div className="capacity-track">
+                                        <span className="capacity-fill" style=${{ width: `${Math.round((Math.max(0, row.value) / Math.max(1, row.max)) * 100)}%` }}></span>
+                                    </div>
+                                </div>`
+                            )}
+                        </div>
+                    </${Card}>
+                </aside>
             </div>
         </section>`;
     };
@@ -1500,9 +1610,6 @@ const App = () => {
                   { label: "Disk Cache", value: formatBytes(resourceSummary.cacheDiskBytes ?? 0), sub: "Persistent usage" },
                 ]
             : [];
-        const taskWindowLabel = taskWindowMs
-            ? `${Math.max(1, Math.round(taskWindowMs / 60000))}m window`
-            : "Recent";
         const modNameById = new Map(
             (resourceData?.mods ?? []).map((mod) => [mod.modId, mod.displayName || mod.modId])
         );
@@ -1514,30 +1621,6 @@ const App = () => {
                 return "Quantified API";
             }
             return modId;
-        };
-        const groupedTaskKinds = taskKinds.reduce((acc, entry) => {
-            const key = entry.modId || "unknown-mod";
-            if (!acc[key]) {
-                acc[key] = [];
-            }
-            acc[key].push(entry);
-            return acc;
-        }, {});
-        const sortedModIds = Object.keys(groupedTaskKinds).sort((a, b) => {
-            const aCount = groupedTaskKinds[a].reduce((sum, entry) => sum + (entry.count || 0), 0);
-            const bCount = groupedTaskKinds[b].reduce((sum, entry) => sum + (entry.count || 0), 0);
-            return bCount - aCount;
-        });
-        const toggleTaskMod = (modId) => {
-            setExpandedTaskMods((prev) => {
-                const next = new Set(prev);
-                if (next.has(modId)) {
-                    next.delete(modId);
-                } else {
-                    next.add(modId);
-                }
-                return next;
-            });
         };
         const groupedCaches = caches.reduce((acc, cache) => {
             const fullName = cache.name || "unknown.cache";
@@ -1558,18 +1641,38 @@ const App = () => {
             const bEntries = groupedCaches[b].reduce((sum, entry) => sum + (entry.entries || 0), 0);
             return bEntries - aEntries;
         });
-        const toggleCacheMod = (modId) => {
-            setExpandedCacheMods((prev) => {
-                const next = new Set(prev);
-                if (next.has(modId)) {
-                    next.delete(modId);
-                } else {
-                    next.add(modId);
-                }
-                return next;
-            });
-        };
+        const topCacheRows = sortedCacheModIds.slice(0, 14).map((modId) => {
+            const entries = groupedCaches[modId] || [];
+            const totalEntries = entries.reduce((sum, entry) => sum + (entry.entries || 0), 0);
+            const totalHits = entries.reduce((sum, entry) => sum + (entry.hitCount || 0), 0);
+            const totalMisses = entries.reduce((sum, entry) => sum + (entry.missCount || 0), 0);
+            const totalEvictions = entries.reduce((sum, entry) => sum + (entry.evictions || 0), 0);
+            const hitRate = totalHits + totalMisses > 0 ? totalHits / (totalHits + totalMisses) : 0;
+            return { modId, modLabel: resolveModLabel(modId), totalEntries, hitRate, totalEvictions };
+        });
         return html`<section className="view resources-view">
+            <div className="view-head">
+                <h2>Resource Center</h2>
+                <p>Cache, disk and per-mod resource telemetry with quick maintenance actions.</p>
+            </div>
+            <div className="tab-kpi-row">
+                <div className="tab-kpi">
+                    <span>Mods tracked</span>
+                    <strong>${formatNumber(modResourceList.length)}</strong>
+                </div>
+                <div className="tab-kpi">
+                    <span>Disk files</span>
+                    <strong>${formatNumber(diskFiles.length)}</strong>
+                </div>
+                <div className="tab-kpi">
+                    <span>Selected files</span>
+                    <strong>${formatNumber(selectedCount)}</strong>
+                </div>
+                <div className="tab-kpi">
+                    <span>Caches</span>
+                    <strong>${formatNumber(caches.length)}</strong>
+                </div>
+            </div>
             <${Card}
                 title="Resource Controls"
                 actions=${html`<div className="card-actions">
@@ -1588,219 +1691,136 @@ const App = () => {
                     <button className="btn btn-danger" disabled=${resourceBusy || !diskFiles.length} onClick=${clearDiskCache}>Clear Disk Cache</button>
                 </div>
             </${Card}>
-            <${Card} title="Per-Mod Usage">
-                ${modResourceList.length
-                    ? html`<div className="table-scroll">
-                          <table className="data-table">
-                              <thead>
-                                  <tr>
-                                      <th>Mod</th>
-                                      <th>Queue</th>
-                                      <th>RAM</th>
-                                      <th>VRAM (peak)</th>
-                                      <th>Disk</th>
-                                      <th>Status</th>
-                                      <th>Actions</th>
-                                  </tr>
-                              </thead>
-                              <tbody>
-                                  ${modResourceList.map(
-                                      (mod) => html`<tr key=${mod.modId}>
-                                          <td>
-                                              <div className="stacked">
-                                                  <strong>${mod.displayName || mod.modId}</strong>
-                                                  <span className="text-muted">${mod.modId}</span>
-                                              </div>
-                                          </td>
-                                          <td>${formatNumber(mod.queueDepth ?? 0)}</td>
-                                          <td>${formatBytes(mod.ramBytes ?? 0)}</td>
-                                          <td>${formatBytes(mod.peakVramBytes ?? 0)}</td>
-                                          <td>${formatBytes(mod.diskBytes ?? 0)}</td>
-                                          <td>
-                                              <${StatusPill}
-                                                  label=${mod.online ? (mod.active ? "Active" : "Idle") : "Offline"}
-                                                  variant=${mod.online ? (mod.active ? "ok" : "warn") : "error"}
-                                              />
-                                          </td>
-                                          <td>
-                                              <button className="btn btn-ghost" disabled=${resourceBusy} onClick=${() => purgeModCache(mod.modId)}>
-                                                  Purge Cache
-                                              </button>
-                                          </td>
-                                      </tr>`
-                                  )}
-                              </tbody>
-                          </table>
-                      </div>`
-                    : html`<p className="text-muted">No mods reported resource usage yet.</p>`}
-              </${Card}>
-              <${Card} title="CPU Task Kinds" actions=${html`<span className="card-note">${taskWindowLabel}</span>`}>
-                  ${taskKinds.length
-                      ? html`<div className="task-kind-list">
-                            ${sortedModIds.map((modId) => {
-                                const entries = groupedTaskKinds[modId] || [];
-                                const totalTasks = entries.reduce((sum, entry) => sum + (entry.count || 0), 0);
-                                const totalBatches = entries.reduce((sum, entry) => sum + (entry.batchCount || 0), 0);
-                                const totalBatchSum = entries.reduce(
-                                    (sum, entry) => sum + (entry.batchAvg || 0) * (entry.batchCount || 0),
-                                    0
-                                );
-                                const maxBatch = entries.reduce((max, entry) => Math.max(max, entry.batchMax || 0), 0);
-                                const avgBatch = totalBatches ? totalBatchSum / totalBatches : 0;
-                                const expanded = expandedTaskMods.has(modId);
-                                const modLabel = resolveModLabel(modId);
-                                return html`<div className="task-kind-mod" key=${modId}>
-                                    <button className="task-kind-header" onClick=${() => toggleTaskMod(modId)}>
-                                        <div className="stacked">
-                                            <strong>${modLabel}</strong>
-                                            <span className="text-muted">${modId}</span>
-                                        </div>
-                                        <div className="task-kind-summary">
-                                            <span>${formatNumber(totalTasks)} tasks</span>
-                                            ${totalBatches
-                                                ? html`<span>${formatNumber(totalBatches)} batches / avg ${formatDecimal(avgBatch)} / max ${formatNumber(maxBatch)}</span>`
-                                                : html`<span className="text-muted">No batches yet</span>`}
-                                        </div>
-                                        <span className="task-kind-toggle">${expanded ? "-" : "+"}</span>
-                                    </button>
-                                    ${expanded
-                                        ? html`<div className="task-kind-entries">
-                                              ${entries.map(
-                                                  (entry, idx) => html`<div className="list-row" key=${idx}>
-                                                      <div className="stacked">
-                                                          <strong>${entry.taskName}</strong>
-                                                      </div>
-                                                      <div className="stacked right">
-                                                          <span>${entry.route}</span>
-                                                          <span className="text-muted">${formatNumber(entry.count || 0)} tasks</span>
-                                                          ${entry.batchCount
-                                                              ? html`<span className="text-muted">
-                                                                    ${formatNumber(entry.batchCount)} batches / avg ${formatDecimal(entry.batchAvg)} / max ${formatNumber(entry.batchMax || 0)}
-                                                                </span>`
-                                                              : null}
-                                                      </div>
-                                                  </div>`
-                                              )}
-                                          </div>`
-                                        : null}
-                                </div>`;
-                            })}
-                        </div>`
-                      : html`<p className="text-muted">No task activity recorded yet.</p>`}
-              </${Card}>
-              <${Card} title="Cache Breakdown">
-                ${caches.length
-                    ? html`<div className="cache-breakdown-list">
-                          ${sortedCacheModIds.map((modId) => {
-                              const entries = groupedCaches[modId] || [];
-                              const totalEntries = entries.reduce((sum, entry) => sum + (entry.entries || 0), 0);
-                              const totalHits = entries.reduce((sum, entry) => sum + (entry.hitCount || 0), 0);
-                              const totalMisses = entries.reduce((sum, entry) => sum + (entry.missCount || 0), 0);
-                              const totalEvictions = entries.reduce((sum, entry) => sum + (entry.evictions || 0), 0);
-                              const hitRate = totalHits + totalMisses > 0 ? totalHits / (totalHits + totalMisses) : 0;
-                              const expanded = expandedCacheMods.has(modId);
-                              const modLabel = resolveModLabel(modId);
-                              return html`<div className="cache-mod" key=${modId}>
-                                  <button className="cache-header" onClick=${() => toggleCacheMod(modId)}>
-                                      <div className="stacked">
-                                          <strong>${modLabel}</strong>
-                                          <span className="text-muted">${modId}</span>
-                                      </div>
-                                      <div className="cache-summary">
-                                          <span>${formatNumber(totalEntries)} entries</span>
-                                          <span>Hit ${formatPercent(hitRate)}</span>
-                                          <span>${formatNumber(totalEvictions)} evictions</span>
-                                      </div>
-                                      <span className="cache-toggle">${expanded ? "-" : "+"}</span>
-                                  </button>
-                                  ${expanded
-                                      ? html`<div className="cache-entries">
-                                            ${entries.map(
-                                                (cache, idx) => html`<div className="cache-row" key=${idx}>
-                                                    <div className="stacked">
-                                                        <strong>${cache.cacheName}</strong>
-                                                        <span className="text-muted">${formatNumber(cache.entries)} entries</span>
-                                                    </div>
-                                                    <div className="cache-stats">
-                                                        <span>Hit ${formatPercent(cache.hitRate)}</span>
-                                                        <span>${formatNumber(cache.hitCount || 0)} hits</span>
-                                                        <span>${formatNumber(cache.missCount || 0)} misses</span>
-                                                    </div>
-                                                </div>`
-                                            )}
-                                        </div>`
-                                      : null}
-                              </div>`;
-                          })}
-                      </div>`
-                    : html`<p className="text-muted">Cache stats will appear once the API collects inventory data.</p>`}
-            </${Card}>
-            <${Card}
-                title="Disk Cache Manager"
-                actions=${html`<div className="card-actions">
-                    <span>${formatNumber(selectedCount)} selected</span>
-                    <button className="btn btn-primary" disabled=${resourceBusy || !selectedCount} onClick=${() => deleteSelectedFiles(selectedFilePayload)}>
-                        Delete Selected
-                    </button>
-                </div>`}
-            >
-                <div className="table-actions">
-                    <button className="btn btn-secondary" disabled=${resourceBusy} onClick=${fetchResources}>Reload Inventory</button>
+            <div className="tab-layout resources-layout">
+                <div className="tab-col">
+                    <${Card} title="Per-Mod Usage">
+                        ${modResourceList.length
+                            ? html`<div className="table-scroll">
+                                  <table className="data-table">
+                                      <thead>
+                                          <tr>
+                                              <th>Mod</th><th>Queue</th><th>RAM</th><th>VRAM (peak)</th><th>Disk</th><th>Status</th><th>Actions</th>
+                                          </tr>
+                                      </thead>
+                                      <tbody>
+                                          ${modResourceList.map(
+                                              (mod) => html`<tr key=${mod.modId}>
+                                                  <td><div className="stacked"><strong>${mod.displayName || mod.modId}</strong><span className="text-muted">${mod.modId}</span></div></td>
+                                                  <td>${formatNumber(mod.queueDepth ?? 0)}</td>
+                                                  <td>${formatBytes(mod.ramBytes ?? 0)}</td>
+                                                  <td>${formatBytes(mod.peakVramBytes ?? 0)}</td>
+                                                  <td>${formatBytes(mod.diskBytes ?? 0)}</td>
+                                                  <td><${StatusPill} label=${mod.online ? (mod.active ? "Active" : "Idle") : "Offline"} variant=${mod.online ? (mod.active ? "ok" : "warn") : "error"} /></td>
+                                                  <td><button className="btn btn-ghost" disabled=${resourceBusy} onClick=${() => purgeModCache(mod.modId)}>Purge Cache</button></td>
+                                              </tr>`
+                                          )}
+                                      </tbody>
+                                  </table>
+                              </div>`
+                            : html`<p className="text-muted">No mods reported resource usage yet.</p>`}
+                    </${Card}>
+                    <${Card}
+                        title="Disk Cache Manager"
+                        actions=${html`<div className="card-actions">
+                            <span>${formatNumber(selectedCount)} selected</span>
+                            <button className="btn btn-primary" disabled=${resourceBusy || !selectedCount} onClick=${() => deleteSelectedFiles(selectedFilePayload)}>
+                                Delete Selected
+                            </button>
+                        </div>`}
+                    >
+                        <div className="table-actions">
+                            <button className="btn btn-secondary" disabled=${resourceBusy} onClick=${fetchResources}>Reload Inventory</button>
+                        </div>
+                        <div className="table-scroll tall">
+                            <table className="data-table">
+                                <thead>
+                                    <tr><th></th><th>Mod</th><th>File</th><th>Size</th><th>Modified</th><th>Usage</th></tr>
+                                </thead>
+                                <tbody>
+                                    ${diskFiles.length
+                                        ? diskFiles.map((file, idx) => {
+                                              const key = `${file.modId}::${file.file}`;
+                                              return html`<tr key=${idx}>
+                                                  <td><input type="checkbox" checked=${selectedFiles.has(key)} onChange=${() => toggleFileSelection(key)} /></td>
+                                                  <td><div className="stacked"><strong>${file.modId}</strong><span className="text-muted">${file.modOnline ? "Mod online" : "Offline"}</span></div></td>
+                                                  <td>${file.file}</td>
+                                                  <td>${formatBytes(file.sizeBytes ?? 0)}</td>
+                                                  <td>${formatTime(file.lastModified)}</td>
+                                                  <td><${StatusPill} label=${file.modOnline ? "In Use" : "Cold"} variant=${file.modOnline ? "warn" : "ok"} /></td>
+                                              </tr>`;
+                                          })
+                                        : html`<tr><td colspan="6"><p className="text-muted">No disk cache files detected.</p></td></tr>`}
+                                </tbody>
+                            </table>
+                        </div>
+                    </${Card}>
                 </div>
-                <div className="table-scroll tall">
-                    <table className="data-table">
-                        <thead>
-                            <tr>
-                                <th></th>
-                                <th>Mod</th>
-                                <th>File</th>
-                                <th>Size</th>
-                                <th>Modified</th>
-                                <th>Usage</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${diskFiles.length
-                                ? diskFiles.map((file, idx) => {
-                                      const key = `${file.modId}::${file.file}`;
-                                      return html`<tr key=${idx}>
-                                          <td>
-                                              <input
-                                                  type="checkbox"
-                                                  checked=${selectedFiles.has(key)}
-                                                  onChange=${() => toggleFileSelection(key)}
-                                              />
-                                          </td>
-                                          <td>
-                                              <div className="stacked">
-                                                  <strong>${file.modId}</strong>
-                                                  <span className="text-muted">${file.modOnline ? "Mod online" : "Offline"}</span>
-                                              </div>
-                                          </td>
-                                          <td>${file.file}</td>
-                                          <td>${formatBytes(file.sizeBytes ?? 0)}</td>
-                                          <td>${formatTime(file.lastModified)}</td>
-                                          <td>
-                                              <${StatusPill} label=${file.modOnline ? "In Use" : "Cold"} variant=${file.modOnline ? "warn" : "ok"} />
-                                          </td>
-                                      </tr>`;
-                                  })
-                                : html`<tr>
-                                      <td colspan="6">
-                                          <p className="text-muted">No disk cache files detected.</p>
-                                      </td>
-                                  </tr>`}
-                        </tbody>
-                    </table>
+                <div className="tab-col">
+                    <${Card} title="Cache Overview" actions=${html`<span className="card-note">Expanded space</span>`}>
+                        ${topCacheRows.length
+                            ? html`<div className="table-scroll tall">
+                                <table className="data-table">
+                                    <thead>
+                                        <tr><th>Module</th><th>Total Entries</th><th>Hit Rate</th><th>Evictions</th></tr>
+                                    </thead>
+                                    <tbody>
+                                        ${topCacheRows.map((row, idx) => html`<tr key=${idx}>
+                                            <td>
+                                                <div className="stacked">
+                                                    <strong>${row.modLabel}</strong>
+                                                    <span className="text-muted">${row.modId}</span>
+                                                </div>
+                                            </td>
+                                            <td>${formatNumber(row.totalEntries)}</td>
+                                            <td>${formatPercent(row.hitRate)}</td>
+                                            <td>${formatNumber(row.totalEvictions)}</td>
+                                        </tr>`)}
+                                    </tbody>
+                                </table>
+                            </div>`
+                            : html`<p className="text-muted">No cache telemetry available yet.</p>`}
+                        <div className="chart-pane">
+                            <${MultiLineChart}
+                                series=${[
+                                    { values: historySeries.cacheRam, color: "#2b3446" },
+                                    { values: historySeries.cacheDisk, color: "#64748b" },
+                                    { values: historySeries.vram, color: "#9ca3af" },
+                                ]}
+                            />
+                        </div>
+                        <div className="chart-legend clear-legend">
+                            <span><strong>Dark line:</strong> RAM cache usage (GB)</span>
+                            <span><strong>Mid line:</strong> Disk cache usage (GB)</span>
+                            <span><strong>Light line:</strong> VRAM usage (GB)</span>
+                        </div>
+                    </${Card}>
                 </div>
-            </${Card}>
+            </div>
         </section>`;
     };
 
     const renderLogs = () =>
         html`<section className="view logs-view">
-            <div className="card-grid two">
-                <${Card} title="Timeline Events">
+            <div className="view-head">
+                <h2>Timeline & Logs</h2>
+                <p>Recent events and API runtime logs.</p>
+            </div>
+            <div className="tab-kpi-row">
+                <div className="tab-kpi"><span>Timeline events</span><strong>${formatNumber(timelineEvents.length)}</strong></div>
+                <div className="tab-kpi"><span>Log lines</span><strong>${formatNumber(logs.length)}</strong></div>
+                <div className="tab-kpi"><span>Queue now</span><strong>${formatNumber(queueDepth)}</strong></div>
+                <div className="tab-kpi"><span>GPU now</span><strong>${formatPercent(gpuCompute)}</strong></div>
+            </div>
+            <div className="tab-layout logs-layout">
+                <${Card}
+                    title="API Log"
+                    actions=${html`<button className="btn btn-ghost" onClick=${downloadHistory}>Download History</button>`}
+                >
+                    <div className="log-window api-log wide-log">
+                        ${logs.length ? logs.map((line, idx) => renderApiLogLine(line, idx, modColorMap)) : html`<p className="text-muted">No log lines yet.</p>`}
+                    </div>
+                </${Card}>
+                <${Card} title="Timeline Events" className="compact-timeline-card">
                     <div className="timeline">
                         ${timelineEvents.length
                             ? timelineEvents.map(
@@ -1819,24 +1839,12 @@ const App = () => {
                             : html`<p className="text-muted">No timeline entries yet.</p>`}
                     </div>
                 </${Card}>
-                <${Card}
-                    title="API Log"
-                    actions=${html`<button className="btn btn-ghost" onClick=${downloadHistory}>Download History</button>`}
-                >
-                    <div className="log-window api-log">
-                        ${logs.length ? logs.map((line, idx) => renderApiLogLine(line, idx, modColorMap)) : html`<p className="text-muted">No log lines yet.</p>`}
-                    </div>
-                </${Card}>
             </div>
         </section>`;
 
     const toggleDefinitions = [
-        { key: "developerMode", label: "Developer Mode", description: "Expose experimental instrumentation" },
         { key: "dashboardEnabled", label: "Dashboard Server", description: "Serve this panel" },
-        { key: "timelineEnabled", label: "Timeline Capture", description: "Record telemetry timeline" },
-        { key: "replayEnabled", label: "Replay Frames", description: "Allow telemetry playback" },
         { key: "stressTestEnabled", label: "Stress Harness", description: "Keep stress testing utilities active" },
-        { key: "modSpotlightEnabled", label: "Mod Spotlight", description: "Highlight heavy mods automatically" },
     ];
 
     const renderControls = () => {
@@ -1845,29 +1853,57 @@ const App = () => {
         const selectedProfileLabel =
             stressProfiles.find((option) => option.key === selectedProfile)?.label ?? state?.stressTestProfileLabel ?? "";
         return html`<section className="view controls-view">
-            <div className="card-grid two">
-                <${Card} title="Feature Toggles">
-                    <div className="toggle-list">
-                        ${toggleDefinitions.map((toggle) =>
-                            html`<${ToggleRow}
-                                key=${toggle.key}
-                                label=${toggle.label}
-                                description=${toggle.description}
-                                value=${state ? state[toggle.key] : false}
-                                disabled=${busy || !state}
-                                onChange=${(value) => updateToggles({ [toggle.key]: value })}
-                            />`
-                        )}
+            <div className="view-head">
+                <h2>Controls</h2>
+                <p>Operational controls for runtime availability and stress testing.</p>
+            </div>
+            <div className="tab-kpi-row">
+                <div className="tab-kpi"><span>Stress cycles</span><strong>${formatNumber(state?.stressTestCycleCount ?? 0)}</strong></div>
+                <div className="tab-kpi"><span>GPU tests</span><strong>${formatNumber(state?.gpuTestComputationCount ?? 0)}</strong></div>
+                <div className="tab-kpi"><span>CPU tests</span><strong>${formatNumber(state?.cpuTestComputationCount ?? 0)}</strong></div>
+                <div className="tab-kpi"><span>Profile</span><strong>${selectedProfileLabel || "Default"}</strong></div>
+            </div>
+            <div className="tab-layout controls-layout">
+                <div className="tab-col controls-left-col">
+                    <${Card} title="Runtime Switches">
+                        <div className="toggle-list">
+                            ${toggleDefinitions.map((toggle) =>
+                                html`<${ToggleRow}
+                                    key=${toggle.key}
+                                    label=${toggle.label}
+                                    description=${toggle.description}
+                                    value=${state ? state[toggle.key] : false}
+                                    disabled=${busy || !state}
+                                    onChange=${(value) => updateToggles({ [toggle.key]: value })}
+                                />`
+                            )}
+                        </div>
+                    </${Card}>
+                    <${Card} title="Export & Maintenance" className="controls-maintenance-card">
+                        <div className="action-row">
+                            <button className="btn btn-primary" onClick=${downloadHistory}>Download Timeline JSON</button>
+                            <button className="btn btn-secondary" onClick=${exportDiagnostics}>Export Live Snapshot</button>
+                            <button className="btn btn-ghost" disabled=${busy || !diskFiles.length} onClick=${clearDiskCache}>Clear Disk Cache</button>
+                        </div>
+                    </${Card}>
+                </div>
+                <${Card} title="Stress Operations" className="stress-orchestration-card">
+                    <div className="stress-stats">
+                        <div className="stress-stat">
+                            <span>Total runs</span>
+                            <strong>${formatNumber(state?.stressTestCycleCount ?? 0)}</strong>
+                        </div>
+                        <div className="stress-stat">
+                            <span>GPU jobs</span>
+                            <strong>${formatNumber(state?.gpuTestComputationCount ?? 0)}</strong>
+                        </div>
+                        <div className="stress-stat">
+                            <span>CPU jobs</span>
+                            <strong>${formatNumber(state?.cpuTestComputationCount ?? 0)}</strong>
+                        </div>
                     </div>
-                </${Card}>
-                <${Card} title="Stress & Diagnostics">
-                    <div className="metrics-row">
-                        <${Metric} label="Stress Cycles" value=${formatNumber(state?.stressTestCycleCount ?? 0)} sub="Completed runs" />
-                        <${Metric} label="GPU Tasks" value=${formatNumber(state?.gpuTestComputationCount ?? 0)} sub="Stress GPU ops" />
-                        <${Metric} label="CPU Tasks" value=${formatNumber(state?.cpuTestComputationCount ?? 0)} sub="Stress CPU ops" />
-                    </div>
-                    <div className="form-row">
-                        <label className="form-label" htmlFor="stress-profile-select">Stress Profile</label>
+                    <div className="stress-profile-block">
+                        <label className="form-label" htmlFor="stress-profile-select">Execution profile</label>
                         <select
                             id="stress-profile-select"
                             className="select-input"
@@ -1879,25 +1915,19 @@ const App = () => {
                                 ? stressProfiles.map((option) => html`<option value=${option.key} key=${option.key}>${option.label}</option>`)
                                 : html`<option value="">No profiles available</option>`}
                         </select>
+                        <p className="stress-profile-note">
+                            ${selectedProfileLabel
+                                ? `Current profile: ${selectedProfileLabel}.`
+                                : "Select a profile to run a validation cycle."}
+                        </p>
                     </div>
-                    <p className="text-muted">
-                        ${selectedProfileLabel
-                            ? `${selectedProfileLabel}. Manual cycle runs every profile for ~10s.`
-                            : "Manual cycle runs every profile for ~10s."}
-                    </p>
-                    <div className="action-row">
-                        <button className="btn btn-primary" disabled=${busy || !state} onClick=${runStressCycle}>Run Stress Cycle</button>
-                        <button className="btn btn-secondary" disabled=${busy} onClick=${clearStressCache}>Clear Stress Cache</button>
-                        <button className="btn btn-ghost" disabled=${busy} onClick=${exportDiagnostics}>Export Diagnostics</button>
+                    <div className="action-row stress-actions">
+                        <button className="btn btn-primary" disabled=${busy || !state} onClick=${runStressCycle}>Run cycle now</button>
+                        <button className="btn btn-secondary" disabled=${busy} onClick=${clearStressCache}>Purge stress cache</button>
+                        <button className="btn btn-ghost" disabled=${busy} onClick=${exportDiagnostics}>Export snapshot</button>
                     </div>
                 </${Card}>
             </div>
-            <${Card} title="Data Export & Tools">
-                <div className="action-row">
-                    <button className="btn btn-primary" onClick=${downloadHistory}>Download History JSON</button>
-                    <button className="btn btn-secondary" onClick=${exportDiagnostics}>Export Live Snapshot</button>
-                </div>
-            </${Card}>
         </section>`;
     };
 
@@ -1908,106 +1938,145 @@ const App = () => {
         if (!configGroups.length) {
             return html`<section className="view config-view"><p className="text-muted">No configuration metadata available.</p></section>`;
         }
+        const query = configQuery.trim().toLowerCase();
+        const visibleGroups = configGroups
+            .map((group) => {
+                const fields = (group.fields || []).filter((field) => {
+                    if (!query) return true;
+                    const haystack = `${field.label || ""} ${field.key || ""} ${field.comment || ""}`.toLowerCase();
+                    return haystack.includes(query);
+                });
+                return { ...group, fields };
+            })
+            .filter((group) => group.fields.length);
+        const selectedGroup = visibleGroups.find((group) => group.name === activeConfigGroup) || visibleGroups[0];
+        const renderConfigMeta = (field) => html`<div className="config-label">
+            <strong>${field.label}</strong>
+            <code>${field.key}</code>
+            <p className="config-comment">${field.comment || "No description provided."}</p>
+        </div>`;
+        const renderConfigField = (field) => {
+            const originalValue = field.value;
+            const value = Object.prototype.hasOwnProperty.call(configEdits, field.key) ? configEdits[field.key] : field.value;
+
+            if (field.type === "boolean") {
+                return html`<div className="config-field" key=${field.key}>
+                    ${renderConfigMeta(field)}
+                    <label className="config-boolean">
+                        <span className="toggle-switch">
+                            <input
+                                className="toggle-input"
+                                type="checkbox"
+                                checked=${Boolean(value)}
+                                onChange=${(event) => updateConfigValue(field.key, originalValue, event.target.checked, { delay: 0 })}
+                            />
+                            <span className="toggle-track" aria-hidden="true">
+                                <span className="toggle-thumb"></span>
+                            </span>
+                        </span>
+                        <span>${Boolean(value) ? "Enabled" : "Disabled"}</span>
+                    </label>
+                </div>`;
+            }
+
+            if (field.type === "select") {
+                const options = Array.isArray(field.options) ? field.options : [];
+                const hasCurrent = options.some((option) => option.value === value);
+                const mergedOptions = hasCurrent || value == null ? options : [{ value, label: `${value} (current)` }, ...options];
+                return html`<div className="config-field" key=${field.key}>
+                    ${renderConfigMeta(field)}
+                    <select
+                        value=${value ?? ""}
+                        onChange=${(event) => {
+                            const nextValue = event.target.value;
+                            const selected = mergedOptions.find((option) => option.value === nextValue);
+                            const expectedDeviceName =
+                                field.key === "openclDeviceId" && selected && nextValue !== "auto"
+                                    ? String(selected.label || "").split(" (")[0].trim()
+                                    : "";
+                            updateConfigValue(field.key, originalValue, nextValue, { delay: 0, expectedDeviceName });
+                        }}
+                    >
+                        ${mergedOptions.map((option) => html`<option value=${option.value}>${option.label}</option>`)}
+                    </select>
+                </div>`;
+            }
+
+            if (field.type === "number") {
+                return html`<div className="config-field" key=${field.key}>
+                    ${renderConfigMeta(field)}
+                    <${NumericInput}
+                        value=${Number(value ?? 0)}
+                        onCommit=${(next) => updateConfigValue(field.key, originalValue, next, { delay: 0 })}
+                    />
+                </div>`;
+            }
+
+            if (field.type === "list") {
+                const display = Array.isArray(value) ? value.join("\n") : "";
+                return html`<div className="config-field" key=${field.key}>
+                    ${renderConfigMeta(field)}
+                    <textarea
+                        rows="4"
+                        value=${display}
+                        onInput=${(event) => {
+                            const next = event.target.value
+                                .split(/\r?\n/)
+                                .map((line) => line.trim())
+                                .filter(Boolean);
+                            updateConfigValue(field.key, originalValue, next, { delay: 650 });
+                        }}
+                    ></textarea>
+                </div>`;
+            }
+
+            return html`<div className="config-field" key=${field.key}>
+                ${renderConfigMeta(field)}
+                <input
+                    type="text"
+                    value=${value ?? ""}
+                    onInput=${(event) => updateConfigValue(field.key, originalValue, event.target.value, { delay: 650 })}
+                />
+            </div>`;
+        };
+
         return html`<section className="view config-view">
-            <div className="config-grid">
-                ${configGroups.map((group) => {
-                    if (!group?.fields?.length) {
-                        return null;
-                    }
-                    return html`<${Card} title=${group.name} key=${group.name}>
-                        <div className="config-fields">
-                            ${group.fields.map((field) => {
-                                const originalValue = field.value;
-                                const value = Object.prototype.hasOwnProperty.call(configEdits, field.key) ? configEdits[field.key] : field.value;
-                                if (field.type === "boolean") {
-                                    return html`<div className="config-field" key=${field.key}>
-                                        <div className="config-label">
-                                            <strong>${field.label}</strong>
-                                            ${field.comment ? html`<p className="config-comment">${field.comment}</p>` : null}
-                                        </div>
-                                        <${ToggleRow}
-                                            label=""
-                                            value=${Boolean(value)}
-                                            onChange=${(next) => updateConfigValue(field.key, originalValue, next, { delay: 0 })}
-                                        />
-                                    </div>`;
-                                }
-                                if (field.type === "select") {
-                                    const options = Array.isArray(field.options) ? field.options : [];
-                                    const hasCurrent = options.some((option) => option.value === value);
-                                    const mergedOptions = hasCurrent || value == null
-                                        ? options
-                                        : [{ value, label: `${value} (current)` }, ...options];
-                                    return html`<div className="config-field" key=${field.key}>
-                                        <div className="config-label">
-                                            <strong>${field.label}</strong>
-                                            ${field.comment ? html`<p className="config-comment">${field.comment}</p>` : null}
-                                        </div>
-                                        <select
-                                            value=${value ?? ""}
-                                            onChange=${(event) => {
-                                                const nextValue = event.target.value;
-                                                const selected = mergedOptions.find((option) => option.value === nextValue);
-                                                const expectedDeviceName = field.key === "openclDeviceId" && selected && nextValue !== "auto"
-                                                    ? String(selected.label || "").split(" (")[0].trim()
-                                                    : "";
-                                                updateConfigValue(field.key, originalValue, nextValue, { delay: 0, expectedDeviceName });
-                                            }}
-                                        >
-                                            ${mergedOptions.map((option) => html`<option value=${option.value}>${option.label}</option>`)}
-                                        </select>
-                                    </div>`;
-                                }
-                                if (field.type === "number") {
-                                    return html`<div className="config-field" key=${field.key}>
-                                        <div className="config-label">
-                                            <strong>${field.label}</strong>
-                                            ${field.comment ? html`<p className="config-comment">${field.comment}</p>` : null}
-                                        </div>
-                                        <${NumericInput}
-                                            value=${Number(value ?? 0)}
-                                            onCommit=${(next) => updateConfigValue(field.key, originalValue, next, { delay: 0 })}
-                                        />
-                                    </div>`;
-                                }
-                                if (field.type === "list") {
-                                    const display = Array.isArray(value) ? value.join("\n") : "";
-                                    return html`<div className="config-field" key=${field.key}>
-                                        <div className="config-label">
-                                            <strong>${field.label}</strong>
-                                            ${field.comment ? html`<p className="config-comment">${field.comment}</p>` : null}
-                                        </div>
-                                        <textarea
-                                            rows="4"
-                                            value=${display}
-                                            onInput=${(event) => {
-                                                const next = event.target.value
-                                                    .split(/\r?\n/)
-                                                    .map((line) => line.trim())
-                                                    .filter(Boolean);
-                                                updateConfigValue(field.key, originalValue, next, { delay: 650 });
-                                            }}
-                                        ></textarea>
-                                    </div>`;
-                                }
-                                return html`<div className="config-field" key=${field.key}>
-                                    <div className="config-label">
-                                        <strong>${field.label}</strong>
-                                        ${field.comment ? html`<p className="config-comment">${field.comment}</p>` : null}
-                                    </div>
-                                    <input
-                                        type="text"
-                                        value=${value ?? ""}
-                                        onInput=${(event) => updateConfigValue(field.key, originalValue, event.target.value, { delay: 650 })}
-                                    />
-                                </div>`;
-                            })}
-                        </div>
-                    </${Card}>`;
-                })}
+            <div className="view-head">
+                <h2>Configuration</h2>
+                <p>Grouped settings with inline autosave.</p>
             </div>
-            <div className="config-actions">
-                <button className="btn btn-secondary" onClick=${fetchConfigLayout}>Reload Layout</button>
+            <div className="config-toolbar">
+                <input
+                    type="search"
+                    value=${configQuery}
+                    onInput=${(event) => setConfigQuery(event.target.value)}
+                    placeholder="Search settings by name, key, or note..."
+                    aria-label="Search settings"
+                />
+                <span className="text-muted">${visibleGroups.reduce((sum, group) => sum + group.fields.length, 0)} fields</span>
+            </div>
+            <div className="config-layout">
+                <aside className="config-groups">
+                    ${visibleGroups.map(
+                        (group) => html`<button
+                            key=${group.name}
+                            className=${`config-group-btn ${selectedGroup?.name === group.name ? "active" : ""}`}
+                            onClick=${() => setActiveConfigGroup(group.name)}
+                        >
+                            <span>${group.name}</span>
+                            <span className="config-group-count">${group.fields.length}</span>
+                        </button>`
+                    )}
+                </aside>
+                <div className="config-main">
+                    ${selectedGroup
+                        ? html`<${Card} title=${selectedGroup.name} key=${selectedGroup.name}>
+                            <div className="config-fields">
+                                ${selectedGroup.fields.map((field) => renderConfigField(field))}
+                            </div>
+                        </${Card}>`
+                        : html`<p className="text-muted">No matching settings for this filter.</p>`}
+                </div>
             </div>
         </section>`;
     };
@@ -2016,7 +2085,20 @@ const App = () => {
         const ramUsed = systemInfo.ramUsedBytes ?? 0;
         const ramTotal = systemInfo.ramTotalBytes ?? 0;
         const ramAvailable = systemInfo.ramAvailableBytes ?? 0;
+        const ramUsedRatio = ramTotal > 0 ? Math.min(1, ramUsed / ramTotal) : 0;
+        const ramFreeRatio = ramTotal > 0 ? Math.min(1, ramAvailable / ramTotal) : 0;
+        const schedulerExec = Math.max(0, Math.round(schedulerRate));
         return html`<section className="view system-view">
+            <div className="view-head">
+                <h2>System</h2>
+                <p>Host hardware, storage and usage trends.</p>
+            </div>
+            <div className="tab-kpi-row">
+                <div className="tab-kpi"><span>RAM used</span><strong>${formatBytes(ramUsed)}</strong></div>
+                <div className="tab-kpi"><span>RAM free</span><strong>${formatBytes(ramAvailable)}</strong></div>
+                <div className="tab-kpi"><span>Queue depth</span><strong>${formatNumber(queueDepth)}</strong></div>
+                <div className="tab-kpi"><span>Scheduler</span><strong>${formatNumber(Math.max(0, Math.round(schedulerRate)))}/s</strong></div>
+            </div>
             <div className="card-grid two">
                 <${Card} title="Hardware Overview">
                     <ul className="system-list">
@@ -2026,28 +2108,40 @@ const App = () => {
                         <li><span>RAM</span><strong>${systemInfo.ram || "-"}</strong></li>
                     </ul>
                 </${Card}>
-                <${Card} title="Sensors">
-                    <div className="metrics-row">
-                        <${Metric}
-                            label="CPU Temp"
-                            value=${Number.isFinite(systemInfo.cpuTemperature) && systemInfo.cpuTemperature > 0
-                                ? formatTemperature(systemInfo.cpuTemperature)
-                                : "N/A"}
-                            sub=${Number.isFinite(systemInfo.cpuTemperature) && systemInfo.cpuTemperature > 0
-                                ? "Reported by OSHI"
-                                : "No sensor data"}
-                        />
-                        <${Metric}
-                            label="GPU Temp"
-                            value=${Number.isFinite(systemInfo.gpuTemperature) && systemInfo.gpuTemperature > 0
-                                ? formatTemperature(systemInfo.gpuTemperature)
-                                : "N/A"}
-                            sub=${Number.isFinite(systemInfo.gpuTemperature) && systemInfo.gpuTemperature > 0
-                                ? "Overlay snapshot"
-                                : "No sensor data"}
-                        />
-                        <${Metric} label="RAM Used" value=${formatBytes(ramUsed)} sub=${`${formatBytes(ramTotal)} total`} />
-                        <${Metric} label="RAM Free" value=${formatBytes(ramAvailable)} sub="Available" />
+                <${Card} title="Live Runtime Utilisation" className="runtime-summary-card">
+                    <div className="runtime-summary-layout">
+                        <div className="runtime-memory-panel">
+                            <div className="runtime-memory-head">
+                                <strong>Memory utilisation</strong>
+                                <span>${formatBytes(ramTotal)} total</span>
+                            </div>
+                            <div className="runtime-primary-value">${formatBytes(ramUsed)}</div>
+                            <div className="runtime-primary-label">RAM used</div>
+                            <div className="runtime-track">
+                                <span style=${{ width: `${Math.round(ramUsedRatio * 100)}%` }}></span>
+                            </div>
+                            <div className="runtime-foot-row">
+                                <span>Free ${formatBytes(ramAvailable)}</span>
+                                <span>${formatPercent(ramUsedRatio)} used</span>
+                            </div>
+                        </div>
+                        <div className="runtime-mini-grid">
+                            <div className="runtime-mini-card">
+                                <span>RAM free</span>
+                                <strong>${formatBytes(ramAvailable)}</strong>
+                                <em>${formatPercent(ramFreeRatio)} of total</em>
+                            </div>
+                            <div className="runtime-mini-card">
+                                <span>Queue depth</span>
+                                <strong>${formatNumber(queueDepth)}</strong>
+                                <em>Live backlog</em>
+                            </div>
+                            <div className="runtime-mini-card">
+                                <span>Scheduler</span>
+                                <strong>${formatNumber(schedulerExec)}/s</strong>
+                                <em>Current throughput</em>
+                            </div>
+                        </div>
                     </div>
                 </${Card}>
             </div>
@@ -2103,32 +2197,36 @@ const App = () => {
                         : null}
                 </${Card}>
             </div>
-            <${Card} title="Usage Trends">
-                <div className="chart-pane">
-                    <${MultiLineChart}
-                        series=${[
-                            { values: historySeries.vram, color: "#8b5cf6" },
-                            { values: historySeries.vramBudget, color: "#f472b6" },
-                        ]}
-                    />
-                </div>
-                <div className="chart-legend">
-                    <span>API VRAM (GB)</span>
-                    <span>Budget (GB)</span>
-                </div>
-                <div className="chart-pane">
-                    <${MultiLineChart}
-                        series=${[
-                            { values: historySeries.cacheRam, color: "#34d399" },
-                            { values: historySeries.cacheDisk, color: "#facc15" },
-                        ]}
-                    />
-                </div>
-                <div className="chart-legend">
-                    <span>RAM cache (GB)</span>
-                    <span>Disk cache (GB)</span>
-                </div>
-            </${Card}>
+            <div className="card-grid two">
+                <${Card} title="VRAM Trend">
+                    <div className="chart-pane">
+                        <${MultiLineChart}
+                            series=${[
+                                { values: historySeries.vram, color: "#2b3446" },
+                                { values: historySeries.vramBudget, color: "#8a94a9" },
+                            ]}
+                        />
+                    </div>
+                    <div className="chart-legend clear-legend">
+                        <span><strong>Dark line:</strong> API VRAM used (GB)</span>
+                        <span><strong>Light line:</strong> VRAM budget (GB)</span>
+                    </div>
+                </${Card}>
+                <${Card} title="Cache Trend">
+                    <div className="chart-pane">
+                        <${MultiLineChart}
+                            series=${[
+                                { values: historySeries.cacheRam, color: "#4d5d76" },
+                                { values: historySeries.cacheDisk, color: "#97a3b9" },
+                            ]}
+                        />
+                    </div>
+                    <div className="chart-legend clear-legend">
+                        <span><strong>Dark line:</strong> RAM cache (GB)</span>
+                        <span><strong>Light line:</strong> Disk cache (GB)</span>
+                    </div>
+                </${Card}>
+            </div>
         </section>`;
     };
 
@@ -2149,6 +2247,15 @@ const App = () => {
         }
     };
 
+    const handleSelectView = useCallback(
+        (nextView) => {
+            if (nextView !== activeView) {
+                setActiveView(nextView);
+            }
+        },
+        [activeView]
+    );
+
     const overlay = loadingState.showOverlay
         ? html`<div className=${`loading-screen ${loadingState.overlayStage === "fading" ? "fade-out" : ""}`}>
               <div className="loading-content">
@@ -2161,52 +2268,65 @@ const App = () => {
           </div>`
         : null;
 
-      const applyThemeOverride = (value) => {
-          if (value === "auto") {
-              setThemeOverride(null);
-              if (typeof window !== "undefined" && window.matchMedia) {
-                  const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-                  setTheme(prefersDark ? "dark" : "light");
-              }
-              return;
-          }
-          setThemeOverride(value);
-          setTheme(value);
-      };
+    const playerName = useMemo(() => {
+        const candidates = [
+            state?.playerName,
+            state?.player?.name,
+            state?.minecraftPlayerName,
+            state?.username,
+            state?.playerUsername,
+        ];
+        return candidates.find((value) => typeof value === "string" && value.trim().length > 0)?.trim() || "";
+    }, [state]);
 
-      return html`<div className="dashboard-shell">
-          <div className="theme-toggle">
-              <button
-                  className=${`theme-toggle__btn ${theme === "light" ? "active" : ""}`}
-                  onClick=${() => applyThemeOverride("light")}
-                  aria-label="Use light theme"
-                  title="Light theme"
-              >
-                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                      <circle cx="12" cy="12" r="4.5"></circle>
-                      <path d="M12 2.5v2.5M12 19v2.5M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M2.5 12h2.5M19 12h2.5M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"></path>
-                  </svg>
-              </button>
-              <button
-                  className=${`theme-toggle__btn ${theme === "dark" ? "active" : ""}`}
-                  onClick=${() => applyThemeOverride("dark")}
-                  aria-label="Use dark theme"
-                  title="Dark theme"
-              >
-                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                      <path d="M20.5 14.7a7.8 7.8 0 0 1-10.2-10.2 8.6 8.6 0 1 0 10.2 10.2z"></path>
-                  </svg>
-              </button>
-              <button
-                  className=${`theme-toggle__btn ${themeOverride ? "" : "active"}`}
-                  onClick=${() => applyThemeOverride("auto")}
-                  aria-label="Use system theme"
-                  title="System theme"
-              >
-                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                      <path d="M3 5.5h18M6 9h12M8 12.5h8M6 16h12M9 19.5h6"></path>
-                  </svg>
-              </button>
+    const greeting = playerName ? `Good evening, ${playerName}.` : "Ehhh... Should you be here???";
+
+    const applyThemeOverride = (value) => {
+        if (value === "auto") {
+            setThemeOverride(null);
+            if (typeof window !== "undefined" && window.matchMedia) {
+                const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+                setTheme(prefersDark ? "dark" : "light");
+            }
+            return;
+        }
+        setThemeOverride(value);
+        setTheme(value);
+    };
+
+    return html`<div className="dashboard-shell">
+        <div className="theme-toggle">
+            <button
+                className=${`theme-toggle__btn ${theme === "light" ? "active" : ""}`}
+                onClick=${() => applyThemeOverride("light")}
+                aria-label="Use light theme"
+                title="Light theme"
+            >
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <circle cx="12" cy="12" r="4.5"></circle>
+                    <path d="M12 2.5v2.5M12 19v2.5M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M2.5 12h2.5M19 12h2.5M4.9 19.1l1.8-1.8M17.3 6.7l1.8-1.8"></path>
+                </svg>
+            </button>
+            <button
+                className=${`theme-toggle__btn ${theme === "dark" ? "active" : ""}`}
+                onClick=${() => applyThemeOverride("dark")}
+                aria-label="Use dark theme"
+                title="Dark theme"
+            >
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M20.5 14.7a7.8 7.8 0 0 1-10.2-10.2 8.6 8.6 0 1 0 10.2 10.2z"></path>
+                </svg>
+            </button>
+            <button
+                className=${`theme-toggle__btn ${themeOverride ? "" : "active"}`}
+                onClick=${() => applyThemeOverride("auto")}
+                aria-label="Use system theme"
+                title="System theme"
+            >
+                <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M3 5.5h18M6 9h12M8 12.5h8M6 16h12M9 19.5h6"></path>
+                </svg>
+            </button>
         </div>
         ${overlay}
         <div className="toast-stack">
@@ -2217,20 +2337,22 @@ const App = () => {
             `)}
         </div>
         <div className="dashboard-layout">
-              <${Sidebar} activeView=${activeView} onSelect=${setActiveView} statusEntries=${statusEntries} />
+            <${Sidebar} activeView=${activeView} onSelect=${handleSelectView} />
             <main className="main-panel">
                 <header className="main-header">
-                    <div>
-                        <h1>Quantified API Webpanel</h1>
-                        <p>Live API status with comprehensive mod and API metrics, diagnostics, development tools, tuning recommendations, in-game controls, and real-time monitoring.</p>
+                    <div className="main-header-copy">
+                        <h1>${greeting}</h1>
+                        <p>Quantified API by Admany. Code is code, so if the API decides to explode, do random stuff, report it xd :DDD</p>
                     </div>
-                    <div className="header-meta">
+                    <div className="header-meta user-meta">
                         <span>Last updated ${lastUpdated ? formatTime(lastUpdated) : "waiting..."}</span>
                         <${StatusPill} label=${state?.dashboardEnabled ? "API Online" : "Offline"} variant=${state?.dashboardEnabled ? "ok" : "error"} />
                     </div>
                 </header>
                 ${error ? html`<div className="error-banner">${error}</div>` : null}
-                ${renderActiveView()}
+                <div className="view-transition" key=${activeView}>
+                    ${renderActiveView()}
+                </div>
             </main>
         </div>
     </div>`;

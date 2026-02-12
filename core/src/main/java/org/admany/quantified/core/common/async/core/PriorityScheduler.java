@@ -32,6 +32,8 @@ import java.util.logging.Logger;
 public final class PriorityScheduler {
 
     private static final Logger LOGGER = Logger.getLogger(PriorityScheduler.class.getName());
+    private static final long DEFAULT_BACKGROUND_STALE_BASE_NANOS = TimeUnit.MILLISECONDS.toNanos(3_000L);
+    private static final long DEFAULT_BACKGROUND_STALE_OVERLOAD_NANOS = TimeUnit.MILLISECONDS.toNanos(1_500L);
 
     private final PriorityBlockingQueue<PriorityTask> foregroundQueue;
     private final BlockingQueue<PriorityTask> backgroundQueue;
@@ -48,8 +50,12 @@ public final class PriorityScheduler {
     private final int backgroundThreads;
     private final ThreadPoolErrorHandler errorHandler;
     private final DynamicThreadScaler scaler;
+    private final AutoBatchController autoBatchController = new AutoBatchController();
+    private final RuntimeAutoTuner runtimeAutoTuner = new RuntimeAutoTuner();
     private final AtomicInteger desiredForegroundWorkers = new AtomicInteger();
     private final AtomicInteger desiredBackgroundWorkers = new AtomicInteger();
+    private volatile long runtimeBackgroundStaleBaseNanos = DEFAULT_BACKGROUND_STALE_BASE_NANOS;
+    private volatile long runtimeBackgroundStaleOverloadNanos = DEFAULT_BACKGROUND_STALE_OVERLOAD_NANOS;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
 
@@ -214,7 +220,19 @@ public final class PriorityScheduler {
                     continue; // superseded
                 }
                 promotedKeys.remove(task.taskKey());
-                executeTask(current, foregroundExecuted);
+                int queueDepth = foregroundQueue.size() + backgroundQueue.size();
+                if (shouldDropStale(current, true, queueDepth)) {
+                    droppedTasks.incrementAndGet();
+                    continue;
+                }
+                executeTask(current, foregroundExecuted, true);
+                int additional = autoBatchController.recommendedAdditional(
+                    true,
+                    foregroundQueue.size(),
+                    SystemLoadMonitor.currentSystemLoad(),
+                    SystemLoadMonitor.maxCpuLoad()
+                );
+                executeBatchFromQueue(foregroundQueue, foregroundExecuted, additional, true);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
             } catch (Throwable t) {
@@ -262,7 +280,19 @@ public final class PriorityScheduler {
                     continue;
                 }
                 promotedKeys.remove(task.taskKey());
-                executeTask(current, backgroundExecuted);
+                int queueDepth = foregroundQueue.size() + backgroundQueue.size();
+                if (shouldDropStale(current, false, queueDepth)) {
+                    droppedTasks.incrementAndGet();
+                    continue;
+                }
+                executeTask(current, backgroundExecuted, false);
+                int additional = autoBatchController.recommendedAdditional(
+                    false,
+                    backgroundQueue.size(),
+                    SystemLoadMonitor.currentSystemLoad(),
+                    SystemLoadMonitor.maxCpuLoad()
+                );
+                executeBatchFromQueue(backgroundQueue, backgroundExecuted, additional, false);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
             } catch (Throwable t) {
@@ -278,7 +308,8 @@ public final class PriorityScheduler {
         ThreadHealthMonitor.unregister(Thread.currentThread());
     }
 
-    private void executeTask(PriorityTask task, AtomicLong counter) {
+    private void executeTask(PriorityTask task, AtomicLong counter, boolean foregroundWorker) {
+        long startNanos = System.nanoTime();
         try {
             if (QuantifiedAPI.isPrintDebugLogs()) {
                 LOGGER.fine("[DEBUG] PriorityScheduler: Executing task " + task.taskKey());
@@ -298,6 +329,9 @@ public final class PriorityScheduler {
             }
         } catch (Throwable t) {
             LOGGER.log(Level.SEVERE, "Scheduled task failure", t);
+        } finally {
+            long duration = Math.max(0L, System.nanoTime() - startNanos);
+            autoBatchController.recordExecution(foregroundWorker, duration);
         }
     }
 
@@ -327,7 +361,14 @@ public final class PriorityScheduler {
                 continue;
             }
             if (task.type() == PriorityTaskType.BACKGROUND) {
-                continue; // Don't promote background tasks to prevent imbalance
+                // Aging: allow very old background tasks to receive a single foreground boost.
+                if (now - task.enqueuedAtNanos() >= promoteAfter * 4L
+                    && foregroundQueue.size() < Math.max(1, (int) (queueBound * 0.75d))
+                    && promotedKeys.putIfAbsent(task.taskKey(), Boolean.TRUE) == null) {
+                    task.adjustScore(0.05);
+                    foregroundQueue.offer(task);
+                }
+                continue;
             }
             if (now - task.enqueuedAtNanos() >= promoteAfter) {
                 // Prevent runaway queue growth: only promote a given key once until it executes.
@@ -341,6 +382,84 @@ public final class PriorityScheduler {
             }
         }
         adjustScaling();
+        applyRuntimeTuning();
+    }
+
+    private void executeBatchFromQueue(BlockingQueue<PriorityTask> queue, AtomicLong counter, int maxAdditional, boolean foregroundWorker) {
+        if (maxAdditional <= 0) {
+            return;
+        }
+        for (int i = 0; i < maxAdditional; i++) {
+            PriorityTask next = queue.poll();
+            if (next == null) {
+                return;
+            }
+            PriorityTask current = coalesceMap.remove(next.taskKey());
+            if (current == null || current != next) {
+                continue;
+            }
+            promotedKeys.remove(next.taskKey());
+            int queueDepth = foregroundQueue.size() + backgroundQueue.size();
+            if (shouldDropStale(current, foregroundWorker, queueDepth)) {
+                droppedTasks.incrementAndGet();
+                continue;
+            }
+            executeTask(current, counter, foregroundWorker);
+        }
+    }
+
+    private boolean shouldDropStale(PriorityTask task, boolean foregroundWorker, int totalQueueDepth) {
+        if (task == null || foregroundWorker) {
+            return false;
+        }
+        if (task.type() == PriorityTaskType.FOREGROUND) {
+            return false;
+        }
+        TaskMetadata metadata = task.metadata();
+        if (metadata != null && metadata.gpuRequired()) {
+            return false;
+        }
+        if (totalQueueDepth < Math.max(24, queueBound / 3)) {
+            return false;
+        }
+        long age = System.nanoTime() - task.enqueuedAtNanos();
+        long staleThreshold = totalQueueDepth > queueBound
+            ? runtimeBackgroundStaleOverloadNanos
+            : runtimeBackgroundStaleBaseNanos;
+        return age > staleThreshold;
+    }
+
+    private void applyRuntimeTuning() {
+        RuntimeAutoTuner.RuntimeTuning tuning = runtimeAutoTuner.maybeTune(
+            foregroundQueue.size(),
+            backgroundQueue.size(),
+            queueBound,
+            droppedTasks.get(),
+            workerCrashes.get(),
+            SystemLoadMonitor.currentSystemLoad(),
+            SystemLoadMonitor.maxCpuLoad()
+        );
+        if (tuning == null) {
+            return;
+        }
+
+        autoBatchController.applyRuntimeTuning(
+            tuning.foregroundTargetNanos(),
+            tuning.backgroundTargetNanos(),
+            tuning.foregroundMaxAdditional(),
+            tuning.backgroundMaxAdditional()
+        );
+        runtimeBackgroundStaleBaseNanos = tuning.staleBaseNanos();
+        runtimeBackgroundStaleOverloadNanos = tuning.staleOverloadNanos();
+        scaler.applyRuntimeTuning(
+            tuning.foregroundThrottlePenalty(),
+            tuning.backgroundThrottlePenalty(),
+            tuning.healthyLoadBoost()
+        );
+        org.admany.quantified.core.common.util.TaskScheduler.applyRuntimeTuning(
+            tuning.gpuUtilLimit(),
+            tuning.gpuBatchTargetNanos()
+        );
     }
 
     private void adjustScaling() {

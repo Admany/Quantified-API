@@ -17,7 +17,6 @@ import org.admany.quantified.core.common.cache.impl.CaffeineThreadSafeCache;
 import org.admany.quantified.core.common.cache.impl.PersistentCache;
 import org.admany.quantified.core.common.cache.interfaces.ThreadSafeCache;
 
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -33,6 +32,7 @@ public final class CacheManager {
     private static final AtomicBoolean MAINTENANCE_STARTED = new AtomicBoolean(false);
     private static final AtomicBoolean DISK_SCAN_IN_FLIGHT = new AtomicBoolean(false);
     private static ScheduledExecutorService maintenanceExecutor;
+    private static ScheduledExecutorService diskUsageExecutor;
     private static ScheduledFuture<?> maintenanceFuture;
     private static volatile Duration maintenanceIdleThreshold = Duration.ofMinutes(5);
     private static volatile long lastDiskUsageBytes;
@@ -182,8 +182,27 @@ public final class CacheManager {
     private static long refreshDiskUsageIfNeeded() {
         long now = System.currentTimeMillis();
         long age = now - lastDiskScanTimeMs;
+        if (lastDiskScanTimeMs == 0L) {
+            // Prime the cache usage snapshot synchronously on first call to avoid prolonged zero values.
+            try {
+                lastDiskUsageBytes = computeDiskUsageBytes();
+                lastDiskScanTimeMs = now;
+            } catch (Exception ex) {
+                LOGGER.log(Level.FINER, "Failed to prime disk cache usage", ex);
+            }
+            return lastDiskUsageBytes;
+        }
         if (age > DISK_USAGE_REFRESH_INTERVAL_MS && DISK_SCAN_IN_FLIGHT.compareAndSet(false, true)) {
-            CompletableFuture.runAsync(() -> {
+            ScheduledExecutorService executor = diskUsageExecutor;
+            if (executor == null) {
+                executor = Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread thread = new Thread(r, "quantified-cache-disk-usage");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+                diskUsageExecutor = executor;
+            }
+            executor.execute(() -> {
                 try {
                     long computed = computeDiskUsageBytes();
                     lastDiskUsageBytes = computed;
@@ -277,6 +296,10 @@ public final class CacheManager {
         if (maintenanceExecutor != null) {
             maintenanceExecutor.shutdownNow();
             maintenanceExecutor = null;
+        }
+        if (diskUsageExecutor != null) {
+            diskUsageExecutor.shutdownNow();
+            diskUsageExecutor = null;
         }
         MAINTENANCE_STARTED.set(false);
     }

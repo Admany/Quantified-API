@@ -10,14 +10,15 @@ import org.admany.quantified.core.common.opencl.core.OpenCLTask;
 import org.admany.quantified.core.common.opencl.gpu.GPUMonitor;
 import org.admany.quantified.core.common.telemetry.TaskKindTelemetry;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -30,9 +31,13 @@ public final class OpenCLTaskManager {
     private static final long VRAM_PRESSURE_COOLDOWN_MS = 2_000L;
     private static final AtomicLong vramPressureCooldownUntilMs = new AtomicLong(0);
     private static final AtomicLong lastPressureLogMs = new AtomicLong(0);
+    private static final int GPU_FAILURE_THRESHOLD = 3;
+    private static final long GPU_FAILURE_COOLDOWN_MS = 3_000L;
+    private static final AtomicInteger consecutiveGpuFailures = new AtomicInteger(0);
+    private static final AtomicLong gpuFailureCooldownUntilMs = new AtomicLong(0);
     private static final int MAX_TASK_HISTORY = 20;
-    private static final Object TASK_HISTORY_LOCK = new Object();
-    private static final Deque<TaskEvent> TASK_HISTORY = new ArrayDeque<>();
+    private static final Deque<TaskEvent> TASK_HISTORY = new ConcurrentLinkedDeque<>();
+    private static final AtomicInteger TASK_HISTORY_SIZE = new AtomicInteger(0);
     private static final long TASK_HISTORY_WINDOW_MS = 5_000L;
     private static final long EXTERNAL_PRESSURE_LOG_INTERVAL_MS = 5_000L;
 
@@ -58,6 +63,10 @@ public final class OpenCLTaskManager {
         T cached = tryLoadCached(task);
         if (cached != null) {
             return CompletableFuture.completedFuture(cached);
+        }
+        if (isGpuFailureCooldownActive()) {
+            recordTaskEvent(task, TaskEventType.ROUTED_CPU, "GPU failure cooldown active");
+            return submitToAsync(task, "GPU failure cooldown active");
         }
         if (taskThrottle != null && !taskThrottle.tryAcquire()) {
             LOGGER.warning("Task rejected due to high GPU load: " + task.name());
@@ -107,6 +116,9 @@ public final class OpenCLTaskManager {
         if (cached != null) {
             return CompletableFuture.completedFuture(cached);
         }
+        if (isGpuFailureCooldownActive()) {
+            return submitToAsync(task, "GPU failure cooldown active");
+        }
         if (taskThrottle != null && !taskThrottle.tryAcquire()) {
             LOGGER.warning("GPU task rejected due to throttle: " + task.name());
             recordTaskEvent(task, TaskEventType.GPU_THROTTLED, "semaphore limit reached");
@@ -138,11 +150,13 @@ public final class OpenCLTaskManager {
             T result = task.executeOnGPU(context);
             org.admany.quantified.core.common.util.TaskScheduler.recordGpuKernelDuration(System.nanoTime() - startNanos);
             recordCachedResult(task, result);
+            onGpuSuccess();
             return CompletableFuture.completedFuture(result);
         } catch (Throwable throwable) {
             recordTaskEvent(task, TaskEventType.GPU_ERROR, throwable.getClass().getSimpleName());
             LOGGER.log(Level.WARNING, "GPU execution failed, falling back to CPU", throwable);
             DeveloperOverlayManager.recordFallbackEvent("GPU execution error: " + throwable.getClass().getSimpleName(), task.modId());
+            onGpuFailure(task, throwable);
             if (monitor != null) {
                 monitor.recordFallback();
             }
@@ -319,13 +333,11 @@ public final class OpenCLTaskManager {
     private static List<TaskEvent> snapshotRecentTaskEvents(long windowMs) {
         long cutoff = System.currentTimeMillis() - windowMs;
         List<TaskEvent> events = new ArrayList<>();
-        synchronized (TASK_HISTORY_LOCK) {
-            for (TaskEvent event : TASK_HISTORY) {
-                if (event.timestampMs() >= cutoff) {
-                    events.add(event);
-                } else {
-                    break;
-                }
+        for (TaskEvent event : TASK_HISTORY) {
+            if (event.timestampMs() >= cutoff) {
+                events.add(event);
+            } else {
+                break;
             }
         }
         return events;
@@ -377,11 +389,15 @@ public final class OpenCLTaskManager {
         String safeMod = (modId != null && !modId.isBlank()) ? modId : "unknown";
         String safeTask = (taskName != null && !taskName.isBlank()) ? taskName : "unknown";
         TaskEvent event = new TaskEvent(System.currentTimeMillis(), safeMod, safeTask, Math.max(-1L, estimatedVramBytes), type, detail);
-        synchronized (TASK_HISTORY_LOCK) {
-            TASK_HISTORY.addFirst(event);
-            while (TASK_HISTORY.size() > MAX_TASK_HISTORY) {
-                TASK_HISTORY.removeLast();
+        TASK_HISTORY.addFirst(event);
+        int size = TASK_HISTORY_SIZE.incrementAndGet();
+        while (size > MAX_TASK_HISTORY) {
+            TaskEvent removed = TASK_HISTORY.pollLast();
+            if (removed == null) {
+                TASK_HISTORY_SIZE.compareAndSet(size, Math.max(0, MAX_TASK_HISTORY));
+                break;
             }
+            size = TASK_HISTORY_SIZE.decrementAndGet();
         }
     }
 
@@ -652,6 +668,31 @@ public final class OpenCLTaskManager {
         public void close() {
             pool.returnQueue(this);
         }
+    }
+
+    private static boolean isGpuFailureCooldownActive() {
+        return gpuFailureCooldownUntilMs.get() > System.currentTimeMillis();
+    }
+
+    private static void onGpuSuccess() {
+        consecutiveGpuFailures.set(0);
+        gpuFailureCooldownUntilMs.set(0L);
+    }
+
+    private static void onGpuFailure(OpenCLTask<?> task, Throwable throwable) {
+        int failures = consecutiveGpuFailures.incrementAndGet();
+        if (failures < GPU_FAILURE_THRESHOLD) {
+            return;
+        }
+        long until = System.currentTimeMillis() + GPU_FAILURE_COOLDOWN_MS;
+        gpuFailureCooldownUntilMs.set(until);
+        String modId = task != null ? task.modId() : "unknown";
+        String detail = throwable == null ? "unknown" : throwable.getClass().getSimpleName();
+        DeveloperOverlayManager.recordFallbackEvent(
+            "GPU failure cooldown entered (" + failures + " consecutive failures, reason: " + detail + ")",
+            modId
+        );
+        LOGGER.fine("GPU failure cooldown activated for " + GPU_FAILURE_COOLDOWN_MS + "ms after " + failures + " consecutive failures");
     }
 }
 

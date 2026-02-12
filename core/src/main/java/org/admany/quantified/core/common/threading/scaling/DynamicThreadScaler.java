@@ -8,6 +8,9 @@ public final class DynamicThreadScaler {
     private final int maxBackground;
     private final AtomicInteger smoothedForeground = new AtomicInteger();
     private final AtomicInteger smoothedBackground = new AtomicInteger();
+    private volatile double foregroundThrottlePenalty = 0.30d;
+    private volatile double backgroundThrottlePenalty = 0.45d;
+    private volatile double healthyLoadBoost = 1.10d;
 
     public DynamicThreadScaler(int maxForeground, int maxBackground, boolean smt) {
         this.maxForeground = Math.max(1, maxForeground);
@@ -44,15 +47,43 @@ public final class DynamicThreadScaler {
         double demand = queueDepth <= 0 ? 0.0 : Math.min(1.0, queueDepth / (double) (max * 2));
         double scaled = min + (max - min) * demand;
 
+        // Auto-tune worker pressure from scheduler throttle signal.
+        // High throttle means queues are being intentionally delayed under load.
+        double throttle = Math.max(0.0, Math.min(1.0, throttleLevel));
+        double throttlePenalty = foreground ? foregroundThrottlePenalty : backgroundThrottlePenalty;
+        scaled *= (1.0 - (throttle * throttlePenalty));
+
         double cap = SystemLoadMonitor.maxCpuLoad();
         if (systemLoad > cap) {
-            double reduction = (systemLoad - cap) * 2;
+            double reduction = Math.max(0.0, (systemLoad - cap) * 2.0);
             scaled *= (1.0 - reduction);
+        } else if (systemLoad < cap * 0.75 && queueDepth > max) {
+            // Under healthy CPU load with sustained queue pressure, allow a mild boost.
+            scaled *= healthyLoadBoost;
         }
 
         int desired = (int) Math.round(Math.max(min, Math.min(max, scaled)));
         return desired;
     }
+
+    public void applyRuntimeTuning(double foregroundThrottlePenalty,
+                                   double backgroundThrottlePenalty,
+                                   double healthyLoadBoost) {
+        this.foregroundThrottlePenalty = clamp(foregroundThrottlePenalty, 0.10d, 0.60d);
+        this.backgroundThrottlePenalty = clamp(backgroundThrottlePenalty, 0.15d, 0.75d);
+        this.healthyLoadBoost = clamp(healthyLoadBoost, 0.90d, 1.35d);
+    }
+
+    private static double clamp(double value, double min, double max) {
+        if (value < min) {
+            return min;
+        }
+        if (value > max) {
+            return max;
+        }
+        return value;
+    }
+
     public record ScalingProfile(int foregroundWorkers, int backgroundWorkers) {
     }
 }

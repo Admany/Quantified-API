@@ -310,6 +310,7 @@ public final class AsyncManager {
         if (!MOD_MANAGER.tryReserveTask(entry.modId)) {
             entry.future.completeExceptionally(new RuntimeException("Mod limit exceeded: " + entry.modId));
             TASKS.remove(key);
+            LAST_REQUEST_NANOS.remove(key);
             return;
         }
 
@@ -348,6 +349,7 @@ public final class AsyncManager {
                 }
 
                 TASKS.remove(key);
+                LAST_REQUEST_NANOS.remove(key);
             });
         };
 
@@ -395,6 +397,7 @@ public final class AsyncManager {
                 upstream.cancel(true);
                 entry.future.completeExceptionally(new TimeoutException("Task " + key + " timed out"));
                 METRICS.recordTimeout();
+                LAST_REQUEST_NANOS.remove(key);
             }
         }, Math.max(1, entry.timeout.toMillis()), TimeUnit.MILLISECONDS);
     }
@@ -428,6 +431,7 @@ public final class AsyncManager {
         if (TASKS.size() <= MAX_IN_FLIGHT) return;
 
         TASKS.entrySet().removeIf(e -> e.getValue().future.isDone());
+        LAST_REQUEST_NANOS.keySet().removeIf(key -> !TASKS.containsKey(key));
 
         if (TASKS.size() <= MAX_IN_FLIGHT) return;
 

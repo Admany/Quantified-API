@@ -30,3 +30,4 @@ logs
 logs/debug.log
 Quantified-API-Description.md
 .gitignore
+.hintrc
