@@ -196,17 +196,13 @@ public final class PriorityScheduler {
         while (running.get()) {
             try {
                 ThreadHealthMonitor.heartbeat(ThreadRole.FOREGROUND_WORKER);
-                if (SystemLoadMonitor.currentSystemLoad() >= SystemLoadMonitor.maxCpuLoad()) {
-                    TimeUnit.MILLISECONDS.sleep(10);
-                    continue;
-                }
                 if (index >= desiredForegroundWorkers.get()) {
                     TimeUnit.MILLISECONDS.sleep(50);
                     continue;
                 }
                 PriorityTask task = foregroundQueue.poll(250, TimeUnit.MILLISECONDS);
                 if (task == null) {
-                    if (SystemLoadMonitor.currentSystemLoad() > SystemLoadMonitor.maxCpuLoad()) {
+                    if (SystemLoadMonitor.currentSystemLoad() >= SystemLoadMonitor.maxCpuLoad()) {
                         Thread.yield();
                         TimeUnit.MILLISECONDS.sleep(10);
                     }
@@ -234,7 +230,10 @@ public final class PriorityScheduler {
                 );
                 executeBatchFromQueue(foregroundQueue, foregroundExecuted, additional, true);
             } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
+                if (!running.get()) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             } catch (Throwable t) {
                 LOGGER.log(Level.WARNING, "Foreground worker crash", t);
                 workerCrashes.incrementAndGet();
@@ -256,19 +255,15 @@ public final class PriorityScheduler {
         while (running.get()) {
             try {
                 ThreadHealthMonitor.heartbeat(ThreadRole.BACKGROUND_WORKER);
-                if (SystemLoadMonitor.currentSystemLoad() >= SystemLoadMonitor.maxCpuLoad()) {
-                    TimeUnit.MILLISECONDS.sleep(20);
-                    continue;
-                }
                 if (index >= desiredBackgroundWorkers.get()) {
                     TimeUnit.MILLISECONDS.sleep(75);
                     continue;
                 }
                 PriorityTask task = backgroundQueue.poll(500, TimeUnit.MILLISECONDS);
                 if (task == null) {
-                    if (SystemLoadMonitor.currentSystemLoad() > SystemLoadMonitor.maxCpuLoad()) {
+                    if (SystemLoadMonitor.currentSystemLoad() >= SystemLoadMonitor.maxCpuLoad()) {
                         Thread.yield();
-                        TimeUnit.MILLISECONDS.sleep(10);
+                        TimeUnit.MILLISECONDS.sleep(20);
                     }
                     continue;
                 }
@@ -294,7 +289,10 @@ public final class PriorityScheduler {
                 );
                 executeBatchFromQueue(backgroundQueue, backgroundExecuted, additional, false);
             } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
+                if (!running.get()) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             } catch (Throwable t) {
                 LOGGER.log(Level.WARNING, "Background worker crash", t);
                 workerCrashes.incrementAndGet();

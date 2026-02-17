@@ -2,6 +2,17 @@
 
 ## **No changes needed for mod authors**  
 
+## v1.2.1 - Released on 2026-02-17  
+
+### Quick summary
+
+- Patched a scheduler stall issue where `quantified-fg` workers could sit in sleep loops under high load.
+- Workers now always try to pull queued work first, then back off only when queues are empty.
+- Interrupt handling was cleaned up so workers do not get stuck in a bad interrupted state.
+- No API changes. Fully compatible update.
+
+---
+
 ## v1.2.0 - Released on 2026-02-12  
 
 ### What’s new / big stuff
