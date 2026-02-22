@@ -223,6 +223,59 @@ public final class QuantifiedHandle {
         return computed;
     }
 
+    <T> CompletableFuture<T> cacheGetAsync(String cacheName, String key, Supplier<T> loader, Duration ttl, long maximumSize, boolean persistence) {
+        Objects.requireNonNull(cacheName, "cacheName");
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(loader, "loader");
+        ensureReady();
+
+        ThreadSafeCache<String, Object> cache = cacheFor(cacheName, maximumSize, ttl, persistence);
+        final ConnectedModImpl modMetrics = QuantifiedAPI.lookupConnectedMod(modId);
+        @SuppressWarnings("unchecked")
+        T cached = (T) cache.getIfPresent(key);
+        if (cached != null) {
+            cacheHits.incrementAndGet();
+            if (modMetrics != null) {
+                modMetrics.recordCacheHit();
+            }
+            QuantifiedCoreForge.touchMod(modId);
+            return CompletableFuture.completedFuture(cached);
+        }
+
+        cacheMisses.incrementAndGet();
+        if (modMetrics != null) {
+            modMetrics.recordCacheMiss();
+        }
+
+        long taskKey = ThreadLocalRandom.current().nextLong();
+        return AsyncManager.submitSync(
+            taskKey,
+            PriorityTaskType.CACHE,
+            PriorityTaskType.CACHE.defaultScore(),
+            () -> {
+                @SuppressWarnings("unchecked")
+                T existing = (T) cache.getIfPresent(key);
+                if (existing != null) {
+                    return existing;
+                }
+                T computed = loader.get();
+                if (computed != null) {
+                    cache.put(key, computed);
+                }
+                return computed;
+            },
+            null,
+            true,
+            modId
+        ).whenComplete((result, throwable) -> {
+            QuantifiedCoreForge.touchMod(modId);
+            if (throwable == null && result != null && modMetrics != null) {
+                modMetrics.recordCacheEntryAdded();
+                refreshModCacheTotals(modMetrics);
+            }
+        });
+    }
+
     CompletableFuture<Void> sendPacket(String channelName, QuantifiedPacket packet) {
         Objects.requireNonNull(channelName, "channelName");
         Objects.requireNonNull(packet, "packet");

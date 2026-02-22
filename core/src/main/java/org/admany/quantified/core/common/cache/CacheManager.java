@@ -183,26 +183,23 @@ public final class CacheManager {
         long now = System.currentTimeMillis();
         long age = now - lastDiskScanTimeMs;
         if (lastDiskScanTimeMs == 0L) {
-            // Prime the cache usage snapshot synchronously on first call to avoid prolonged zero values.
-            try {
-                lastDiskUsageBytes = computeDiskUsageBytes();
-                lastDiskScanTimeMs = now;
-            } catch (Exception ex) {
-                LOGGER.log(Level.FINER, "Failed to prime disk cache usage", ex);
+            if (DISK_SCAN_IN_FLIGHT.compareAndSet(false, true)) {
+                ensureDiskUsageExecutor().execute(() -> {
+                    try {
+                        long computed = computeDiskUsageBytes();
+                        lastDiskUsageBytes = computed;
+                        lastDiskScanTimeMs = System.currentTimeMillis();
+                    } catch (Exception ex) {
+                        LOGGER.log(Level.FINER, "Failed to prime disk cache usage", ex);
+                    } finally {
+                        DISK_SCAN_IN_FLIGHT.set(false);
+                    }
+                });
             }
             return lastDiskUsageBytes;
         }
         if (age > DISK_USAGE_REFRESH_INTERVAL_MS && DISK_SCAN_IN_FLIGHT.compareAndSet(false, true)) {
-            ScheduledExecutorService executor = diskUsageExecutor;
-            if (executor == null) {
-                executor = Executors.newSingleThreadScheduledExecutor(r -> {
-                    Thread thread = new Thread(r, "quantified-cache-disk-usage");
-                    thread.setDaemon(true);
-                    return thread;
-                });
-                diskUsageExecutor = executor;
-            }
-            executor.execute(() -> {
+            ensureDiskUsageExecutor().execute(() -> {
                 try {
                     long computed = computeDiskUsageBytes();
                     lastDiskUsageBytes = computed;
@@ -215,6 +212,25 @@ public final class CacheManager {
             });
         }
         return lastDiskUsageBytes;
+    }
+
+    private static ScheduledExecutorService ensureDiskUsageExecutor() {
+        ScheduledExecutorService executor = diskUsageExecutor;
+        if (executor != null) {
+            return executor;
+        }
+        synchronized (CacheManager.class) {
+            executor = diskUsageExecutor;
+            if (executor == null) {
+                executor = Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread thread = new Thread(r, "quantified-cache-disk-usage");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+                diskUsageExecutor = executor;
+            }
+            return executor;
+        }
     }
 
     private static long safeSize(ThreadSafeCache<?, ?> cache) {

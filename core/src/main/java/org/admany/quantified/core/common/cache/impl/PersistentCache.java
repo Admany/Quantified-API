@@ -53,6 +53,8 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
     private final Object stateLock = new Object();
     private final AtomicBoolean dirty = new AtomicBoolean(false);
     private final AtomicBoolean saveInFlight = new AtomicBoolean(false);
+    private final AtomicBoolean loadScheduled = new AtomicBoolean(false);
+    private final AtomicBoolean loadSuppressed = new AtomicBoolean(false);
     private volatile boolean closed = false;
 
     public PersistentCache(ThreadSafeCache<K, V> delegate, String modId, String cacheName, boolean compression) {
@@ -70,7 +72,7 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
 
         try {
             Files.createDirectories(modDir);
-            loadFromDisk();
+            scheduleLoadFromDiskAsync();
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to create cache directory or load cache for " + modId + "/" + cacheName, e);
         }
@@ -100,6 +102,7 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
 
     @Override
     public void invalidateAll() {
+        loadSuppressed.set(true);
         delegate.invalidateAll();
         synchronized (fileLock()) {
             try {
@@ -133,6 +136,7 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
     @Override
     public void close() {
         closed = true;
+        loadSuppressed.set(true);
 
         long deadline = System.currentTimeMillis() + 5000L;
         synchronized (stateLock) {
@@ -150,8 +154,24 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
         delegate.close();
     }
 
+    private void scheduleLoadFromDiskAsync() {
+        if (!loadScheduled.compareAndSet(false, true)) {
+            return;
+        }
+        IO_EXECUTOR.execute(() -> {
+            try {
+                loadFromDisk();
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Failed to load cache from disk asynchronously: " + cacheFile, e);
+            }
+        });
+    }
+
     @SuppressWarnings("unchecked")
     private void loadFromDisk() {
+        if (closed || loadSuppressed.get()) {
+            return;
+        }
         if (!Files.exists(cacheFile)) {
             return;
         }
@@ -163,7 +183,13 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
 
                 Map<K, V> data = (Map<K, V>) ois.readObject();
                 for (Map.Entry<K, V> entry : data.entrySet()) {
+                    if (closed || loadSuppressed.get()) {
+                        break;
+                    }
                     try {
+                        if (delegate.getIfPresent(entry.getKey()) != null) {
+                            continue;
+                        }
                         delegate.put(entry.getKey(), entry.getValue());
                     } catch (Exception e) {
                         LOGGER.log(Level.WARNING, "Failed to load cache entry: " + entry.getKey(), e);

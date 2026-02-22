@@ -52,15 +52,16 @@ public class AsyncProbeScheduler {
         if (succeeded) {
             return;
         }
+        String triggerReason = reason != null ? reason : "unknown";
         if (!scheduled) {
             scheduleBackgroundProbe();
         }
-        LOGGER.info("Triggering OpenCL probe due to: " + reason);
-        if (reason.startsWith("opengl-ready") || reason.startsWith("renderer:")) {
-            runProbeSynchronously(reason);
-        } else {
-            scheduleProbe(Duration.ZERO, reason);
+        LOGGER.info("Triggering OpenCL probe due to: " + triggerReason);
+        if ((triggerReason.startsWith("opengl-ready") || triggerReason.startsWith("renderer:"))
+            && !rendererTriggered.compareAndSet(false, true)) {
+            return;
         }
+        scheduleProbe(Duration.ZERO, triggerReason);
     }
 
     public static synchronized void reset() {
@@ -100,32 +101,6 @@ public class AsyncProbeScheduler {
             OpenCLManager.forceProbe().whenComplete((ok, err) -> handleProbeResult(trigger, attemptNo, ok, err));
         } catch (Throwable t) {
             LOGGER.log(Level.WARNING, "OpenCL probe execution failure on attempt #" + attemptNo, t);
-            scheduleRetry("execution-exception");
-        }
-    }
-
-    private static void runProbeSynchronously(String trigger) {
-        if (succeeded) {
-            return;
-        }
-        int current;
-        do {
-            current = remainingAttempts.get();
-            if (current <= 0) {
-                LOGGER.warning("OpenCL probe attempts exhausted; giving up after " + MAX_ATTEMPTS + " tries");
-                return;
-            }
-        } while (!remainingAttempts.compareAndSet(current, current - 1));
-
-        int attemptNo = attemptCounter.incrementAndGet();
-        LOGGER.info("Running OpenCL probe attempt #" + attemptNo + " synchronously (" + trigger + ")");
-
-        try {
-            Boolean result = OpenCLManager.forceProbeSynchronous(); // Run synchronously
-            handleProbeResult(trigger, attemptNo, result, null);
-        } catch (Throwable t) {
-            LOGGER.log(Level.WARNING, "OpenCL probe execution failure on attempt #" + attemptNo, t);
-            DeveloperOverlayManager.recordApiLog("[OpenCL] Probe attempt " + attemptNo + " failed (" + trigger + ") - " + t.getMessage());
             scheduleRetry("execution-exception");
         }
     }

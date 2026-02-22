@@ -118,6 +118,16 @@ public final class QuantifiedAPI {
         return handle.cacheGet(cacheName, key, loader, ttl, maxSize, persistence);
     }
 
+    public static <T> CompletableFuture<T> getCachedAsync(String cacheName, String key, Supplier<T> loader) {
+        QuantifiedHandle handle = getHandle();
+        return handle.cacheGetAsync(cacheName, key, loader, null, DEFAULT_CACHE_MAX_SIZE, true);
+    }
+
+    public static <T> CompletableFuture<T> getCachedAsync(String cacheName, String key, Supplier<T> loader, Duration ttl, long maxSize, boolean persistence) {
+        QuantifiedHandle handle = getHandle();
+        return handle.cacheGetAsync(cacheName, key, loader, ttl, maxSize, persistence);
+    }
+
     public static <T> CompletableFuture<T> hybrid(String operationName, Supplier<T> work) {
         QuantifiedHandle handle = getHandle();
         QuantifiedHybrid<T> hybrid = QuantifiedHybrid.builder(handle.modId(), operationName, work)

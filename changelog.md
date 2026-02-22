@@ -2,6 +2,35 @@
 
 ## **No changes needed for mod authors**  
 
+## v1.2.2 - Released on 2026-02-22  
+
+### Quick summary
+
+- Startup RAM spikes are lower now.
+- OpenCL startup is fully deferred/background (no forced sync probe on boot).
+- Persistent cache loading is now async, so cache construction no longer blocks startup.
+- Added async cache API path: `QuantifiedAPI.getCachedAsync(...)`.
+- Existing `getCached(...)` path is unchanged. No API breaks.
+
+---
+
+### What changed
+
+- Removed eager startup OpenCL probe path from Forge bootstrap.
+- Removed eager default cache registrations that were allocating memory too early.
+- Cache disk-usage snapshot no longer does a blocking first scan.
+- Added async cache miss compute path in `QuantifiedHandle` + API overloads in `QuantifiedAPI`.
+- Added async hydrate path for persistent cache files.
+
+---
+
+### Notes
+
+- First seconds after launch may run CPU path until GPU probe completes (expected).
+- Existing mods do not need code changes.
+
+---
+
 ## v1.2.1 - Released on 2026-02-17  
 
 ### Quick summary

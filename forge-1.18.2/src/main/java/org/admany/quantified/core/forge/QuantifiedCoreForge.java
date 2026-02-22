@@ -134,11 +134,6 @@ public final class QuantifiedCoreForge {
         DeveloperOverlayManager.recordApiLog(startupMsg3);
         AsyncManager.initialise(bootstrap, coalescer);
 
-        CacheManager.register("building", 10000,
-            java.time.Duration.ofMillis(10000L), false);
-        CacheManager.register("noise", 10000,
-            java.time.Duration.ofMillis(10000L), false);
-
         long ttlMs = Math.max(1_000L, 10000L);
         long idleMs = Math.max(30_000L, Math.min(ttlMs, 120_000L));
         CacheManager.startMaintenance(Duration.ofMinutes(1), Duration.ofMillis(idleMs));
@@ -152,14 +147,8 @@ public final class QuantifiedCoreForge {
         DeveloperOverlayManager.recordApiLog(startupMsg4);
         try {
             OpenCLManager.initialize();
-            boolean ready = OpenCLManager.forceProbeSynchronous();
-            if (ready) {
-                LOGGER.info("OpenCL acceleration initialized successfully.");
-                DeveloperOverlayManager.recordApiLog("[Quantified] OpenCL initialized");
-            } else {
-                LOGGER.info("OpenCL acceleration not available at startup; continuing without GPU acceleration.");
-                DeveloperOverlayManager.recordApiLog("[Quantified] OpenCL unavailable at startup");
-            }
+            LOGGER.info("OpenCL initialization deferred to background probe.");
+            DeveloperOverlayManager.recordApiLog("[Quantified] OpenCL probe deferred (background)");
         } catch (Exception e) {
             LOGGER.info("OpenCL acceleration not available: " + e.getMessage());
             DeveloperOverlayManager.recordApiLog("[Quantified] OpenCL not available: " + e.getMessage());
