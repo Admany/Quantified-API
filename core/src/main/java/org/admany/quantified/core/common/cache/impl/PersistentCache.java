@@ -9,6 +9,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.nio.file.AccessDeniedException;
 import java.util.zip.ZipException;
@@ -55,6 +57,7 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
     private final AtomicBoolean saveInFlight = new AtomicBoolean(false);
     private final AtomicBoolean loadScheduled = new AtomicBoolean(false);
     private final AtomicBoolean loadSuppressed = new AtomicBoolean(false);
+    private final CountDownLatch initialLoadLatch = new CountDownLatch(1);
     private volatile boolean closed = false;
 
     public PersistentCache(ThreadSafeCache<K, V> delegate, String modId, String cacheName, boolean compression) {
@@ -75,16 +78,19 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
             scheduleLoadFromDiskAsync();
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to create cache directory or load cache for " + modId + "/" + cacheName, e);
+            initialLoadLatch.countDown();
         }
     }
 
     @Override
     public V getIfPresent(K key) {
+        awaitInitialLoad();
         return delegate.getIfPresent(key);
     }
 
     @Override
     public V get(K key, java.util.function.Function<? super K, ? extends V> mappingFunction) {
+        awaitInitialLoad();
         return delegate.get(key, mappingFunction);
     }
 
@@ -115,26 +121,31 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
 
     @Override
     public long size() {
+        awaitInitialLoad();
         return delegate.size();
     }
 
     @Override
     public Map<K, V> snapshot() {
+        awaitInitialLoad();
         return delegate.snapshot();
     }
 
     @Override
     public Optional<CacheStats> stats() {
+        awaitInitialLoad();
         return delegate.stats();
     }
 
     @Override
     public void pruneIdleEntries(Duration idleThreshold) {
+        awaitInitialLoad();
         delegate.pruneIdleEntries(idleThreshold);
     }
 
     @Override
     public void close() {
+        awaitInitialLoad();
         closed = true;
         loadSuppressed.set(true);
 
@@ -158,13 +169,39 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
         if (!loadScheduled.compareAndSet(false, true)) {
             return;
         }
-        IO_EXECUTOR.execute(() -> {
-            try {
-                loadFromDisk();
-            } catch (Exception e) {
-                LOGGER.log(Level.WARNING, "Failed to load cache from disk asynchronously: " + cacheFile, e);
+        try {
+            IO_EXECUTOR.execute(() -> {
+                try {
+                    loadFromDisk();
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "Failed to load cache from disk asynchronously: " + cacheFile, e);
+                } finally {
+                    initialLoadLatch.countDown();
+                }
+            });
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Failed to schedule async cache load for " + cacheFile, e);
+            initialLoadLatch.countDown();
+        }
+    }
+
+    private void awaitInitialLoad() {
+        if (!loadScheduled.get()) {
+            return;
+        }
+        long waitMs = Long.getLong("quantified.cache.initial_load_wait_ms", 5000L);
+        if (waitMs < 0L) {
+            waitMs = 0L;
+        }
+        try {
+            if (waitMs == 0L) {
+                initialLoadLatch.await();
+            } else {
+                initialLoadLatch.await(waitMs, TimeUnit.MILLISECONDS);
             }
-        });
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     @SuppressWarnings("unchecked")
