@@ -47,6 +47,7 @@ public final class GpuTaskDispatcher {
         // Check GPU temperature before scheduling GPU tasks
         GPUMonitor.GPUStatus gpuStatus = OpenCLManager.getGPUStatus();
         if (gpuStatus != null && gpuStatus.temperatureC() > 90.0) {
+            GpuBatchTelemetry.recordRejectedThermal();
             return false;
         }
         String key = bucketKey(task, metadata);
@@ -82,12 +83,18 @@ public final class GpuTaskDispatcher {
 
     private boolean eligible(TaskMetadata metadata) {
         if (metadata == null) {
+            GpuBatchTelemetry.recordRejectedNoMetadata();
             return false;
         }
         if (!metadata.batchable()) {
+            GpuBatchTelemetry.recordRejectedNotBatchable();
             return false;
         }
-        return metadata.gpuPreferred() || metadata.gpuRequired();
+        if (!metadata.gpuPreferred() && !metadata.gpuRequired()) {
+            GpuBatchTelemetry.recordRejectedNotGpuMarked();
+            return false;
+        }
+        return true;
     }
 
     private String bucketKey(PriorityTask task, TaskMetadata metadata) {
@@ -196,7 +203,10 @@ public final class GpuTaskDispatcher {
             if (dispatchGpuBatch(modId, tasks, metadata)) {
                 return;
             }
+            GpuBatchTelemetry.recordFallbackDispatcherUnavailable();
             LOGGER.fine(() -> "GPU batch dispatcher unavailable; routing work back to CPU for mod " + modId);
+        } else {
+            GpuBatchTelemetry.recordFallbackNoWorkload();
         }
         runTasksInline(tasks);
     }
@@ -213,19 +223,21 @@ public final class GpuTaskDispatcher {
     private void runGpuBatch(String modId, List<PriorityTask> tasks, TaskMetadata metadata) {
         boolean gpuExecuted = false;
         GpuBatchTelemetry.recordAttempt();
-        try {
-            gpuExecuted = tryExecuteGpuWorkload(modId, tasks, metadata);
-            if (gpuExecuted) {
-                GpuBatchTelemetry.recordSuccess();
-                LOGGER.fine(() -> "GPU batch completed for mod " + modId + " with " + tasks.size() + " tasks");
-            } else {
-                GpuBatchTelemetry.recordFallback();
-                if (metadata.gpuRequired()) {
-                    LOGGER.warning("GPU-required batch falling back to CPU due to unavailable workload or runtime");
-                }
-                failGpuTasks(tasks);
+        gpuExecuted = tryExecuteGpuWorkload(modId, tasks, metadata);
+        if (gpuExecuted) {
+            GpuBatchTelemetry.recordSuccess();
+            GpuBatchTelemetry.recordGpuTasksCompleted(tasks.size());
+            // The GPU workload completes registry futures, but AsyncManager still needs
+            // the original task payload to bridge those results back to caller futures.
+            runTasksInline(tasks);
+            LOGGER.fine(() -> "GPU batch completed for mod " + modId + " with " + tasks.size() + " tasks");
+        } else {
+            GpuBatchTelemetry.recordFallback();
+            GpuBatchTelemetry.recordFallbackExecutionFailure();
+            if (metadata.gpuRequired()) {
+                LOGGER.warning("GPU-required batch falling back to CPU due to unavailable workload or runtime");
             }
-        } finally {
+            failGpuTasks(tasks);
             rerouteTasksToCpu(tasks);
         }
     }

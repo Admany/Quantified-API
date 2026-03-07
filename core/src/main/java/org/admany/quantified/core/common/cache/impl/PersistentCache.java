@@ -4,12 +4,13 @@ import java.io.*;
 import java.nio.file.*;
 import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.nio.file.AccessDeniedException;
@@ -35,8 +36,9 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
     private final String cacheName;
     private final Path cacheFile;
     private final boolean compression;
+    private static final long SAVE_DEBOUNCE_MS = Math.max(250L, Long.getLong("quantified.cache.save_debounce_ms", 1500L));
 
-    private static final ExecutorService IO_EXECUTOR = Executors.newSingleThreadExecutor(new ThreadFactory() {
+    private static final ScheduledExecutorService IO_EXECUTOR = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
         @Override
         public Thread newThread(Runnable r) {
             Thread t = new Thread(r, "quantified-cache-io");
@@ -58,6 +60,7 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
     private final AtomicBoolean loadScheduled = new AtomicBoolean(false);
     private final AtomicBoolean loadSuppressed = new AtomicBoolean(false);
     private final CountDownLatch initialLoadLatch = new CountDownLatch(1);
+    private volatile ScheduledFuture<?> pendingSaveFuture;
     private volatile boolean closed = false;
 
     public PersistentCache(ThreadSafeCache<K, V> delegate, String modId, String cacheName, boolean compression) {
@@ -109,6 +112,7 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
     @Override
     public void invalidateAll() {
         loadSuppressed.set(true);
+        cancelPendingSave();
         delegate.invalidateAll();
         synchronized (fileLock()) {
             try {
@@ -117,6 +121,7 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
                 LOGGER.log(Level.WARNING, "Failed to delete cache file: " + cacheFile, e);
             }
         }
+        releaseFileLockReference();
     }
 
     @Override
@@ -148,6 +153,7 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
         awaitInitialLoad();
         closed = true;
         loadSuppressed.set(true);
+        cancelPendingSave();
 
         long deadline = System.currentTimeMillis() + 5000L;
         synchronized (stateLock) {
@@ -163,6 +169,7 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
 
         saveToDisk(); 
         delegate.close();
+        releaseFileLockReference();
     }
 
     private void scheduleLoadFromDiskAsync() {
@@ -197,7 +204,12 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
             if (waitMs == 0L) {
                 initialLoadLatch.await();
             } else {
-                initialLoadLatch.await(waitMs, TimeUnit.MILLISECONDS);
+                boolean completed = initialLoadLatch.await(waitMs, TimeUnit.MILLISECONDS);
+                if (!completed) {
+                    LOGGER.log(Level.WARNING,
+                        "Persistent cache initial load timed out after {0}ms for {1}/{2} ({3}). Proceeding with in-memory state until hydrate completes.",
+                        new Object[]{waitMs, modId, cacheName, cacheFile});
+                }
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -224,7 +236,11 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
                         break;
                     }
                     try {
+                        // Runtime writes win over disk hydrate if they landed before initial load completed.
                         if (delegate.getIfPresent(entry.getKey()) != null) {
+                            LOGGER.log(Level.FINEST,
+                                "Skipping disk cache entry because in-memory value already exists for {0}/{1}: {2}",
+                                new Object[]{modId, cacheName, entry.getKey()});
                             continue;
                         }
                         delegate.put(entry.getKey(), entry.getValue());
@@ -267,26 +283,37 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
             return;
         }
         dirty.set(true);
+        synchronized (stateLock) {
+            if (closed) {
+                return;
+            }
+            ScheduledFuture<?> pending = pendingSaveFuture;
+            if (pending != null && !pending.isDone()) {
+                pending.cancel(false);
+            }
+            pendingSaveFuture = IO_EXECUTOR.schedule(this::runSaveLoop, SAVE_DEBOUNCE_MS, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void runSaveLoop() {
         if (!saveInFlight.compareAndSet(false, true)) {
             return;
         }
-
-        IO_EXECUTOR.execute(() -> {
-            try {
-                while (!closed && dirty.getAndSet(false)) {
-                    saveToDisk();
-                }
-            } finally {
-                saveInFlight.set(false);
-                synchronized (stateLock) {
-                    stateLock.notifyAll();
-                }
-
-                if (!closed && dirty.get() && saveInFlight.compareAndSet(false, true)) {
-                    saveToDiskAsync();
-                }
+        try {
+            while (!closed && dirty.getAndSet(false)) {
+                saveToDisk();
             }
-        });
+        } finally {
+            saveInFlight.set(false);
+            synchronized (stateLock) {
+                pendingSaveFuture = null;
+                stateLock.notifyAll();
+            }
+
+            if (!closed && dirty.get()) {
+                saveToDiskAsync();
+            }
+        }
     }
 
     private void saveToDisk() {
@@ -300,15 +327,10 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
 
                 Map<K, V> serializableData = new HashMap<>();
                 for (Map.Entry<K, V> entry : snapshot.entrySet()) {
-                    try {
-                        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                             ObjectOutputStream testOos = new ObjectOutputStream(baos)) {
-                            testOos.writeObject(entry.getKey());
-                            testOos.writeObject(entry.getValue());
-                            serializableData.put(entry.getKey(), entry.getValue());
-                        }
-                    } catch (Exception e) {
-                        LOGGER.log(Level.FINE, "Skipping non-serializable cache entry: " + entry.getKey(), e);
+                    if (entry.getKey() instanceof Serializable && entry.getValue() instanceof Serializable) {
+                        serializableData.put(entry.getKey(), entry.getValue());
+                    } else {
+                        LOGGER.log(Level.FINEST, "Skipping non-serializable cache entry: {0}", entry.getKey());
                     }
                 }
 
@@ -337,6 +359,21 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
                 LOGGER.log(Level.WARNING, "Failed to save cache to disk: " + cacheFile, e);
             }
         }
+    }
+
+    private void cancelPendingSave() {
+        synchronized (stateLock) {
+            ScheduledFuture<?> pending = pendingSaveFuture;
+            if (pending != null && !pending.isDone()) {
+                pending.cancel(false);
+            }
+            pendingSaveFuture = null;
+        }
+    }
+
+    private void releaseFileLockReference() {
+        Path normalized = cacheFile.toAbsolutePath().normalize();
+        FILE_LOCKS.remove(normalized);
     }
 
     private static void moveTempIntoPlaceWithRetries(Path tmp, Path target) throws IOException {

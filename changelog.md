@@ -2,6 +2,48 @@
 
 ## **No changes needed for mod authors**  
 
+## v1.3.0 - Released on 2026-03-07  
+
+### Quick summary
+
+- Persistent cache CPU usage is much lower now under real load.
+- Cache persistence is now opt-in by default instead of silently enabled everywhere.
+- Disk saves are debounced, so cache-heavy mods stop wasting CPU on constant rewrite churn.
+- Fixed an OpenCL batch execution bug where successful GPU batches could still fail to complete caller futures correctly.
+- Added much better GPU batch / fallback telemetry so it is easier to see why GPU paths are or are not being used.
+
+---
+
+### What changed
+
+- `QuantifiedAPI.getCached(...)`, `getCachedAsync(...)`, and `putCached(...)` now default to non-persistent cache usage unless persistence is explicitly requested.
+- Persistent cache writes are now coalesced/debounced instead of saving on every single mutation.
+- Removed the old expensive per-entry trial serialization path during disk saves.
+- Improved persistent cache lifecycle handling:
+  - file lock references are cleaned up properly
+  - timed-out async hydrate now logs a warning
+  - disk hydrate precedence is now explicitly documented in code/logging
+- Fixed GPU batch success flow so completed GPU work actually propagates results back to waiting task futures.
+- Added detailed GPU batch telemetry counters for:
+  - missing metadata
+  - not batchable
+  - not GPU-marked
+  - thermal rejection
+  - dispatcher unavailable fallback
+  - no-workload fallback
+  - execution failure fallback
+  - direct GPU throttle/capacity/cooldown rejections
+
+---
+
+### Real-world result
+
+- In monitored runs, `quantified-cache-io` dropped from being one of the top CPU-heavy threads to not showing up in the top thread list at all.
+- One compared run improved from roughly **587 CPM** to **753 CPM** after the broader LC2H + Quantified API cleanup pass.
+- This update does not add API breakage for mod authors. It is mainly an internal efficiency/stability pass.
+
+---
+
 ## v1.2.2 - Released on 2026-02-22  
 
 ### Quick summary

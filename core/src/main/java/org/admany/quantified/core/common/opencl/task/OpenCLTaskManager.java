@@ -1,6 +1,7 @@
 package org.admany.quantified.core.common.opencl.task;
 
 import org.admany.quantified.core.common.async.core.AsyncManager;
+import org.admany.quantified.core.common.async.gpu.GpuBatchTelemetry;
 import org.admany.quantified.core.common.async.task.PriorityTaskType;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
 import org.admany.quantified.core.common.opencl.cache.TieredGpuCache;
@@ -65,10 +66,12 @@ public final class OpenCLTaskManager {
             return CompletableFuture.completedFuture(cached);
         }
         if (isGpuFailureCooldownActive()) {
+            GpuBatchTelemetry.recordDirectFailureCooldown();
             recordTaskEvent(task, TaskEventType.ROUTED_CPU, "GPU failure cooldown active");
             return submitToAsync(task, "GPU failure cooldown active");
         }
         if (taskThrottle != null && !taskThrottle.tryAcquire()) {
+            GpuBatchTelemetry.recordDirectThrottleRejected();
             LOGGER.warning("Task rejected due to high GPU load: " + task.name());
             recordTaskEvent(task, TaskEventType.GPU_THROTTLED, "semaphore limit reached");
             return CompletableFuture.completedFuture(null);
@@ -76,6 +79,7 @@ public final class OpenCLTaskManager {
 
         try {
             if (!canAcceptTask(task)) {
+                GpuBatchTelemetry.recordDirectCapacityRejected();
                 LOGGER.fine("GPU capacity check failed, routing to async pool: " + task.name());
                 DeveloperOverlayManager.recordFallbackEvent("GPU capacity limit reached", task.modId());
                 return submitToAsync(task, "GPU capacity limit reached");
@@ -116,16 +120,23 @@ public final class OpenCLTaskManager {
         if (cached != null) {
             return CompletableFuture.completedFuture(cached);
         }
+        if (isInVramPressureCooldown()) {
+            GpuBatchTelemetry.recordDirectVramCooldown();
+            return submitToAsync(task, "VRAM pressure cooldown active");
+        }
         if (isGpuFailureCooldownActive()) {
+            GpuBatchTelemetry.recordDirectFailureCooldown();
             return submitToAsync(task, "GPU failure cooldown active");
         }
         if (taskThrottle != null && !taskThrottle.tryAcquire()) {
+            GpuBatchTelemetry.recordDirectThrottleRejected();
             LOGGER.warning("GPU task rejected due to throttle: " + task.name());
             recordTaskEvent(task, TaskEventType.GPU_THROTTLED, "semaphore limit reached");
             return CompletableFuture.failedFuture(new IllegalStateException("GPU busy"));
         }
         try {
             if (!canAcceptTask(task)) {
+                GpuBatchTelemetry.recordDirectCapacityRejected();
                 LOGGER.fine("GPU capacity check failed, executing on async pool: " + task.name());
                 DeveloperOverlayManager.recordFallbackEvent("GPU capacity limit reached", task.modId());
                 return submitToAsync(task, "GPU capacity limit reached");
@@ -151,12 +162,14 @@ public final class OpenCLTaskManager {
             org.admany.quantified.core.common.util.TaskScheduler.recordGpuKernelDuration(System.nanoTime() - startNanos);
             recordCachedResult(task, result);
             onGpuSuccess();
+            GpuBatchTelemetry.recordDirectGpuSucceeded();
             return CompletableFuture.completedFuture(result);
         } catch (Throwable throwable) {
             recordTaskEvent(task, TaskEventType.GPU_ERROR, throwable.getClass().getSimpleName());
             LOGGER.log(Level.WARNING, "GPU execution failed, falling back to CPU", throwable);
             DeveloperOverlayManager.recordFallbackEvent("GPU execution error: " + throwable.getClass().getSimpleName(), task.modId());
             onGpuFailure(task, throwable);
+            GpuBatchTelemetry.recordDirectGpuFailed();
             if (monitor != null) {
                 monitor.recordFallback();
             }

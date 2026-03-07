@@ -110,7 +110,7 @@ public final class QuantifiedAPI {
 
     public static <T> T getCached(String cacheName, String key, Supplier<T> loader) {
         QuantifiedHandle handle = getHandle();
-        return handle.cacheGet(cacheName, key, loader, null, DEFAULT_CACHE_MAX_SIZE, true);
+        return handle.cacheGet(cacheName, key, loader, null, DEFAULT_CACHE_MAX_SIZE, false);
     }
 
     public static <T> T getCached(String cacheName, String key, Supplier<T> loader, Duration ttl, long maxSize, boolean persistence) {
@@ -120,7 +120,7 @@ public final class QuantifiedAPI {
 
     public static <T> CompletableFuture<T> getCachedAsync(String cacheName, String key, Supplier<T> loader) {
         QuantifiedHandle handle = getHandle();
-        return handle.cacheGetAsync(cacheName, key, loader, null, DEFAULT_CACHE_MAX_SIZE, true);
+        return handle.cacheGetAsync(cacheName, key, loader, null, DEFAULT_CACHE_MAX_SIZE, false);
     }
 
     public static <T> CompletableFuture<T> getCachedAsync(String cacheName, String key, Supplier<T> loader, Duration ttl, long maxSize, boolean persistence) {
@@ -151,7 +151,7 @@ public final class QuantifiedAPI {
             return;
         }
         QuantifiedHandle handle = getHandle();
-        handle.cacheGet(cacheName, key, () -> value, null, DEFAULT_CACHE_MAX_SIZE, true);
+        handle.cacheGet(cacheName, key, () -> value, null, DEFAULT_CACHE_MAX_SIZE, false);
     }
 
     public static <T> void putCached(String cacheName, String key, T value, Duration ttl, long maxSize, boolean persistence) {
