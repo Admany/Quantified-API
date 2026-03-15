@@ -16,7 +16,6 @@ public final class OpenCLRuntime {
     private enum Binding {
         UNKNOWN,
         LWJGL,
-        JOCL,
         NONE
     }
 
@@ -52,23 +51,8 @@ public final class OpenCLRuntime {
                 LAST_ERROR.set(null);
                 LOGGER.info("OpenCL runtime initialised via LWJGL");
                 return true;
-            } else if (b == Binding.JOCL) {
-                LOGGER.fine("Attempting to initialize JOCL runtime (fallback)");
-                try {
-                    invokeJOCLSetup();
-                } catch (Throwable t) {
-                    String message = t.getMessage() != null ? t.getMessage() : t.getClass().getName();
-                    LAST_ERROR.set(message);
-                    LOGGER.warning("OpenCL runtime unavailable (JOCL): " + message);
-                    LOGGER.log(Level.INFO, "Full OpenCL init failure", t);
-                    return false;
-                }
-                INITIALISED.set(true);
-                LAST_ERROR.set(null);
-                LOGGER.info("OpenCL runtime initialised via JOCL");
-                return true;
             } else {
-                LAST_ERROR.set("No Java OpenCL binding found (org.lwjgl.opencl or org.jocl)");
+                LAST_ERROR.set("No Java OpenCL binding found (org.lwjgl.opencl)");
                 LOGGER.warning("OpenCL runtime unavailable: No Java binding found");
                 return false;
             }
@@ -120,11 +104,6 @@ public final class OpenCLRuntime {
             return Binding.LWJGL;
         }
 
-        // JOCL check: pure Java binding (if present).
-        if (isClassPresent("org.jocl.CL")) {
-            return Binding.JOCL;
-        }
-
         return Binding.NONE;
     }
 
@@ -171,17 +150,6 @@ public final class OpenCLRuntime {
         Class<?> cl = Class.forName("org.lwjgl.opencl.CL");
         Method destroy = cl.getMethod("destroy");
         destroy.invoke(null);
-    }
-
-    private static void invokeJOCLSetup() throws Exception {
-        // Attempt to set exceptions enabled for JOCL if available
-        Class<?> cl = Class.forName("org.jocl.CL");
-        try {
-            Method setEx = cl.getMethod("setExceptionsEnabled", boolean.class);
-            setEx.invoke(null, true);
-        } catch (NoSuchMethodException ignore) {
-            // not critical
-        }
     }
 
     public static final class AvailabilitySnapshot {

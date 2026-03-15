@@ -209,7 +209,7 @@ public final class QuantifiedCommand {
             sendInfo(context.getSource(), String.format("│ Context Test: %s │", contextOk ? "✓" : "✗"));
 
             if (reason.toLowerCase().contains("binding") || reason.toLowerCase().contains("no java opencl")) {
-                sendInfo(context.getSource(), "Tip: Include the LWJGL OpenCL binding or JOCL in the mod classpath or run without the sandboxing launcher.");
+                sendInfo(context.getSource(), "Tip: Include the LWJGL OpenCL binding in the mod classpath or run without the sandboxing launcher.");
             }
         } else {
             var status = OpenCLManager.getGPUStatus();
@@ -291,7 +291,7 @@ public final class QuantifiedCommand {
                 String reason = runtime.failureReason() != null ? runtime.failureReason() : "Unknown reason";
                 sendWarn(context.getSource(), "OpenCL acceleration is not available on this system: " + reason);
                 if (reason.toLowerCase().contains("no java opencl binding") || reason.toLowerCase().contains("binding")) {
-                    sendInfo(context.getSource(), "Hint: Ensure the LWJGL OpenCL binding or JOCL is present in the mod classpath, or run without the launcher that sandboxed the JVM.");
+                    sendInfo(context.getSource(), "Hint: Ensure the LWJGL OpenCL binding is present in the mod classpath, or run without the launcher that sandboxed the JVM.");
                 }
             }
         });

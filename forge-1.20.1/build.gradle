@@ -98,8 +98,6 @@ dependencies {
     compileOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
     minecraftLibrary("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
 
-    implementation "org.jocl:jocl:2.0.0"
-
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
     testImplementation 'org.mockito:mockito-core:5.5.0'
     testImplementation 'org.mockito:mockito-junit-jupiter:5.5.0'
@@ -143,7 +141,6 @@ shadowJar {
     archiveClassifier.set("")
     from sourceSets.main.output
     dependencies {
-        include(dependency('org.jocl:jocl'))
         include(dependency('org.lwjgl:lwjgl-opencl'))
         include(dependency('com.github.ben-manes.caffeine:caffeine'))
         include(dependency('org.bouncycastle:bcprov-jdk15on'))
