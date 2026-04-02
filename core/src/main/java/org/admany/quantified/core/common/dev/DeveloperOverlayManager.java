@@ -69,13 +69,15 @@ public final class DeveloperOverlayManager {
     private static final java.nio.file.Path API_LOG_PATH = java.nio.file.Paths.get(System.getProperty("user.dir"), "quantified-api.log");
     private static final long ALERT_COOLDOWN_MS = 7_500L;
     private static final long QUEUE_ALERT_THRESHOLD = 1024;
-    private static final double GPU_ALERT_UTIL = 0.85;
+    private static final double GPU_ALERT_UTIL = 0.92;
+    private static final double GPU_BUSY_UTIL = 0.97;
+    private static final double GPU_WARM_TEMP = 82.0;
     private static final double GPU_ALERT_TEMP = 90.0;
     private static final long MOD_HEADROOM_TARGET = 64L;
 
     private static ScheduledFuture<?> samplingTask;
     private static volatile long lastQueueAlertMs = 0L;
-    private static volatile long lastGpuAlertMs = 0L;
+    private static volatile GpuSafeguardState lastGpuSafeguardState = GpuSafeguardState.CLEAR;
 
     private DeveloperOverlayManager() {
     }
@@ -309,16 +311,20 @@ public final class DeveloperOverlayManager {
                 null
             ));
         }
-        if ((gpuMemoryUtil > GPU_ALERT_UTIL || gpuComputeUtil > GPU_ALERT_UTIL || gpuTemperature > GPU_ALERT_TEMP)
-            && (now - lastGpuAlertMs) > ALERT_COOLDOWN_MS) {
-            lastGpuAlertMs = now;
-            String message = gpuTemperature > GPU_ALERT_TEMP
-                ? "GPU temperature exceeds 90C"
-                : "GPU nearing safety thresholds";
+        GpuSafeguardState safeguardState = classifyGpuSafeguard(gpuMemoryUtil, gpuComputeUtil, gpuTemperature);
+        GpuSafeguardState previousState = lastGpuSafeguardState;
+        if (safeguardState == GpuSafeguardState.CLEAR) {
+            lastGpuSafeguardState = GpuSafeguardState.CLEAR;
+            return;
+        }
+        boolean stateChanged = safeguardState != previousState;
+        boolean escalated = safeguardState.severity() > previousState.severity();
+        if (stateChanged || escalated) {
+            lastGpuSafeguardState = safeguardState;
             recordTimelineEvent(new TimelineEvent(
                 now,
                 TimelineEventType.GPU_SAFEGUARD,
-                message,
+                safeguardState.message(),
                 queueDepth,
                 gpuMemoryUtil,
                 gpuComputeUtil,
@@ -326,6 +332,21 @@ public final class DeveloperOverlayManager {
                 null
             ));
         }
+    }
+
+    private static GpuSafeguardState classifyGpuSafeguard(double gpuMemoryUtil,
+                                                          double gpuComputeUtil,
+                                                          double gpuTemperature) {
+        if (gpuTemperature > GPU_ALERT_TEMP) {
+            return GpuSafeguardState.THERMAL;
+        }
+        if (gpuMemoryUtil > GPU_ALERT_UTIL) {
+            return GpuSafeguardState.VRAM_PRESSURE;
+        }
+        if (gpuComputeUtil > GPU_BUSY_UTIL && gpuTemperature >= GPU_WARM_TEMP) {
+            return GpuSafeguardState.SATURATED;
+        }
+        return GpuSafeguardState.CLEAR;
     }
 
     private static List<TimelineEvent> snapshotTimeline() {
@@ -667,6 +688,29 @@ public final class DeveloperOverlayManager {
         OK,
         INFO,
         WARNING
+    }
+
+    private enum GpuSafeguardState {
+        CLEAR(0, ""),
+        SATURATED(1, "GPU is heavily saturated and warming up"),
+        VRAM_PRESSURE(2, "GPU VRAM pressure is high"),
+        THERMAL(3, "GPU temperature exceeds 90C");
+
+        private final int severity;
+        private final String message;
+
+        GpuSafeguardState(int severity, String message) {
+            this.severity = severity;
+            this.message = message;
+        }
+
+        public int severity() {
+            return severity;
+        }
+
+        public String message() {
+            return message;
+        }
     }
 
     public record AutoTuningHint(HintSeverity severity, String message) {

@@ -5,6 +5,8 @@ import org.admany.quantified.core.common.async.core.AsyncManagerBootstrap;
 import org.admany.quantified.core.common.async.gpu.GpuWorkloadRegistry;
 import org.admany.quantified.core.common.async.task.PriorityTask;
 import org.admany.quantified.core.common.async.task.TaskMetadata;
+import org.admany.quantified.core.common.config.MultithreadingConfig;
+import org.admany.quantified.core.common.gpu.backend.GpuBackendRouter;
 import org.admany.quantified.core.common.opencl.core.OpenCLContext;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.opencl.core.OpenCLTask;
@@ -52,12 +54,24 @@ class TaskSchedulerTest {
 
     @BeforeEach
     void setUp() {
+        if (MultithreadingConfig.CONFIG == null) {
+            MultithreadingConfig.CONFIG = new MultithreadingConfig.Config();
+        }
+        MultithreadingConfig.CONFIG.enableGpuAcceleration = true;
+        MultithreadingConfig.CONFIG.openclForced = false;
+        MultithreadingConfig.CONFIG.preferredGpuBackend = "VULKAN_PREFERRED";
+        GpuBackendRouter.resetForTesting();
         TaskScheduler.resetStats();
         TaskScheduler.setGpuWorkloadForTesting(new TestGpuBatchWorkload());
     }
 
     @AfterEach
     void tearDown() {
+        if (MultithreadingConfig.CONFIG != null) {
+            MultithreadingConfig.CONFIG.openclForced = false;
+            MultithreadingConfig.CONFIG.preferredGpuBackend = "VULKAN_PREFERRED";
+        }
+        GpuBackendRouter.resetForTesting();
         TaskScheduler.resetStats();
         TaskScheduler.setGpuWorkloadForTesting(null);
     }

@@ -1,0 +1,29 @@
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(std430, set = 0, binding = 0) readonly buffer InCoords { float inputCoords[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer OutFeatures { float outputFeatures[]; };
+layout(push_constant) uniform Push { int count; } pushData;
+uint mixBits(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uint(pushData.count)) {
+        return;
+    }
+    uint seed = mixBits(floatBitsToUint(inputCoords[id]) ^ (id * 0x9e3779b9u));
+    uint base = id * 4u;
+    float primary = float(seed & 0x00ffffffu) * (1.0 / 16777215.0);
+    float heightBias = float(int((seed >> 24u) & 0x0fu) - 7) * 0.5;
+    float correction = float((seed >> 20u) & 0x07u);
+    float flags = float((seed >> 16u) & 0x0fu);
+    outputFeatures[base] = primary;
+    outputFeatures[base + 1u] = heightBias;
+    outputFeatures[base + 2u] = correction;
+    outputFeatures[base + 3u] = flags;
+}

@@ -1,6 +1,5 @@
 package org.admany.quantified.core.forge;
 
-
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.server.ServerStartingEvent;
@@ -21,14 +20,18 @@ import org.admany.quantified.core.forge.commands.QuantifiedCommand;
 import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.dev.DeveloperFeatures; 
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
+import org.admany.quantified.core.common.gpu.backend.VulkanProbeScheduler;
+import org.admany.quantified.core.common.gpu.backend.VulkanRuntime;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.opencl.gpu.AsyncProbeScheduler;
+import org.admany.quantified.core.common.vulkan.core.VulkanManager;
 import org.admany.quantified.core.common.dev.StressTestController;
 import org.admany.quantified.core.common.dev.web.DeveloperDashboardServer;
 import org.admany.quantified.core.common.network.NetworkManager;
 import org.admany.quantified.core.common.telemetry.TelemetryService;
 import org.admany.quantified.core.common.threading.core.MainThreadExecutor;
 import org.admany.quantified.core.common.util.QuantifiedConnectionListener;
+import org.admany.quantified.core.common.util.LwjglRuntimeTuning;
 import org.admany.quantified.core.common.util.QuantifiedPaths;
 import org.admany.quantified.api.QuantifiedAPI;
 import java.time.Duration;
@@ -47,10 +50,15 @@ public final class QuantifiedCoreForge {
     public static final String MODID = "quantified";
     private static final Logger LOGGER = LoggerFactory.getLogger(QuantifiedCoreForge.class);
 
+    static {
+        LwjglRuntimeTuning.ensureConfigured();
+    }
+
     private static ScheduledExecutorService coalescer;
     private static NetworkManager networkManager;
     private static final ConcurrentHashMap<String, ModInfo> registeredMods = new ConcurrentHashMap<>();
     private static volatile boolean gpuNameUpdated = false;
+    private static volatile boolean clientWorldProbeTriggered = false;
     private static final AtomicBoolean CORE_BOOTSTRAPPED = new AtomicBoolean(false);
 
     public static class ModInfo {
@@ -104,6 +112,10 @@ public final class QuantifiedCoreForge {
             }
         });
 
+        int lwjglStackSizeBytes = LwjglRuntimeTuning.ensureConfigured();
+        LOGGER.info("Configured LWJGL stack size to {} MiB ({} bytes)",
+            lwjglStackSizeBytes / (1024 * 1024), lwjglStackSizeBytes);
+
         String startupMsg1 = "[Quantified] Quantified API starting";
         LOGGER.info(startupMsg1);
         DeveloperOverlayManager.recordApiLog(startupMsg1);
@@ -143,7 +155,7 @@ public final class QuantifiedCoreForge {
 
         TelemetryService.start();
 
-        String startupMsg4 = "[Quantified] Quantified OpenCL Acceleration Starting";
+        String startupMsg4 = "[Quantified] Quantified GPU Acceleration Starting";
         LOGGER.debug(startupMsg4);
         DeveloperOverlayManager.recordApiLog(startupMsg4);
         try {
@@ -153,6 +165,20 @@ public final class QuantifiedCoreForge {
         } catch (Exception e) {
             LOGGER.info("OpenCL acceleration not available: " + e.getMessage());
             DeveloperOverlayManager.recordApiLog("[Quantified] OpenCL not available: " + e.getMessage());
+        }
+        if (VulkanRuntime.hasBindings()) {
+            try {
+                VulkanProbeScheduler.scheduleBackgroundProbe();
+                LOGGER.info("Vulkan initialization deferred to background probe.");
+                DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan probe deferred (background)");
+                DeveloperOverlayManager.recordApiLog("[Vulkan] Probe scheduler armed");
+            } catch (Throwable e) {
+                LOGGER.info("Vulkan acceleration not available: " + e.getMessage());
+                DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan not available: " + e.getMessage());
+            }
+        } else {
+            LOGGER.info("Vulkan acceleration not available: LWJGL Vulkan classes are missing from the runtime");
+            DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan not available: LWJGL Vulkan classes missing");
         }
 
         if (MultithreadingConfig.CONFIG.enableNetworking) {
@@ -187,6 +213,7 @@ public final class QuantifiedCoreForge {
 
     private void clientSetup(final FMLClientSetupEvent event) {
         AsyncProbeScheduler.triggerProbe("client-setup");
+        VulkanProbeScheduler.triggerProbe("client-setup");
         MinecraftForge.EVENT_BUS.addListener((TickEvent e) -> {
             if (e.type == TickEvent.Type.RENDER && e.phase == TickEvent.Phase.START && !gpuNameUpdated) {
                 try {
@@ -198,12 +225,30 @@ public final class QuantifiedCoreForge {
 
                         AsyncProbeScheduler.triggerProbe("opengl-ready:" + renderer);
                         DeveloperOverlayManager.recordApiLog("[OpenCL] OpenCL probe triggered (OpenGL context ready)");
+                        VulkanProbeScheduler.triggerRendererProbe(renderer);
+                        DeveloperOverlayManager.recordApiLog("[Vulkan] Vulkan probe triggered (OpenGL context ready)");
 
                         gpuNameUpdated = true;
                     }
                 } catch (Exception ex) {
                     LOGGER.warn("Failed to get GPU name from OpenGL: " + ex.getMessage());
                     DeveloperOverlayManager.recordApiLog("GPU detection failed: " + ex.getMessage());
+                }
+            }
+            if (e.type == TickEvent.Type.RENDER && e.phase == TickEvent.Phase.START && !clientWorldProbeTriggered) {
+                try {
+                    Class<?> minecraftClass = Class.forName("net.minecraft.client.Minecraft");
+                    Object minecraft = minecraftClass.getMethod("getInstance").invoke(null);
+                    Object level = minecraft != null ? minecraftClass.getField("level").get(minecraft) : null;
+                    if (level != null) {
+                        Object dimension = level.getClass().getMethod("dimension").invoke(level);
+                        Object location = dimension.getClass().getMethod("location").invoke(dimension);
+                        String worldId = String.valueOf(location);
+                        VulkanProbeScheduler.triggerWorldProbe(worldId);
+                        DeveloperOverlayManager.recordApiLog("[Vulkan] Vulkan probe triggered (client world ready: " + worldId + ")");
+                        clientWorldProbeTriggered = true;
+                    }
+                } catch (Throwable ignored) {
                 }
             }
         });
@@ -213,6 +258,7 @@ public final class QuantifiedCoreForge {
     public void onServerStarting(ServerStartingEvent event) {
         MainThreadExecutor.install(event.getServer());
         AsyncProbeScheduler.triggerProbe("server-start");
+        VulkanProbeScheduler.triggerProbe("server-start");
     }
 
     @SubscribeEvent
@@ -225,6 +271,10 @@ public final class QuantifiedCoreForge {
     public void onServerStopping(net.minecraftforge.event.server.ServerStoppingEvent event) {
         MainThreadExecutor.clear();
         OpenCLManager.shutdown();
+        if (VulkanRuntime.hasBindings()) {
+            VulkanManager.shutdown();
+        }
+        VulkanProbeScheduler.reset();
         StressTestController.shutdown();
         DeveloperDashboardServer.stop();
         DiskCacheManager.shutdown();
@@ -353,15 +403,15 @@ public final class QuantifiedCoreForge {
 
             // Force load OpenCL core classes (if available)
             try {
-                Class.forName("org.admany.quantified.core.common.opencl.OpenCLManager");
-                Class.forName("org.admany.quantified.core.common.opencl.OpenCLTask");
-                Class.forName("org.admany.quantified.core.common.opencl.OpenCLContext");
-                Class.forName("org.admany.quantified.core.common.opencl.AsyncProbeScheduler");
-                Class.forName("org.admany.quantified.core.common.opencl.GPUDetector");
-                Class.forName("org.admany.quantified.core.common.opencl.GPUMonitor");
-                Class.forName("org.admany.quantified.core.common.opencl.HardwareDetector");
-                Class.forName("org.admany.quantified.core.common.opencl.OpenCLRuntime");
-                Class.forName("org.admany.quantified.core.common.opencl.NativeLibraryExtractor");
+                Class.forName("org.admany.quantified.core.common.opencl.core.OpenCLManager");
+                Class.forName("org.admany.quantified.core.common.opencl.core.OpenCLTask");
+                Class.forName("org.admany.quantified.core.common.opencl.core.OpenCLContext");
+                Class.forName("org.admany.quantified.core.common.opencl.gpu.AsyncProbeScheduler");
+                Class.forName("org.admany.quantified.core.common.opencl.gpu.GPUDetector");
+                Class.forName("org.admany.quantified.core.common.opencl.gpu.GPUMonitor");
+                Class.forName("org.admany.quantified.core.common.opencl.gpu.HardwareDetector");
+                Class.forName("org.admany.quantified.core.common.opencl.core.OpenCLRuntime");
+                Class.forName("org.admany.quantified.core.common.opencl.util.NativeLibraryExtractor");
 
                 Class.forName("org.admany.quantified.core.common.util.TaskScheduler");
                 Class.forName("org.admany.quantified.core.common.util.TaskScheduler$ResourceHint");
@@ -372,7 +422,25 @@ public final class QuantifiedCoreForge {
                 DeveloperOverlayManager.recordApiLog("[Quantified] OpenCL core classes loaded");
             } catch (ClassNotFoundException e) {
                 LOGGER.info("OpenCL core classes not available (expected if core JAR not present): " + e.getMessage());
-                DeveloperOverlayManager.recordApiLog("[Quantified] OpenCL core not available - CPU fallback mode");
+                DeveloperOverlayManager.recordApiLog("[Quantified] OpenCL core classes missing - OpenCL backend unavailable");
+            }
+
+            if (VulkanRuntime.hasBindings()) {
+                try {
+                    Class.forName("org.admany.quantified.api.vulkan.QuantifiedVulkan");
+                    Class.forName("org.admany.quantified.core.common.gpu.backend.VulkanRuntime");
+                    Class.forName("org.admany.quantified.core.common.gpu.backend.VulkanProbeScheduler");
+                    Class.forName("org.admany.quantified.core.common.vulkan.core.VulkanManager");
+                    Class.forName("org.admany.quantified.core.common.vulkan.core.VulkanContext");
+                    LOGGER.debug("Vulkan core classes loaded successfully.");
+                    DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan core classes loaded");
+                } catch (Throwable e) {
+                    LOGGER.info("Vulkan core classes not available: " + e.getMessage());
+                    DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan core classes missing - Vulkan backend unavailable");
+                }
+            } else {
+                LOGGER.info("Vulkan core classes not available: LWJGL Vulkan classes are missing from the runtime");
+                DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan core classes missing - Vulkan backend unavailable");
             }
 
             LOGGER.info("All Quantified API classes successfully initialized.");

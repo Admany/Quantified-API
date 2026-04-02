@@ -23,6 +23,8 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Objects;
 import org.admany.quantified.api.QuantifiedAPI;
+import org.admany.quantified.api.compute.GpuBackendPreference;
+import org.admany.quantified.api.compute.GpuBackendType;
 import org.admany.quantified.api.interfaces.ConnectedMod;
 import org.admany.quantified.api.interfaces.ModStatistics;
 import org.admany.quantified.core.common.cache.CacheManager;
@@ -34,13 +36,18 @@ import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.dev.DeveloperFeatures;
 import org.admany.quantified.core.common.dev.StressTestController;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
+import org.admany.quantified.core.common.gpu.backend.GpuBackendRouter;
+import org.admany.quantified.core.common.gpu.backend.VulkanProbeScheduler;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
+import org.admany.quantified.core.common.opencl.gpu.AsyncProbeScheduler;
 import org.admany.quantified.core.common.opencl.gpu.GPUDetector;
 import org.admany.quantified.core.common.opencl.gpu.GPUMonitor;
 import org.admany.quantified.core.common.opencl.gpu.probe.GpuTelemetryService;
 import org.admany.quantified.core.common.opencl.task.OpenCLTaskManager;
 import org.admany.quantified.core.common.telemetry.TaskKindTelemetry;
 import org.admany.quantified.core.common.util.TaskScheduler;
+import org.admany.quantified.core.common.gpu.backend.VulkanRuntime;
+import org.admany.quantified.core.common.vulkan.core.VulkanManager;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.File;
@@ -817,6 +824,8 @@ public final class DeveloperDashboardServer {
             return placeholder;
         }
         JsonArray openclDeviceOptions = buildOpenClDeviceOptions();
+        JsonArray vulkanDeviceOptions = buildVulkanDeviceOptions();
+        JsonArray gpuBackendOptions = buildGpuBackendOptions();
         Map<String, Object> values = new LinkedHashMap<>();
         for (java.lang.reflect.Field field : MultithreadingConfig.Config.class.getFields()) {
             try {
@@ -837,9 +846,19 @@ public final class DeveloperDashboardServer {
                 field.addProperty("type", describeConfigType(value));
                 field.addProperty("comment", layout.comments().getOrDefault(key, ""));
                 field.add("value", GSON.toJsonTree(value));
-                if ("openclDeviceId".equals(key)) {
-                    field.addProperty("type", "select");
-                    field.add("options", openclDeviceOptions);
+                switch (key) {
+                    case "preferredGpuBackend" -> {
+                        field.addProperty("type", "select");
+                        field.add("options", gpuBackendOptions);
+                    }
+                    case "vulkanDeviceId" -> {
+                        field.addProperty("type", "select");
+                        field.add("options", vulkanDeviceOptions);
+                    }
+                    case "openclDeviceId" -> {
+                        field.addProperty("type", "select");
+                        field.add("options", openclDeviceOptions);
+                    }
                 }
                 fields.add(field);
             }
@@ -884,10 +903,58 @@ public final class DeveloperDashboardServer {
         return options;
     }
 
+    private static JsonArray buildVulkanDeviceOptions() {
+        JsonArray options = new JsonArray();
+        JsonObject auto = new JsonObject();
+        auto.addProperty("value", "auto");
+        auto.addProperty("label", VulkanRuntime.hasBindings() ? "Auto (best Vulkan device)" : "Unavailable (Vulkan runtime missing)");
+        options.add(auto);
+        if (!VulkanRuntime.hasBindings()) {
+            return options;
+        }
+        for (VulkanManager.VulkanDeviceInfo device : VulkanManager.listDevices()) {
+            JsonObject option = new JsonObject();
+            option.addProperty("value", device.id());
+            option.addProperty("label", formatVulkanDeviceLabel(device));
+            options.add(option);
+        }
+        return options;
+    }
+
+    private static JsonArray buildGpuBackendOptions() {
+        JsonArray options = new JsonArray();
+        options.add(selectOption(GpuBackendPreference.VULKAN_PREFERRED.name(), "Auto (Vulkan first)"));
+        options.add(selectOption(GpuBackendPreference.OPENCL_PREFERRED.name(), "OpenCL preferred"));
+        options.add(selectOption(GpuBackendPreference.VULKAN_REQUIRED.name(), "Vulkan only"));
+        options.add(selectOption(GpuBackendPreference.OPENCL_REQUIRED.name(), "OpenCL only"));
+        options.add(selectOption(GpuBackendPreference.CPU_ONLY.name(), "CPU only"));
+        return options;
+    }
+
     private static String formatOpenClDeviceLabel(GPUDetector.OpenCLDeviceInfo device) {
         String type = device.type() != null ? device.type().name().toLowerCase(Locale.ROOT) : "gpu";
         String vram = device.vramBytes() > 0 ? formatBytes(device.vramBytes()) : "unknown VRAM";
         return device.name() + " (" + device.vendor() + " / " + type + " / " + vram + " / CU " + device.computeUnits() + ")";
+    }
+
+    private static String formatVulkanDeviceLabel(VulkanManager.VulkanDeviceInfo device) {
+        String type = switch (device.deviceType()) {
+            case 2 -> "discrete gpu";
+            case 1 -> "integrated gpu";
+            case 3 -> "virtual gpu";
+            case 4 -> "cpu";
+            default -> "gpu";
+        };
+        String vram = device.localMemoryBytes() > 0 ? formatBytes(device.localMemoryBytes()) : "unknown VRAM";
+        String suffix = device.softwareAdapter() ? " / software" : "";
+        return device.name() + " (" + device.vendor() + " / " + type + " / " + vram + suffix + ")";
+    }
+
+    private static JsonObject selectOption(String value, String label) {
+        JsonObject option = new JsonObject();
+        option.addProperty("value", value);
+        option.addProperty("label", label);
+        return option;
     }
 
     private static void applyConfigUpdates(JsonObject request) {
@@ -910,27 +977,61 @@ public final class DeveloperDashboardServer {
         }
         try {
             synchronized (MultithreadingConfig.class) {
+                String previousVulkanDeviceId = MultithreadingConfig.CONFIG != null ? MultithreadingConfig.CONFIG.vulkanDeviceId : null;
                 String previousOpenclDeviceId = MultithreadingConfig.CONFIG != null ? MultithreadingConfig.CONFIG.openclDeviceId : null;
+                String previousGpuPreference = MultithreadingConfig.CONFIG != null ? MultithreadingConfig.CONFIG.preferredGpuBackend : null;
+                String updatedVulkanDeviceId = previousVulkanDeviceId;
                 String updatedOpenclDeviceId = previousOpenclDeviceId;
+                String updatedGpuPreference = previousGpuPreference;
+                boolean vulkanDeviceChanged = false;
                 boolean openclDeviceChanged = false;
+                boolean gpuPreferenceChanged = false;
+                boolean gpuAccelerationChanged = false;
                 for (Map.Entry<String, JsonElement> entry : updates.entrySet()) {
                     String key = entry.getKey();
                     java.lang.reflect.Field field = MultithreadingConfig.Config.class.getField(key);
                     Object coerced = coerceConfigValue(field.getType(), entry.getValue());
                     field.set(MultithreadingConfig.CONFIG, coerced);
+                    if ("vulkanDeviceId".equals(key)) {
+                        updatedVulkanDeviceId = coerced != null ? coerced.toString() : null;
+                        vulkanDeviceChanged = !Objects.equals(previousVulkanDeviceId, updatedVulkanDeviceId);
+                    }
                     if ("openclDeviceId".equals(key)) {
                         updatedOpenclDeviceId = coerced != null ? coerced.toString() : null;
                         openclDeviceChanged = !Objects.equals(previousOpenclDeviceId, updatedOpenclDeviceId);
                     }
+                    if ("preferredGpuBackend".equals(key)) {
+                        updatedGpuPreference = coerced != null ? coerced.toString() : null;
+                        gpuPreferenceChanged = !Objects.equals(previousGpuPreference, updatedGpuPreference);
+                    }
+                    if ("enableGpuAcceleration".equals(key)) {
+                        gpuAccelerationChanged = true;
+                    }
                 }
                 MultithreadingConfig.writePrettyJsonConfig(MultithreadingConfig.CONFIG);
+                if (vulkanDeviceChanged && VulkanRuntime.hasBindings()) {
+                    VulkanManager.setPreferredDevice(normalizeAutoDeviceValue(updatedVulkanDeviceId));
+                }
                 if (openclDeviceChanged) {
                     OpenCLManager.switchDevice(updatedOpenclDeviceId);
+                }
+                if ((gpuAccelerationChanged || gpuPreferenceChanged || vulkanDeviceChanged) && VulkanRuntime.hasBindings()) {
+                    VulkanProbeScheduler.triggerProbe("dashboard-config");
+                }
+                if (gpuAccelerationChanged || gpuPreferenceChanged || openclDeviceChanged) {
+                    AsyncProbeScheduler.triggerProbe("dashboard-config");
                 }
             }
         } catch (ReflectiveOperationException ex) {
             throw new IllegalArgumentException("Invalid config key provided", ex);
         }
+    }
+
+    private static String normalizeAutoDeviceValue(String deviceId) {
+        if (deviceId == null || deviceId.isBlank()) {
+            return null;
+        }
+        return "auto".equalsIgnoreCase(deviceId.trim()) ? null : deviceId;
     }
 
     private static Object coerceConfigValue(Class<?> type, JsonElement value) {
@@ -1100,6 +1201,7 @@ public final class DeveloperDashboardServer {
 
     private static JsonObject buildStatePayload(DeveloperOverlayManager.DeveloperDiagnosticsView diagnostics) {
         JsonObject payload = new JsonObject();
+        payload.addProperty("enableGpuAcceleration", MultithreadingConfig.CONFIG != null && MultithreadingConfig.CONFIG.enableGpuAcceleration);
         payload.addProperty("developerMode", DeveloperFeatures.isDeveloperModeEnabled());
         payload.addProperty("dashboardEnabled", DeveloperFeatures.isDashboardEnabled());
         payload.addProperty("timelineEnabled", DeveloperFeatures.isTimelineEnabled());
@@ -1108,12 +1210,31 @@ public final class DeveloperDashboardServer {
         payload.addProperty("stressTestEnabled", DeveloperFeatures.isStressTestEnabled());
         payload.addProperty("modSpotlightEnabled", DeveloperFeatures.isModSpotlightEnabled());
         OpenCLManager.RuntimeStatus openclStatus = OpenCLManager.runtimeStatus();
+        boolean vulkanBindingsPresent = VulkanRuntime.hasBindings();
+        boolean vulkanProbeAvailable = vulkanBindingsPresent && VulkanRuntime.isAvailable();
+        boolean vulkanInitialized = vulkanBindingsPresent && VulkanManager.runtimeStatus().isAvailable();
+        String vulkanFailureReason = vulkanBindingsPresent
+            ? VulkanManager.runtimeStatus().failureReason()
+            : "LWJGL Vulkan classes are not present in this runtime";
         payload.addProperty("openclAvailable", openclStatus.isAvailable());
         if (openclStatus.failureReason() != null) {
             payload.addProperty("openclFailureReason", openclStatus.failureReason());
         }
+        payload.addProperty("vulkanAvailable", vulkanProbeAvailable);
+        payload.addProperty("vulkanInitialized", vulkanInitialized);
+        if (!vulkanProbeAvailable) {
+            payload.addProperty("vulkanFailureReason", vulkanFailureReason);
+        } else if (vulkanFailureReason != null) {
+            payload.addProperty("vulkanFailureReason", "Probe succeeded; runtime initialization deferred until first use");
+        }
         GPUMonitor.GPUStatus gpuStatus = OpenCLManager.getGPUStatus();
         payload.addProperty("openclDeviceName", gpuStatus != null ? gpuStatus.deviceName() : "");
+        payload.addProperty("vulkanDeviceName", vulkanProbeAvailable ? VulkanManager.deviceName() : "");
+        GpuBackendPreference configuredPreference = GpuBackendRouter.getDefaultPreference();
+        payload.addProperty("configuredGpuBackendPreference", configuredPreference.name());
+        GpuBackendType activeBackend = resolveDashboardGpuBackend(configuredPreference);
+        payload.addProperty("activeGpuBackend", activeBackend.name());
+        payload.addProperty("activeGpuDeviceName", resolveDashboardGpuDeviceName(activeBackend, gpuStatus));
         StressTestController.StressTestProfile profile = DeveloperFeatures.getStressTestProfile();
         if (profile != null) {
             payload.addProperty("stressTestProfile", profile.configKey());
@@ -1186,12 +1307,13 @@ public final class DeveloperDashboardServer {
         payload.addProperty("port", boundPort >= 0 ? boundPort : MultithreadingConfig.CONFIG.developerDashboardPort);
         payload.addProperty("timelineSize", diagnostics.timeline().size());
         payload.addProperty("replayFrameCount", diagnostics.replayFrames().size());
-        String playerName = resolveDashboardPlayerName();
-        if (!playerName.isEmpty()) {
-            payload.addProperty("playerName", playerName);
+        String displayName = resolveDashboardDisplayName();
+        if (!displayName.isEmpty()) {
+            payload.addProperty("playerName", displayName);
+            payload.addProperty("username", displayName);
         }
 
-    payload.addProperty("openclForced", MultithreadingConfig.CONFIG.openclForced);
+        payload.addProperty("openclForced", MultithreadingConfig.CONFIG.openclForced);
 
         TaskScheduler.SchedulingStats schedulerStats = TaskScheduler.getStats();
         payload.addProperty("schedulerTotalTasks", schedulerStats.totalTasks());
@@ -1233,7 +1355,50 @@ public final class DeveloperDashboardServer {
         return payload;
     }
 
+    private static GpuBackendType resolveDashboardGpuBackend(GpuBackendPreference configuredPreference) {
+        if (MultithreadingConfig.CONFIG == null || !MultithreadingConfig.CONFIG.enableGpuAcceleration) {
+            return GpuBackendType.CPU;
+        }
+        return GpuBackendRouter.selectBackend("dashboard", configuredPreference, true, true).backendType();
+    }
+
+    private static String resolveDashboardGpuDeviceName(GpuBackendType backendType, GPUMonitor.GPUStatus gpuStatus) {
+        return switch (backendType) {
+            case VULKAN -> VulkanRuntime.hasBindings() ? VulkanManager.deviceName() : "";
+            case OPENCL -> gpuStatus != null ? gpuStatus.deviceName() : "";
+            case CPU -> "";
+        };
+    }
+
+    private static String resolveDashboardDisplayName() {
+        String playerName = resolveDashboardPlayerName();
+        if (!playerName.isEmpty()) {
+            return playerName;
+        }
+        if (MultithreadingConfig.CONFIG != null) {
+            String configuredName = safeTrim(MultithreadingConfig.CONFIG.developerDashboardUsername);
+            if (!configuredName.isEmpty()) {
+                return configuredName;
+            }
+        }
+        return "";
+    }
+
     private static String resolveDashboardPlayerName() {
+        String serverPlayerName = resolveServerPlayerName();
+        if (!serverPlayerName.isEmpty()) {
+            return serverPlayerName;
+        }
+
+        String clientPlayerName = resolveClientPlayerName();
+        if (!clientPlayerName.isEmpty()) {
+            return clientPlayerName;
+        }
+
+        return "";
+    }
+
+    private static String resolveServerPlayerName() {
         try {
             Class<?> hooksClass = Class.forName("net.minecraftforge.server.ServerLifecycleHooks");
             Object server = hooksClass.getMethod("getCurrentServer").invoke(null);
@@ -1250,15 +1415,28 @@ public final class DeveloperDashboardServer {
                         }
                     }
                 }
+                String ownerName = extractServerOwnerName(server);
+                if (!ownerName.isEmpty()) {
+                    return ownerName;
+                }
             }
         } catch (Throwable ignored) {
         }
 
+        return "";
+    }
+
+    private static String resolveClientPlayerName() {
         try {
             Class<?> minecraftClass = Class.forName("net.minecraft.client.Minecraft");
             Object minecraft = minecraftClass.getMethod("getInstance").invoke(null);
             if (minecraft != null) {
-                Object player = minecraftClass.getField("player").get(minecraft);
+                String sessionName = extractMinecraftSessionName(minecraft);
+                if (!sessionName.isEmpty()) {
+                    return sessionName;
+                }
+
+                Object player = extractMinecraftPlayer(minecraftClass, minecraft);
                 String name = extractPlayerName(player);
                 if (!name.isEmpty()) {
                     return name;
@@ -1268,6 +1446,76 @@ public final class DeveloperDashboardServer {
         }
 
         return "";
+    }
+
+    private static String extractServerOwnerName(Object server) {
+        if (server == null) {
+            return "";
+        }
+        try {
+            Object profile = server.getClass().getMethod("getSingleplayerProfile").invoke(server);
+            if (profile != null) {
+                Object nameObj = profile.getClass().getMethod("getName").invoke(profile);
+                String name = safeTrim(nameObj == null ? "" : String.valueOf(nameObj));
+                if (!name.isEmpty()) {
+                    return name;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Object nameObj = server.getClass().getMethod("getSingleplayerName").invoke(server);
+            String name = safeTrim(nameObj == null ? "" : String.valueOf(nameObj));
+            if (!name.isEmpty()) {
+                return name;
+            }
+        } catch (Throwable ignored) {
+        }
+        return "";
+    }
+
+    private static String extractMinecraftSessionName(Object minecraft) {
+        if (minecraft == null) {
+            return "";
+        }
+        try {
+            Object user = minecraft.getClass().getMethod("getUser").invoke(minecraft);
+            if (user != null) {
+                Object nameObj = user.getClass().getMethod("getName").invoke(user);
+                String name = safeTrim(nameObj == null ? "" : String.valueOf(nameObj));
+                if (!name.isEmpty()) {
+                    return name;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return "";
+    }
+
+    private static Object extractMinecraftPlayer(Class<?> minecraftClass, Object minecraft) {
+        if (minecraft == null) {
+            return null;
+        }
+        try {
+            return minecraftClass.getField("player").get(minecraft);
+        } catch (Throwable ignored) {
+        }
+        try {
+            java.lang.reflect.Field[] fields = minecraftClass.getFields();
+            for (java.lang.reflect.Field field : fields) {
+                Class<?> type = field.getType();
+                if (type == null) {
+                    continue;
+                }
+                String typeName = type.getName();
+                if (typeName.equals("net.minecraft.client.player.LocalPlayer")
+                    || typeName.endsWith(".LocalPlayer")) {
+                    return field.get(minecraft);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     private static String extractPlayerName(Object player) {
@@ -1535,7 +1783,8 @@ public final class DeveloperDashboardServer {
             return cached;
         }
         boolean isWindows = normalizeOsFamily(system).contains("windows");
-        if (isWindows && Boolean.TRUE.equals(CPU_TEMP_UNAVAILABLE.get())) {
+        if (isWindows) {
+            CPU_TEMP_UNAVAILABLE.set(true);
             return cached;
         }
         try {
@@ -1546,15 +1795,9 @@ public final class DeveloperDashboardServer {
             double value = sensors.getCpuTemperature();
             if (!Double.isNaN(value) && value > 0.0d) {
                 LAST_CPU_SENSOR_VALUE.set(value);
-                if (isWindows) {
-                    CPU_TEMP_UNAVAILABLE.set(false);
-                }
                 return value;
             }
         } catch (Throwable ignored) {
-        }
-        if (isWindows) {
-            CPU_TEMP_UNAVAILABLE.set(true);
         }
         return cached;
     }

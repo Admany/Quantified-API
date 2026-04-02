@@ -340,28 +340,17 @@ public final class OpenCLContext implements AutoCloseable {
                 "\n" +
                 "__kernel void terrain_generation(__global const float* input_coords, __global float* output_features) {\n" +
                 "    int id = get_global_id(0);\n" +
-                "    float coord = input_coords[id];\n" +
-                "    \n" +
-                "    // Generate terrain features using noise-like functions\n" +
-                "    // Height: base terrain height with some variation\n" +
-                "    float height = 64.0f + 20.0f * sin(coord * 0.001f) + 10.0f * cos(coord * 0.002f);\n" +
-                "    \n" +
-                "    // Excavation: probability of underground structures\n" +
-                "    float excavation = fabs(sin(coord * 0.003f + cos(coord * 0.004f))) * 0.8f;\n" +
-                "    \n" +
-                "    // Ruin type: categorical value 0-3\n" +
-                "    float ruin_noise = sin(coord * 0.005f) * cos(coord * 0.006f);\n" +
-                "    int ruin_type = (int)((ruin_noise + 1.0f) * 2.0f) % 4;\n" +
-                "    \n" +
-                "    // Palette index: material variation\n" +
-                "    float palette_noise = sin(coord * 0.007f + cos(coord * 0.008f));\n" +
-                "    int palette_index = (int)((palette_noise + 1.0f) * 8.0f) % 16;\n" +
-                "    \n" +
-                "    // Output 4 features per work item\n" +
-                "    output_features[id * 4] = height;\n" +
-                "    output_features[id * 4 + 1] = excavation;\n" +
-                "    output_features[id * 4 + 2] = (float)ruin_type;\n" +
-                "    output_features[id * 4 + 3] = (float)palette_index;\n" +
+                "    uint seed = as_uint(input_coords[id]) ^ ((uint)id * 0x9e3779b9u);\n" +
+                "    seed ^= seed >> 16;\n" +
+                "    seed *= 0x7feb352du;\n" +
+                "    seed ^= seed >> 15;\n" +
+                "    seed *= 0x846ca68bu;\n" +
+                "    seed ^= seed >> 16;\n" +
+                "    int base = id * 4;\n" +
+                "    output_features[base] = (float)(seed & 0x00ffffffu) / 16777215.0f;\n" +
+                "    output_features[base + 1] = ((float)(((seed >> 24) & 0x0fu)) - 7.0f) * 0.5f;\n" +
+                "    output_features[base + 2] = (float)((seed >> 20) & 0x07u);\n" +
+                "    output_features[base + 3] = (float)((seed >> 16) & 0x0fu);\n" +
                 "}\n" +
                 "\n" +
                 "__kernel void quant_histogram_int(__global const int* samples,\n" +

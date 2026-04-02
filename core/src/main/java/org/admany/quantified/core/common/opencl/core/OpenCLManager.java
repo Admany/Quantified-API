@@ -10,6 +10,7 @@ import org.admany.quantified.core.common.opencl.gpu.GPUMonitor;
 import org.admany.quantified.core.common.opencl.gpu.HardwareDetector;
 import org.admany.quantified.core.common.opencl.task.OpenCLTaskManager;
 import org.admany.quantified.core.common.opencl.task.OpenCLTestTask;
+import org.admany.quantified.core.common.util.LwjglRuntimeTuning;
 import org.admany.quantified.core.common.opencl.util.CLDataUtil;
 import org.admany.quantified.core.common.opencl.util.NativeLibraryExtractor;
 import org.lwjgl.opencl.CL10;
@@ -36,9 +37,8 @@ public final class OpenCLManager {
     private static final AtomicBoolean availabilityAnnounced = new AtomicBoolean(false);
 
     private static final ExecutorService probeExecutor = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "Quantified-OpenCL-Probe");
-        t.setDaemon(true);
-        return t;
+        return LwjglRuntimeTuning.newDaemonThread(r, "Quantified-OpenCL-Probe",
+            LwjglRuntimeTuning.gpuThreadStackSizeKb());
     });
     private static final Object probeMutex = new Object();
     private static final java.util.concurrent.atomic.AtomicReference<String> forcedDeviceId =

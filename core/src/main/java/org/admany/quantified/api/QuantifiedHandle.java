@@ -1,5 +1,6 @@
 package org.admany.quantified.api;
 
+import org.admany.quantified.api.graph.QuantifiedTaskGraph;
 import org.admany.quantified.core.common.async.core.AsyncManager;
 import org.admany.quantified.core.common.async.core.PriorityScheduler;
 import org.admany.quantified.core.common.async.task.PriorityTaskType;
@@ -186,6 +187,14 @@ public final class QuantifiedHandle {
                 }
             }
         });
+    }
+
+    <T> CompletableFuture<T> submitGraph(QuantifiedTaskGraph.Builder builder, QuantifiedTaskGraph.NodeHandle<T> terminal) {
+        return TaskGraphExecutor.submit(this, builder, terminal);
+    }
+
+    CompletableFuture<Map<String, Object>> submitGraphAll(QuantifiedTaskGraph.Builder builder) {
+        return TaskGraphExecutor.submitAll(this, builder);
     }
 
     <T> T cacheGet(String cacheName, String key, Supplier<T> loader, Duration ttl, long maximumSize, boolean persistence) {

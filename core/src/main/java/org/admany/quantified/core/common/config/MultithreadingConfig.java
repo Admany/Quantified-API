@@ -2,6 +2,7 @@ package org.admany.quantified.core.common.config;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import org.admany.quantified.api.compute.GpuBackendPreference;
 import org.admany.quantified.core.common.util.QuantifiedPaths;
 import org.slf4j.Logger;
 
@@ -57,8 +58,10 @@ public class MultithreadingConfig {
 
         // === GPU/OpenCL Configuration ===
         public boolean enableGpuAcceleration = true; // Enable GPU acceleration when available
+        public String preferredGpuBackend = GpuBackendPreference.VULKAN_PREFERRED.name(); // Preferred compute backend routing policy
         public boolean openclForced = false; // Force OpenCL usage even for small tasks
         public boolean gpuDebugLogging = false; // Enable detailed GPU operation logging
+        public String vulkanDeviceId = "auto"; // Vulkan device selection ("auto" picks the best Vulkan-capable GPU)
         public String openclDeviceId = "auto"; // OpenCL device selection ("auto" picks the fastest detected GPU)
 
         // Task Processing Configuration
@@ -488,8 +491,10 @@ public class MultithreadingConfig {
             config.networkTimeoutMs = extractBoxedInt(jsonData, "networkTimeoutMs", config.networkTimeoutMs);
 
             config.enableGpuAcceleration = extractBoxedBoolean(jsonData, "enableGpuAcceleration", config.enableGpuAcceleration);
+            config.preferredGpuBackend = extractBoxedString(jsonData, "preferredGpuBackend", config.preferredGpuBackend);
             config.openclForced = extractBoxedBoolean(jsonData, "openclForced", config.openclForced);
             config.gpuDebugLogging = extractBoxedBoolean(jsonData, "gpuDebugLogging", config.gpuDebugLogging);
+            config.vulkanDeviceId = extractBoxedString(jsonData, "vulkanDeviceId", config.vulkanDeviceId);
             config.openclDeviceId = extractBoxedString(jsonData, "openclDeviceId", config.openclDeviceId);
 
             config.taskQueueSize = extractBoxedInt(jsonData, "taskQueueSize", config.taskQueueSize);
@@ -567,8 +572,10 @@ public class MultithreadingConfig {
             if (jsonData.has("gpu") && jsonData.get("gpu").isJsonObject()) {
                 com.google.gson.JsonObject gpu = jsonData.get("gpu").getAsJsonObject();
                 config.enableGpuAcceleration = extractBoxedBoolean(gpu, "enableGpuAcceleration", config.enableGpuAcceleration);
+                config.preferredGpuBackend = extractBoxedString(gpu, "preferredGpuBackend", config.preferredGpuBackend);
                 config.openclForced = extractBoxedBoolean(gpu, "openclForced", config.openclForced);
                 config.gpuDebugLogging = extractBoxedBoolean(gpu, "gpuDebugLogging", config.gpuDebugLogging);
+                config.vulkanDeviceId = extractBoxedString(gpu, "vulkanDeviceId", config.vulkanDeviceId);
                 config.openclDeviceId = extractBoxedString(gpu, "openclDeviceId", config.openclDeviceId);
             }
 
@@ -744,8 +751,10 @@ public class MultithreadingConfig {
         describeField(comments, labels, "enableNetworking", "Networking Support", "Allow the API to talk to remote services or other mods.");
         describeField(comments, labels, "networkTimeoutMs", "Network Timeout", "How long to wait (in ms) before a network request is considered dead.");
         describeField(comments, labels, "enableGpuAcceleration", "GPU Acceleration", "Let Quantified push compatible workloads onto the GPU whenever possible.");
+        describeField(comments, labels, "preferredGpuBackend", "Preferred GPU Backend", "Choose how Quantified routes generic GPU work: Vulkan-first, OpenCL-first, strict backend requirements, or CPU-only.");
         describeField(comments, labels, "openclForced", "Force OpenCL", "Always route compute through OpenCL even when the CPU would normally be chosen.");
         describeField(comments, labels, "gpuDebugLogging", "GPU Debug Logging", "Emit detailed OpenCL/GPU traces to help troubleshoot rendering or compute issues.");
+        describeField(comments, labels, "vulkanDeviceId", "Vulkan Device", "Select which Vulkan device to use. Use auto to let Quantified pick the best Vulkan compute GPU.");
         describeField(comments, labels, "openclDeviceId", "OpenCL Device", "Select which OpenCL device to use. Use auto to let Quantified pick the fastest GPU.");
         describeField(comments, labels, "parallelMaxThreads", "Parallel Threads", "Upper bound for threads dedicated to the parallel compute pool.");
         describeField(comments, labels, "parallelQueueLimit", "Parallel Queue Limit", "Maximum number of queued parallel slices across all mods.");
@@ -790,7 +799,7 @@ public class MultithreadingConfig {
         java.util.LinkedHashMap<String, String[]> groups = new java.util.LinkedHashMap<>();
         groups.put("General Settings", new String[]{"logToConsole", "logLevel"});
         groups.put("Networking Configuration", new String[]{"enableNetworking", "networkTimeoutMs"});
-        groups.put("GPU / OpenCL", new String[]{"enableGpuAcceleration", "openclForced", "gpuDebugLogging", "openclDeviceId"});
+        groups.put("GPU / Compute", new String[]{"enableGpuAcceleration", "preferredGpuBackend", "vulkanDeviceId", "openclDeviceId", "openclForced", "gpuDebugLogging"});
         groups.put("Parallel Execution", new String[]{"parallelMaxThreads", "parallelQueueLimit", "parallelMaxSlicesPerMod", "parallelFailurePolicy"});
         groups.put("Task Processing", new String[]{"taskQueueSize", "taskTimeoutMs"});
         groups.put("Developer Features", new String[]{"developerMode", "developerTimeline", "developerReplay", "developerStressTest", "developerModSpotlight"});

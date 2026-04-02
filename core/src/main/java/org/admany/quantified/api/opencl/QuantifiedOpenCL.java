@@ -1,5 +1,6 @@
 package org.admany.quantified.api.opencl;
 
+import org.admany.quantified.api.compute.GpuBackendPreference;
 import org.admany.quantified.core.common.opencl.core.OpenCLContext;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.util.TaskScheduler;
@@ -261,7 +262,8 @@ public final class QuantifiedOpenCL {
             mapComplexity(builder.complexity()),
             mapKind(builder.kind()),
             builder.timeout(),
-            builder.allowMainThreadRerouting()
+            builder.allowMainThreadRerouting(),
+            GpuBackendPreference.OPENCL_REQUIRED
         );
     }
 

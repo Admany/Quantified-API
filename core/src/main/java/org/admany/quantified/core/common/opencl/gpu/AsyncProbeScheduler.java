@@ -11,13 +11,13 @@ import java.util.logging.Logger;
 
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
+import org.admany.quantified.core.common.util.LwjglRuntimeTuning;
 
 public class AsyncProbeScheduler {
     private static final Logger LOGGER = Logger.getLogger(AsyncProbeScheduler.class.getName());
     private static final ScheduledExecutorService SCHEDULER = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "Quantified-OpenCL-Probe-Scheduler");
-        t.setDaemon(true);
-        return t;
+        return LwjglRuntimeTuning.newDaemonThread(r, "Quantified-OpenCL-Probe-Scheduler",
+            LwjglRuntimeTuning.gpuThreadStackSizeKb());
     });
 
     private static final int MAX_ATTEMPTS = 6;

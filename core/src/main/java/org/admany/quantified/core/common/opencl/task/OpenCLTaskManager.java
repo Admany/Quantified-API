@@ -1,12 +1,12 @@
 package org.admany.quantified.core.common.opencl.task;
 
+import org.admany.quantified.api.compute.GpuBackendPreference;
 import org.admany.quantified.core.common.async.core.AsyncManager;
 import org.admany.quantified.core.common.async.gpu.GpuBatchTelemetry;
 import org.admany.quantified.core.common.async.task.PriorityTaskType;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
 import org.admany.quantified.core.common.opencl.cache.TieredGpuCache;
 import org.admany.quantified.core.common.opencl.core.OpenCLContext;
-import org.admany.quantified.core.common.opencl.core.OpenCLRuntime;
 import org.admany.quantified.core.common.opencl.core.OpenCLTask;
 import org.admany.quantified.core.common.opencl.gpu.GPUMonitor;
 import org.admany.quantified.core.common.telemetry.TaskKindTelemetry;
@@ -19,6 +19,7 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
@@ -43,6 +44,7 @@ public final class OpenCLTaskManager {
     private static final long EXTERNAL_PRESSURE_LOG_INTERVAL_MS = 5_000L;
 
     private static final AtomicLong lastExternalPressureLogMs = new AtomicLong(0);
+    private static final AtomicBoolean vramPressureHandling = new AtomicBoolean(false);
 
     private static GPUMonitor monitor;
     private static OpenCLContext context;
@@ -95,7 +97,8 @@ public final class OpenCLTaskManager {
                 org.admany.quantified.core.common.util.TaskScheduler.TaskComplexity.MODERATE,
                 org.admany.quantified.core.common.util.TaskScheduler.TaskType.GENERAL,
                 task.timeout().orElse(null),
-                true // Allow main thread rerouting for OpenCL tasks
+                true, // Allow main thread rerouting for OpenCL tasks
+                GpuBackendPreference.OPENCL_REQUIRED
             );
         } finally {
             if (taskThrottle != null) {
@@ -186,26 +189,19 @@ public final class OpenCLTaskManager {
     }
 
     public static void handleVramSaturation(String cause) {
-        GPUMonitor.GPUStatus status = monitor != null ? monitor.getStatus() : null;
-
-        if (isLikelyExternalPressure(status, cause)) {
-            offloadCachesForExternalPressure();
-            logExternalPressure(status, cause);
+        if (!vramPressureHandling.compareAndSet(false, true)) {
             return;
         }
-
+        GPUMonitor.GPUStatus status = monitor != null ? monitor.getStatus() : null;
         try {
-            clearGPUCaches();
-            // Destroy OpenCL context to free VRAM
-            if (context != null) {
-                try {
-                    context.close();
-                } catch (Throwable t) {
-                    LOGGER.fine("Failed to close OpenCL context: " + t.getMessage());
-                }
-                context = null;
+            if (isLikelyExternalPressure(status, cause)) {
+                clearGPUCaches();
+                enterVramPressureCooldown();
+                logExternalPressure(status, cause);
+                return;
             }
-            OpenCLRuntime.destroy();
+
+            clearGPUCaches();
             if (monitor != null) {
                 try {
                     monitor.refreshNow();
@@ -217,15 +213,18 @@ public final class OpenCLTaskManager {
             logSaturationContext(status, cause);
         } catch (Throwable t) {
             LOGGER.log(Level.WARNING, "Failed to handle VRAM saturation", t);
+        } finally {
+            vramPressureHandling.set(false);
         }
     }
 
     private static void clearGPUCaches() {
         TieredGpuCache cache = tieredCache;
         if (cache != null) {
-            cache.clear();
+            cache.offloadToDisk();
         }
         org.admany.quantified.core.common.opencl.core.OpenCLManager.evictBufferPool(true);
+        offloadExternalQuantifiedCaches();
         if (monitor != null) {
             monitor.clearMemoryTracking();
             LOGGER.info("GPU memory tracking cleared");
@@ -253,8 +252,8 @@ public final class OpenCLTaskManager {
     }
 
     private static void logSaturationContext(GPUMonitor.GPUStatus status, String cause) {
-        DeveloperOverlayManager.recordApiLog("[OpenCL] VRAM saturation detected - destroyed context to free VRAM, pausing GPU work temporarily");
-        LOGGER.warning("VRAM saturation detected - destroyed context to free VRAM, pausing GPU work temporarily");
+        DeveloperOverlayManager.recordApiLog("[OpenCL] VRAM saturation detected - offloaded GPU caches and trimmed buffers, pausing new GPU work briefly");
+        LOGGER.warning("VRAM saturation detected - offloaded GPU caches and trimmed buffers, pausing new GPU work briefly");
 
         String detail = buildPressureDetail("VRAM saturation context", status, cause, true);
         LOGGER.warning(detail);
@@ -280,18 +279,12 @@ public final class OpenCLTaskManager {
         DeveloperOverlayManager.recordApiLog("[OpenCL] " + detail);
     }
 
-    private static void offloadCachesForExternalPressure() {
-        try {
-            clearGPUCaches();
-        } catch (Throwable ignored) {
-        }
-
+    private static void offloadExternalQuantifiedCaches() {
         try {
             Class<?> gpuMemoryManager = Class.forName("org.admany.lc2h.worldgen.gpu.GPUMemoryManager");
             gpuMemoryManager.getMethod("clearQuantifiedAPICaches").invoke(null);
-            DeveloperOverlayManager.recordApiLog("[OpenCL] Offloaded Quantified caches to RAM/disk due to external VRAM pressure");
+            DeveloperOverlayManager.recordApiLog("[OpenCL] Offloaded Quantified caches to RAM/disk");
         } catch (Throwable ignored) {
-            // LC2H not present or method unavailable; best effort
         }
     }
 

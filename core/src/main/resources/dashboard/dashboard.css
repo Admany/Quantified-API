@@ -433,6 +433,13 @@ body {
     min-height: 142px;
 }
 
+.kpi-head-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+}
+
 .kpi-card h3 {
     margin: 0;
     font-size: clamp(1.4rem, 2.8vw, 2rem);
@@ -451,6 +458,12 @@ body {
 .kpi-card span {
     color: var(--text-secondary);
     font-size: 0.87rem;
+}
+
+.kpi-meta-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
 }
 
 .overview-main-chart {
@@ -925,6 +938,24 @@ body {
     color: var(--danger);
     border-color: rgba(184, 77, 77, 0.24);
     background: rgba(184, 77, 77, 0.1);
+}
+
+.status-pill.vulkan {
+    color: #cf4747;
+    border-color: rgba(207, 71, 71, 0.28);
+    background: rgba(207, 71, 71, 0.12);
+}
+
+.status-pill.opencl {
+    color: #2c8f5d;
+    border-color: rgba(44, 143, 93, 0.26);
+    background: rgba(44, 143, 93, 0.12);
+}
+
+.status-pill.cpu {
+    color: var(--text-secondary);
+    border-color: var(--border-soft);
+    background: var(--surface-strong);
 }
 
 .status-board {

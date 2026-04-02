@@ -233,6 +233,29 @@ public final class TieredGpuCache {
         }
     }
 
+    public void offloadToDisk() {
+        lock.lock();
+        try {
+            flushAllToDisk();
+            entries.values().forEach(entry -> {
+                if (entry.tier != CacheTier.DISK) {
+                    entry.tier = CacheTier.DISK;
+                }
+                if (entry.payload != null) {
+                    setPayload(entry, null);
+                }
+                if (entry.buffer != null) {
+                    setBuffer(entry, null);
+                }
+            });
+            vramPromotionPaused = true;
+            lastVramTrimLogMs = 0L;
+            manifests.values().forEach(DiskManifest::saveIfDirty);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     public long getVramUsageBytes() {
         lock.lock();
         try {

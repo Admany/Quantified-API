@@ -1,13 +1,21 @@
 package org.admany.quantified.core.common.util;
 
+import org.admany.quantified.api.compute.GpuBackendPreference;
+import org.admany.quantified.api.compute.GpuBackendType;
 import org.admany.quantified.core.common.async.core.AsyncManager;
 import org.admany.quantified.core.common.async.gpu.GpuWorkloadRegistry;
 import org.admany.quantified.core.common.async.gpu.OpenClBatchWorkload;
+import org.admany.quantified.core.common.async.gpu.VulkanBatchWorkload;
 import org.admany.quantified.core.common.async.task.PriorityTaskType;
 import org.admany.quantified.core.common.async.task.TaskMetadata;
 import org.admany.quantified.core.common.config.MultithreadingConfig;
+import org.admany.quantified.core.common.gpu.backend.GpuBackendRouter;
+import org.admany.quantified.core.common.gpu.backend.VulkanRuntime;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.opencl.core.OpenCLTask;
+import org.admany.quantified.core.common.vulkan.core.ApiVulkanTaskWrapper;
+import org.admany.quantified.core.common.vulkan.core.VulkanManager;
+import org.admany.quantified.core.common.vulkan.core.VulkanTask;
 import org.admany.quantified.api.QuantifiedAPI;
 
 import java.time.Duration;
@@ -76,7 +84,6 @@ public final class TaskScheduler {
      * @param timeout Optional timeout
      * @return CompletableFuture with the result
      */
-    @SuppressWarnings("unchecked")
     public static <T> CompletableFuture<T> submitComputeTask(
             String modId,
             String taskName,
@@ -89,16 +96,40 @@ public final class TaskScheduler {
             TaskType type,
             Duration timeout,
             boolean allowMainThreadRerouting) {
+        return submitComputeTask(modId, taskName, taskKey, cpuImplementation, gpuTask, dataSizeBytes, parallelUnits,
+            complexity, type, timeout, allowMainThreadRerouting, GpuBackendPreference.AUTO);
+    }
 
-        OpenCLTask<T> effectiveGpuTask = null;
+    @SuppressWarnings("unchecked")
+    public static <T> CompletableFuture<T> submitComputeTask(
+            String modId,
+            String taskName,
+            long taskKey,
+            Supplier<T> cpuImplementation,
+            Object gpuTask,
+            long dataSizeBytes,
+            int parallelUnits,
+            TaskComplexity complexity,
+            TaskType type,
+            Duration timeout,
+            boolean allowMainThreadRerouting,
+            GpuBackendPreference backendPreference) {
+
+        OpenCLTask<T> effectiveOpenClTask = null;
+        VulkanTask<T> effectiveVulkanTask = null;
         if (gpuTask instanceof OpenCLTask) {
-            effectiveGpuTask = (OpenCLTask<T>) gpuTask;
+            effectiveOpenClTask = (OpenCLTask<T>) gpuTask;
         } else if (gpuTask instanceof org.admany.quantified.api.opencl.QuantifiedOpenCL.ApiOpenClTask) {
-            effectiveGpuTask = new org.admany.quantified.core.common.opencl.core.ApiOpenClTaskWrapper<T>(
+            effectiveOpenClTask = new org.admany.quantified.core.common.opencl.core.ApiOpenClTaskWrapper<>(
                 (org.admany.quantified.api.opencl.QuantifiedOpenCL.ApiOpenClTask<T>) gpuTask);
+        } else if (gpuTask instanceof VulkanTask) {
+            effectiveVulkanTask = (VulkanTask<T>) gpuTask;
+        } else if (gpuTask instanceof org.admany.quantified.api.vulkan.QuantifiedVulkan.ApiVulkanTask) {
+            effectiveVulkanTask = new ApiVulkanTaskWrapper<>(
+                (org.admany.quantified.api.vulkan.QuantifiedVulkan.ApiVulkanTask<T>) gpuTask);
         }
 
-        if (effectiveGpuTask instanceof org.admany.quantified.core.common.opencl.core.CacheableOpenCLTask<?> cacheableTask) {
+        if (effectiveOpenClTask instanceof org.admany.quantified.core.common.opencl.core.CacheableOpenCLTask<?> cacheableTask) {
             String cacheKey = cacheableTask.cacheKey();
             if (cacheKey != null && !cacheKey.isBlank()) {
                 org.admany.quantified.core.common.opencl.cache.TieredGpuCache.CacheHit hit =
@@ -118,20 +149,51 @@ public final class TaskScheduler {
 
         TaskAnalysis analysis = analyzeTask(dataSizeBytes, parallelUnits, complexity, type);
 
-        ExecutionPlatform platform = decidePlatform(analysis, effectiveGpuTask);
+        GpuBackendPreference effectivePreference = normalizeBackendPreference(modId, backendPreference);
+        GpuBackendRouter.Selection backendSelection = GpuBackendRouter.selectBackend(
+            modId,
+            effectivePreference,
+            effectiveOpenClTask != null,
+            effectiveVulkanTask != null
+        );
+
+        ExecutionPlatform platform = decidePlatform(
+            analysis,
+            effectiveOpenClTask,
+            effectiveVulkanTask,
+            backendSelection.backendType(),
+            effectivePreference
+        );
 
         LOGGER.fine(() -> String.format("Task '%s' scheduled for %s (data: %d bytes, parallel: %d, complexity: %s)",
             taskName, platform, dataSizeBytes, parallelUnits, complexity));
 
-        boolean gpuSelected = platform == ExecutionPlatform.GPU && effectiveGpuTask != null;
+        boolean gpuSelected = platform == ExecutionPlatform.GPU
+            && ((backendSelection.backendType() == GpuBackendType.OPENCL && effectiveOpenClTask != null)
+            || (backendSelection.backendType() == GpuBackendType.VULKAN && effectiveVulkanTask != null));
         if (gpuSelected) {
             recordGpuTaskScheduled();
-            GpuWorkloadRegistry.register(taskKey, effectiveGpuTask);
+            if (backendSelection.backendType() == GpuBackendType.VULKAN) {
+                GpuWorkloadRegistry.register(taskKey, effectiveVulkanTask);
+            } else {
+                GpuWorkloadRegistry.register(taskKey, effectiveOpenClTask);
+            }
         } else {
             recordCpuTaskScheduled();
         }
 
-        TaskMetadata metadata = buildMetadata(analysis, gpuSelected, modId, taskName, dataSizeBytes, parallelUnits, complexity, type);
+        TaskMetadata metadata = buildMetadata(
+            analysis,
+            gpuSelected,
+            backendSelection.backendType(),
+            effectivePreference,
+            modId,
+            taskName,
+            dataSizeBytes,
+            parallelUnits,
+            complexity,
+            type
+        );
 
         if (QuantifiedAPI.isPrintDebugLogs()) {
             LOGGER.fine("[DEBUG] TaskScheduler: Routing task " + taskKey + " via AsyncManager (gpuSelected=" + gpuSelected + ")");
@@ -254,6 +316,8 @@ public final class TaskScheduler {
 
     private static TaskMetadata buildMetadata(TaskAnalysis analysis,
                                               boolean gpuSelected,
+                                              GpuBackendType backendType,
+                                              GpuBackendPreference backendPreference,
                                               String modId,
                                               String taskName,
                                               long dataSizeBytes,
@@ -278,8 +342,10 @@ public final class TaskScheduler {
           if (gpuSelected) {
               builder.gpuPreferred(true);
               builder.batchable(true);
-              builder.gpuWorkload(gpuBatchWorkload);
-              if (analysis.dataSizeOptimal() || complexity == TaskComplexity.MASSIVE) {
+              builder.gpuWorkload(backendType == GpuBackendType.VULKAN ? VulkanBatchWorkload.INSTANCE : gpuBatchWorkload);
+              if ((backendPreference != null && (backendPreference.requiresOpenCL() || backendPreference.requiresVulkan()))
+                  || analysis.dataSizeOptimal()
+                  || complexity == TaskComplexity.MASSIVE) {
                   builder.gpuRequired(true);
               }
           } else {
@@ -288,12 +354,29 @@ public final class TaskScheduler {
         return builder.build();
     }
 
-    private static ExecutionPlatform decidePlatform(TaskAnalysis analysis, OpenCLTask<?> gpuTask) {
-        if (gpuTask == null) {
-            return ExecutionPlatform.CPU;
+    private static ExecutionPlatform decidePlatform(TaskAnalysis analysis,
+                                                    OpenCLTask<?> openClTask,
+                                                    VulkanTask<?> vulkanTask,
+                                                    GpuBackendType backendType,
+                                                    GpuBackendPreference backendPreference) {
+        if (backendType == GpuBackendType.VULKAN) {
+            return decideVulkanPlatform(analysis, vulkanTask, backendPreference);
         }
+        if (backendType == GpuBackendType.OPENCL) {
+            return decideOpenClPlatform(analysis, openClTask, backendPreference);
+        }
+        return ExecutionPlatform.CPU;
+    }
 
-        if (!OpenCLManager.isAvailable()) {
+    private static GpuBackendPreference normalizeBackendPreference(String modId,
+                                                                  GpuBackendPreference backendPreference) {
+        return GpuBackendRouter.resolvePreference(modId, backendPreference);
+    }
+
+    private static ExecutionPlatform decideOpenClPlatform(TaskAnalysis analysis,
+                                                          OpenCLTask<?> gpuTask,
+                                                          GpuBackendPreference backendPreference) {
+        if (gpuTask == null || !OpenCLManager.isAvailable()) {
             return ExecutionPlatform.CPU;
         }
 
@@ -309,19 +392,41 @@ public final class TaskScheduler {
             return ExecutionPlatform.CPU;
         }
 
-        if (forceOpenCl) {
+        if (backendPreference != null && backendPreference.requiresOpenCL()) {
             return ExecutionPlatform.GPU;
         }
 
-        if (shouldPreferGpu(analysis)) {
+        if (forceOpenCl || shouldPreferGpu(analysis)) {
             return ExecutionPlatform.GPU;
         }
 
+        return decideGpuByAnalysis(analysis);
+    }
+
+    private static ExecutionPlatform decideVulkanPlatform(TaskAnalysis analysis,
+                                                          VulkanTask<?> gpuTask,
+                                                          GpuBackendPreference backendPreference) {
+        if (gpuTask == null || !VulkanRuntime.isAvailable()) {
+            return ExecutionPlatform.CPU;
+        }
+        if (!canGpuAcceptTask(analysis, gpuTask)) {
+            return ExecutionPlatform.CPU;
+        }
+        if (backendPreference != null && backendPreference.requiresVulkan()) {
+            return ExecutionPlatform.GPU;
+        }
+        return decideGpuByAnalysis(analysis);
+    }
+
+    private static ExecutionPlatform decideGpuByAnalysis(TaskAnalysis analysis) {
         if (!analysis.dataSizeEfficient) {
             return ExecutionPlatform.CPU;
         }
 
-        if ((analysis.complexity == TaskComplexity.MODERATE || analysis.complexity == TaskComplexity.COMPLEX || analysis.complexity == TaskComplexity.MASSIVE) && analysis.expectedSpeedup >= GPU_SPEEDUP_THRESHOLD) {
+        if ((analysis.complexity == TaskComplexity.MODERATE
+            || analysis.complexity == TaskComplexity.COMPLEX
+            || analysis.complexity == TaskComplexity.MASSIVE)
+            && analysis.expectedSpeedup >= GPU_SPEEDUP_THRESHOLD) {
             return ExecutionPlatform.GPU;
         }
 
@@ -409,6 +514,21 @@ public final class TaskScheduler {
                 memoryUtil));
         }
         return accepted;
+    }
+
+    private static boolean canGpuAcceptTask(TaskAnalysis analysis, VulkanTask<?> gpuTask) {
+        if (gpuTask == null || !VulkanRuntime.isAvailable()) {
+            return false;
+        }
+        try {
+            org.admany.quantified.core.common.async.core.PriorityScheduler.SchedulerSnapshot schedulerSnapshot = AsyncManager.schedulerSnapshot();
+            int queueDepth = Math.max(0, schedulerSnapshot.foregroundQueue() + schedulerSnapshot.backgroundQueue());
+            if (queueDepth > 0 && shouldTemporarilyPreferCpu(queueDepth)) {
+                return false;
+            }
+        } catch (Throwable ignored) {
+        }
+        return VulkanManager.canAcceptTask(gpuTask);
     }
 
     private static double calculateExpectedSpeedup(TaskComplexity complexity, TaskType type,
@@ -614,11 +734,19 @@ public final class TaskScheduler {
     }
 
     public static void recordExternalCpuTask() {
-        recordCpuTaskScheduled();
+        recordCpuTasksScheduled(1L);
     }
 
     public static void recordExternalGpuTask() {
-        recordGpuTaskScheduled();
+        recordGpuTasksScheduled(1L);
+    }
+
+    public static void recordExternalCpuTasks(long count) {
+        recordCpuTasksScheduled(count);
+    }
+
+    public static void recordExternalGpuTasks(long count) {
+        recordGpuTasksScheduled(count);
     }
 
     public static void recordGpuKernelDuration(long durationNanos) {
@@ -627,13 +755,27 @@ public final class TaskScheduler {
     }
 
     private static void recordCpuTaskScheduled() {
-        totalTasksScheduled.incrementAndGet();
-        cpuTasksExecuted.incrementAndGet();
+        recordCpuTasksScheduled(1L);
     }
 
     private static void recordGpuTaskScheduled() {
-        totalTasksScheduled.incrementAndGet();
-        gpuTasksExecuted.incrementAndGet();
+        recordGpuTasksScheduled(1L);
+    }
+
+    private static void recordCpuTasksScheduled(long count) {
+        if (count <= 0L) {
+            return;
+        }
+        totalTasksScheduled.addAndGet(count);
+        cpuTasksExecuted.addAndGet(count);
+    }
+
+    private static void recordGpuTasksScheduled(long count) {
+        if (count <= 0L) {
+            return;
+        }
+        totalTasksScheduled.addAndGet(count);
+        gpuTasksExecuted.addAndGet(count);
     }
 
     private static <T> CompletableFuture<T> resolveGpuOrCpu(long taskKey, Supplier<T> cpuImplementation) {

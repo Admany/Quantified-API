@@ -94,6 +94,10 @@ public final class GpuTaskDispatcher {
             GpuBatchTelemetry.recordRejectedNotGpuMarked();
             return false;
         }
+        if (metadata.gpuWorkload().isEmpty()) {
+            GpuBatchTelemetry.recordFallbackNoWorkload();
+            return false;
+        }
         return true;
     }
 

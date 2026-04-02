@@ -290,6 +290,28 @@ function formatMillis(value) {
     return `${Math.round(value)} ms`;
 }
 
+function formatGpuBackendLabel(value) {
+    const backend = String(value || "CPU").toUpperCase();
+    if (backend === "VULKAN") {
+        return "VULKAN";
+    }
+    if (backend === "OPENCL") {
+        return "OpenCL";
+    }
+    return "CPU";
+}
+
+function gpuBackendPillVariant(value) {
+    const backend = String(value || "CPU").toUpperCase();
+    if (backend === "VULKAN") {
+        return "vulkan";
+    }
+    if (backend === "OPENCL") {
+        return "opencl";
+    }
+    return "cpu";
+}
+
 function normalizeLoadRatio(value) {
     const numeric = Number(value);
     if (!Number.isFinite(numeric) || numeric <= 0) {
@@ -1088,39 +1110,43 @@ const App = () => {
         return String(name || "").toLowerCase().replace(/\s+/g, " ").trim();
     }, []);
 
-    const waitForGpuSwitch = useCallback(async (expectedName) => {
-        const deadline = Date.now() + 15000;
+    const readGpuRuntimeState = useCallback(async () => {
+        const deadline = Date.now() + 6500;
         let lastState = null;
-        const expected = normalizeDeviceName(expectedName);
+        const resolveGpuReason = (runtimeState) => {
+            const backend = String(runtimeState?.activeGpuBackend || "CPU").toUpperCase();
+            const preferred = String(runtimeState?.configuredGpuBackendPreference || "").toUpperCase();
+            if (backend === "VULKAN") {
+                return runtimeState?.vulkanFailureReason || "";
+            }
+            if (preferred.includes("VULKAN") && runtimeState?.vulkanFailureReason) {
+                return runtimeState.vulkanFailureReason;
+            }
+            return runtimeState?.openclFailureReason || runtimeState?.vulkanFailureReason || "";
+        };
         while (Date.now() < deadline) {
-            const state = await fetchJson("/api/v1/dashboard/state");
-            lastState = state;
-            const active = normalizeDeviceName(state.openclDeviceName);
-            if (state.openclAvailable === false && state.openclFailureReason) {
-                return { ok: false, deviceName: state.openclDeviceName || "", reason: state.openclFailureReason };
+            const nextState = await fetchJson("/api/v1/dashboard/state");
+            lastState = nextState;
+            const backend = String(nextState.activeGpuBackend || "CPU").toUpperCase();
+            const deviceName = nextState.activeGpuDeviceName || nextState.vulkanDeviceName || nextState.openclDeviceName || "";
+            if (backend !== "CPU" || !nextState.enableGpuAcceleration) {
+                return {
+                    backend,
+                    deviceName,
+                    reason: resolveGpuReason(nextState),
+                };
             }
-            if (state.openclAvailable) {
-                if (!expected && active) {
-                    return { ok: true, deviceName: state.openclDeviceName };
-                }
-                if (expected && active && (active.includes(expected) || expected.includes(active))) {
-                    return { ok: true, deviceName: state.openclDeviceName };
-                }
-                if (expected && !active) {
-                    return { ok: true, deviceName: state.openclDeviceName || expectedName };
-                }
-            }
-            await new Promise((resolve) => setTimeout(resolve, 900));
+            await new Promise((resolve) => setTimeout(resolve, 700));
         }
         return {
-            ok: false,
-            deviceName: lastState?.openclDeviceName || "",
-            reason: lastState?.openclFailureReason || "Timed out waiting for OpenCL switch",
+            backend: String(lastState?.activeGpuBackend || "CPU").toUpperCase(),
+            deviceName: lastState?.activeGpuDeviceName || lastState?.vulkanDeviceName || lastState?.openclDeviceName || "",
+            reason: resolveGpuReason(lastState),
         };
-    }, [normalizeDeviceName]);
+    }, []);
 
     const applyConfigUpdate = useCallback(async (key, value, options = {}) => {
-        const isGpu = key === "openclDeviceId";
+        const isGpu = ["preferredGpuBackend", "vulkanDeviceId", "openclDeviceId", "enableGpuAcceleration"].includes(key);
         if (isGpu) {
             pushToast("Applying GPU change...", "info", 2600);
         }
@@ -1137,17 +1163,12 @@ const App = () => {
                 return next;
             });
             if (isGpu) {
-                const expectedName = options.expectedDeviceName || "";
-                const result = await waitForGpuSwitch(expectedName);
-                if (result.ok) {
-                    const label = result.deviceName
-                        ? `GPU change applied - now using ${result.deviceName} for OpenCL tasks.`
-                        : "GPU change applied - OpenCL is ready.";
-                    pushToast(label, "success", 4200);
-                } else {
-                    const detail = result.reason ? ` (${result.reason})` : "";
-                    pushToast(`GPU change failed${detail}`, "error", 4200);
-                }
+                const runtime = await readGpuRuntimeState();
+                const backendLabel = formatGpuBackendLabel(runtime.backend);
+                const deviceSuffix = runtime.deviceName ? ` on ${runtime.deviceName}` : "";
+                const detail = runtime.reason ? ` (${runtime.reason})` : "";
+                const tone = runtime.backend === "CPU" ? "info" : "success";
+                pushToast(`GPU config applied - active backend ${backendLabel}${deviceSuffix}${detail}.`, tone, 4600);
             } else {
                 pushToast("Change applied", "success");
             }
@@ -1157,7 +1178,7 @@ const App = () => {
             setError(err.message || "Failed to apply config change");
             pushToast("Change failed", "error", 3200);
         }
-    }, [pushToast, updateConfigGroupValue, waitForGpuSwitch]);
+    }, [pushToast, readGpuRuntimeState, updateConfigGroupValue]);
 
     const scheduleConfigUpdate = useCallback((key, value, options = {}) => {
         const timers = configSaveTimers.current;
@@ -1200,6 +1221,10 @@ const App = () => {
     const gpuCompute = Number(snapshot.gpuComputeUtil ?? 0);
     const gpuMemory = Number(snapshot.gpuMemoryUtil ?? 0);
     const gpuTemperature = Number(snapshot.gpuTemperature ?? state?.systemInfo?.gpuTemperature ?? 0);
+    const activeGpuBackend = String(state?.activeGpuBackend ?? "CPU").toUpperCase();
+    const activeGpuDeviceName = state?.activeGpuDeviceName || state?.vulkanDeviceName || state?.openclDeviceName || "";
+    const activeGpuBackendLabel = formatGpuBackendLabel(activeGpuBackend);
+    const activeGpuBackendVariant = gpuBackendPillVariant(activeGpuBackend);
     const cpuSystemLoad = normalizeLoadRatio(snapshot.cpuSystemLoad ?? state?.cpuSystemLoad ?? 0);
     const schedulerRate = Number(snapshot.schedulerExecRate ?? 0);
     const ramCacheBytes = Number(state?.cacheRamBytes ?? 0);
@@ -1291,8 +1316,10 @@ const App = () => {
                 label: "GPU",
                 badge: formatTemperature(gpuTemperature),
                 variant: gpuVariant === "ok" ? memoryVariant : gpuVariant,
-                detail: `${formatPercent(gpuCompute)} compute`,
-                message: `API VRAM ${formatPercent(vramRatio)} of ${formatBytes(vramBudgetBytes || 0)}`,
+                detail: `${activeGpuBackendLabel} • ${formatPercent(gpuCompute)} compute`,
+                message: activeGpuDeviceName
+                    ? `${activeGpuDeviceName} • API VRAM ${formatPercent(vramRatio)} of ${formatBytes(vramBudgetBytes || 0)}`
+                    : `API VRAM ${formatPercent(vramRatio)} of ${formatBytes(vramBudgetBytes || 0)}`,
             },
             {
                 label: "CPU",
@@ -1476,9 +1503,15 @@ const App = () => {
                             <span>Threshold ${formatNumber(queueThreshold)}</span>
                         </div>
                         <div className="card kpi-card">
-                            <p className="kpi-label">GPU Compute</p>
+                            <div className="kpi-head-row">
+                                <p className="kpi-label">GPU Compute</p>
+                                <${StatusPill} label=${activeGpuBackendLabel} variant=${activeGpuBackendVariant} />
+                            </div>
                             <h3>${formatPercent(gpuCompute)}</h3>
-                            <span>VRAM ${formatPercent(vramRatio)}</span>
+                            <div className="kpi-meta-stack">
+                                <span>${activeGpuDeviceName || "No active GPU device"}</span>
+                                <span>VRAM ${formatPercent(vramRatio)}</span>
+                            </div>
                         </div>
                         <div className="card kpi-card">
                             <p className="kpi-label">Scheduler</p>
@@ -2279,7 +2312,7 @@ const App = () => {
         return candidates.find((value) => typeof value === "string" && value.trim().length > 0)?.trim() || "";
     }, [state]);
 
-    const greeting = playerName ? `Good evening, ${playerName}.` : "Ehhh... Should you be here???";
+    const greeting = playerName ? `Welcome back, ${playerName}.` : "Quantified API dashboard";
 
     const applyThemeOverride = (value) => {
         if (value === "auto") {

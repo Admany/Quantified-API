@@ -199,6 +199,20 @@ public final class DeveloperFeatures {
         return org.admany.quantified.core.common.opencl.core.OpenCLManager.forceProbe();
     }
 
+    public static java.util.concurrent.CompletableFuture<Boolean> runVulkanProbe() {
+        if (!isDeveloperModeEnabled()) {
+            java.util.concurrent.CompletableFuture<Boolean> f = new java.util.concurrent.CompletableFuture<>();
+            f.completeExceptionally(new IllegalStateException("Developer mode is not enabled"));
+            return f;
+        }
+        if (!org.admany.quantified.core.common.gpu.backend.VulkanRuntime.hasBindings()) {
+            java.util.concurrent.CompletableFuture<Boolean> f = new java.util.concurrent.CompletableFuture<>();
+            f.completeExceptionally(new IllegalStateException("LWJGL Vulkan classes are not present in this runtime"));
+            return f;
+        }
+        return org.admany.quantified.core.common.vulkan.core.VulkanManager.forceProbe();
+    }
+
     private static StressTestController.StressTestProfile parseProfile(String raw) {
         try {
             return StressTestController.StressTestProfile.fromConfigKey(raw);

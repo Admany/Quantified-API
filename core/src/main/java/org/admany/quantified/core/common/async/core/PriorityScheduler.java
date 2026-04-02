@@ -16,6 +16,7 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -34,9 +35,17 @@ public final class PriorityScheduler {
     private static final Logger LOGGER = Logger.getLogger(PriorityScheduler.class.getName());
     private static final long DEFAULT_BACKGROUND_STALE_BASE_NANOS = TimeUnit.MILLISECONDS.toNanos(3_000L);
     private static final long DEFAULT_BACKGROUND_STALE_OVERLOAD_NANOS = TimeUnit.MILLISECONDS.toNanos(1_500L);
+    private static final int AFFINITY_STEAL_THRESHOLD = Math.max(4,
+        Integer.getInteger("quantified.scheduler.affinityStealThreshold", 8));
+    private static final long FOREGROUND_IDLE_POLL_MILLIS = Math.max(10L,
+        Long.getLong("quantified.scheduler.foregroundIdlePollMs", 50L));
+    private static final long BACKGROUND_IDLE_POLL_MILLIS = Math.max(20L,
+        Long.getLong("quantified.scheduler.backgroundIdlePollMs", 100L));
 
     private final PriorityBlockingQueue<PriorityTask> foregroundQueue;
     private final BlockingQueue<PriorityTask> backgroundQueue;
+    private final AffinityLane[] foregroundAffinityLanes;
+    private final AffinityLane[] backgroundAffinityLanes;
     private final ConcurrentHashMap<Long, PriorityTask> coalesceMap = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Long, Boolean> promotedKeys = new ConcurrentHashMap<>();
 
@@ -46,8 +55,10 @@ public final class PriorityScheduler {
 
     private final Duration promotionDelay;
     private final int queueBound;
-    private final int foregroundThreads;
-    private final int backgroundThreads;
+    private final int initialForegroundWorkers;
+    private final int initialBackgroundWorkers;
+    private final int maxForegroundWorkers;
+    private final int maxBackgroundWorkers;
     private final ThreadPoolErrorHandler errorHandler;
     private final DynamicThreadScaler scaler;
     private final AutoBatchController autoBatchController = new AutoBatchController();
@@ -64,6 +75,8 @@ public final class PriorityScheduler {
     private final AtomicLong foregroundExecuted = new AtomicLong();
     private final AtomicLong backgroundExecuted = new AtomicLong();
     private final AtomicInteger droppedTasks = new AtomicInteger();
+    private final AtomicInteger foregroundAffinityQueued = new AtomicInteger();
+    private final AtomicInteger backgroundAffinityQueued = new AtomicInteger();
     private final AtomicLong duplicatesSuppressed = new AtomicLong();
     private final AtomicLong workerCrashes = new AtomicLong();
 
@@ -80,23 +93,39 @@ public final class PriorityScheduler {
                              int maxForegroundThreads,
                              int maxBackgroundThreads,
                              Duration promotionDelay,
+                             int queueBound) {
+        this(foregroundThreads, backgroundThreads, maxForegroundThreads, maxBackgroundThreads, promotionDelay, queueBound,
+            ThreadPoolErrorHandler.logging(LOGGER));
+    }
+
+    public PriorityScheduler(int foregroundThreads,
+                             int backgroundThreads,
+                             int maxForegroundThreads,
+                             int maxBackgroundThreads,
+                             Duration promotionDelay,
                              int queueBound,
                              ThreadPoolErrorHandler errorHandler) {
         this.foregroundQueue = new PriorityBlockingQueue<>();
         this.backgroundQueue = new LinkedBlockingQueue<>();
-        this.foregroundThreads = Math.max(1, foregroundThreads);
-        this.backgroundThreads = Math.max(1, backgroundThreads);
+        this.initialForegroundWorkers = Math.max(1, foregroundThreads);
+        this.initialBackgroundWorkers = Math.max(1, backgroundThreads);
+        this.maxForegroundWorkers = Math.max(this.initialForegroundWorkers, maxForegroundThreads);
+        this.maxBackgroundWorkers = Math.max(this.initialBackgroundWorkers, maxBackgroundThreads);
+        this.foregroundAffinityLanes = createAffinityLanes(this.maxForegroundWorkers);
+        this.backgroundAffinityLanes = createAffinityLanes(this.maxBackgroundWorkers);
         this.errorHandler = Objects.requireNonNull(errorHandler, "errorHandler");
-        this.scaler = new DynamicThreadScaler(maxForegroundThreads, maxBackgroundThreads, SystemLoadMonitor.isSmtCapable());
-        this.desiredForegroundWorkers.set(this.foregroundThreads);
-        this.desiredBackgroundWorkers.set(this.backgroundThreads);
-        this.foregroundPool = Executors.newFixedThreadPool(this.foregroundThreads, r -> {
-            Thread t = new Thread(r, "quantified-fg");
+        this.scaler = new DynamicThreadScaler(this.maxForegroundWorkers, this.maxBackgroundWorkers, SystemLoadMonitor.isSmtCapable());
+        this.desiredForegroundWorkers.set(this.initialForegroundWorkers);
+        this.desiredBackgroundWorkers.set(this.initialBackgroundWorkers);
+        AtomicInteger fgThreadCounter = new AtomicInteger(0);
+        AtomicInteger bgThreadCounter = new AtomicInteger(0);
+        this.foregroundPool = Executors.newFixedThreadPool(this.maxForegroundWorkers, r -> {
+            Thread t = new Thread(r, "quantified-fg-" + fgThreadCounter.incrementAndGet());
             t.setDaemon(true);
             return t;
         });
-        this.backgroundPool = Executors.newFixedThreadPool(this.backgroundThreads, r -> {
-            Thread t = new Thread(r, "quantified-bg");
+        this.backgroundPool = Executors.newFixedThreadPool(this.maxBackgroundWorkers, r -> {
+            Thread t = new Thread(r, "quantified-bg-" + bgThreadCounter.incrementAndGet());
             t.setDaemon(true);
             return t;
         });
@@ -113,11 +142,11 @@ public final class PriorityScheduler {
         if (!running.compareAndSet(false, true)) {
             return;
         }
-        for (int i = 0; i < foregroundThreads; i++) {
+        for (int i = 0; i < maxForegroundWorkers; i++) {
             final int index = i;
             foregroundPool.submit(() -> foregroundLoop(index));
         }
-        for (int i = 0; i < backgroundThreads; i++) {
+        for (int i = 0; i < maxBackgroundWorkers; i++) {
             final int index = i;
             backgroundPool.submit(() -> backgroundLoop(index));
         }
@@ -152,7 +181,7 @@ public final class PriorityScheduler {
         // Superseded any earlier task for this key; allow future promotion.
         promotedKeys.remove(task.taskKey());
 
-        int queued = foregroundQueue.size() + backgroundQueue.size();
+        int queued = totalForegroundQueued() + totalBackgroundQueued();
         int uniquePending = coalesceMap.size();
         boolean critical = task.type() == PriorityTaskType.FOREGROUND
             || (task.metadata() != null && task.metadata().gpuRequired())
@@ -166,22 +195,26 @@ public final class PriorityScheduler {
         }
 
         if (shouldRouteForeground(task)) {
-            if (foregroundQueue.size() >= queueBound && !critical) {
+            if (totalForegroundQueued() >= queueBound && !critical) {
                 droppedTasks.incrementAndGet();
                 coalesceMap.remove(task.taskKey(), task);
                 return;
             }
-            foregroundQueue.offer(task);
+            if (!routeToAffinityLane(task, true)) {
+                foregroundQueue.offer(task);
+            }
             if (QuantifiedAPI.isPrintDebugLogs()) {
                 LOGGER.fine("[DEBUG] PriorityScheduler: Task " + task.taskKey() + " routed to foreground queue");
             }
         } else {
-            if (backgroundQueue.size() >= queueBound && !critical) {
+            if (totalBackgroundQueued() >= queueBound && !critical) {
                 droppedTasks.incrementAndGet();
                 coalesceMap.remove(task.taskKey(), task);
                 return;
             }
-            backgroundQueue.offer(task);
+            if (!routeToAffinityLane(task, false)) {
+                backgroundQueue.offer(task);
+            }
             if (QuantifiedAPI.isPrintDebugLogs()) {
                 LOGGER.fine("[DEBUG] PriorityScheduler: Task " + task.taskKey() + " routed to background queue");
             }
@@ -200,7 +233,7 @@ public final class PriorityScheduler {
                     TimeUnit.MILLISECONDS.sleep(50);
                     continue;
                 }
-                PriorityTask task = foregroundQueue.poll(250, TimeUnit.MILLISECONDS);
+                PriorityTask task = pollForegroundTask(index);
                 if (task == null) {
                     if (SystemLoadMonitor.currentSystemLoad() >= SystemLoadMonitor.maxCpuLoad()) {
                         Thread.yield();
@@ -216,7 +249,7 @@ public final class PriorityScheduler {
                     continue; // superseded
                 }
                 promotedKeys.remove(task.taskKey());
-                int queueDepth = foregroundQueue.size() + backgroundQueue.size();
+                int queueDepth = totalForegroundQueued() + totalBackgroundQueued();
                 if (shouldDropStale(current, true, queueDepth)) {
                     droppedTasks.incrementAndGet();
                     continue;
@@ -224,11 +257,12 @@ public final class PriorityScheduler {
                 executeTask(current, foregroundExecuted, true);
                 int additional = autoBatchController.recommendedAdditional(
                     true,
-                    foregroundQueue.size(),
+                    totalForegroundQueued(),
                     SystemLoadMonitor.currentSystemLoad(),
                     SystemLoadMonitor.maxCpuLoad()
                 );
-                executeBatchFromQueue(foregroundQueue, foregroundExecuted, additional, true);
+                int consumed = executeBatchFromAffinityLane(foregroundAffinityLanes[index], foregroundAffinityQueued, foregroundExecuted, additional, true);
+                executeBatchFromQueue(foregroundQueue, foregroundExecuted, Math.max(0, additional - consumed), true);
             } catch (InterruptedException interrupted) {
                 if (!running.get()) {
                     Thread.currentThread().interrupt();
@@ -259,7 +293,7 @@ public final class PriorityScheduler {
                     TimeUnit.MILLISECONDS.sleep(75);
                     continue;
                 }
-                PriorityTask task = backgroundQueue.poll(500, TimeUnit.MILLISECONDS);
+                PriorityTask task = pollBackgroundTask(index);
                 if (task == null) {
                     if (SystemLoadMonitor.currentSystemLoad() >= SystemLoadMonitor.maxCpuLoad()) {
                         Thread.yield();
@@ -275,7 +309,7 @@ public final class PriorityScheduler {
                     continue;
                 }
                 promotedKeys.remove(task.taskKey());
-                int queueDepth = foregroundQueue.size() + backgroundQueue.size();
+                int queueDepth = totalForegroundQueued() + totalBackgroundQueued();
                 if (shouldDropStale(current, false, queueDepth)) {
                     droppedTasks.incrementAndGet();
                     continue;
@@ -283,11 +317,12 @@ public final class PriorityScheduler {
                 executeTask(current, backgroundExecuted, false);
                 int additional = autoBatchController.recommendedAdditional(
                     false,
-                    backgroundQueue.size(),
+                    totalBackgroundQueued(),
                     SystemLoadMonitor.currentSystemLoad(),
                     SystemLoadMonitor.maxCpuLoad()
                 );
-                executeBatchFromQueue(backgroundQueue, backgroundExecuted, additional, false);
+                int consumed = executeBatchFromAffinityLane(backgroundAffinityLanes[index], backgroundAffinityQueued, backgroundExecuted, additional, false);
+                executeBatchFromQueue(backgroundQueue, backgroundExecuted, Math.max(0, additional - consumed), false);
             } catch (InterruptedException interrupted) {
                 if (!running.get()) {
                     Thread.currentThread().interrupt();
@@ -336,8 +371,15 @@ public final class PriorityScheduler {
     private boolean shouldRouteForeground(PriorityTask task) {
         double score = task.score();
         boolean prefersForeground = score >= 0.5 || task.type() == PriorityTaskType.FOREGROUND;
-        int fgSize = foregroundQueue.size();
-        int bgSize = backgroundQueue.size();
+        TaskMetadata metadata = task.metadata();
+        if (metadata != null) {
+            String affinity = metadata.affinityKey();
+            if (affinity != null && !affinity.isBlank()) {
+                return prefersForeground;
+            }
+        }
+        int fgSize = totalForegroundQueued();
+        int bgSize = totalBackgroundQueued();
         if (prefersForeground && bgSize < fgSize) {
             // BG is less loaded, route to BG instead
             return false;
@@ -361,21 +403,25 @@ public final class PriorityScheduler {
             if (task.type() == PriorityTaskType.BACKGROUND) {
                 // Aging: allow very old background tasks to receive a single foreground boost.
                 if (now - task.enqueuedAtNanos() >= promoteAfter * 4L
-                    && foregroundQueue.size() < Math.max(1, (int) (queueBound * 0.75d))
+                    && totalForegroundQueued() < Math.max(1, (int) (queueBound * 0.75d))
                     && promotedKeys.putIfAbsent(task.taskKey(), Boolean.TRUE) == null) {
                     task.adjustScore(0.05);
-                    foregroundQueue.offer(task);
+                    if (!routeToAffinityLane(task, true)) {
+                        foregroundQueue.offer(task);
+                    }
                 }
                 continue;
             }
             if (now - task.enqueuedAtNanos() >= promoteAfter) {
                 // Prevent runaway queue growth: only promote a given key once until it executes.
-                if (foregroundQueue.size() >= queueBound) {
+                if (totalForegroundQueued() >= queueBound) {
                     continue;
                 }
                 if (promotedKeys.putIfAbsent(task.taskKey(), Boolean.TRUE) == null) {
                     task.adjustScore(0.1);
-                    foregroundQueue.offer(task);
+                    if (!routeToAffinityLane(task, true)) {
+                        foregroundQueue.offer(task);
+                    }
                 }
             }
         }
@@ -397,13 +443,43 @@ public final class PriorityScheduler {
                 continue;
             }
             promotedKeys.remove(next.taskKey());
-            int queueDepth = foregroundQueue.size() + backgroundQueue.size();
+            int queueDepth = totalForegroundQueued() + totalBackgroundQueued();
             if (shouldDropStale(current, foregroundWorker, queueDepth)) {
                 droppedTasks.incrementAndGet();
                 continue;
             }
             executeTask(current, counter, foregroundWorker);
         }
+    }
+
+    private int executeBatchFromAffinityLane(AffinityLane lane,
+                                             AtomicInteger laneQueuedCounter,
+                                             AtomicLong counter,
+                                             int maxAdditional,
+                                             boolean foregroundWorker) {
+        if (maxAdditional <= 0 || lane == null) {
+            return 0;
+        }
+        int executed = 0;
+        while (executed < maxAdditional) {
+            PriorityTask next = pollAffinityLane(lane, laneQueuedCounter);
+            if (next == null) {
+                break;
+            }
+            PriorityTask current = coalesceMap.remove(next.taskKey());
+            if (current == null || current != next) {
+                continue;
+            }
+            promotedKeys.remove(next.taskKey());
+            int queueDepth = totalForegroundQueued() + totalBackgroundQueued();
+            if (shouldDropStale(current, foregroundWorker, queueDepth)) {
+                droppedTasks.incrementAndGet();
+                continue;
+            }
+            executeTask(current, counter, foregroundWorker);
+            executed++;
+        }
+        return executed;
     }
 
     private boolean shouldDropStale(PriorityTask task, boolean foregroundWorker, int totalQueueDepth) {
@@ -429,8 +505,8 @@ public final class PriorityScheduler {
 
     private void applyRuntimeTuning() {
         RuntimeAutoTuner.RuntimeTuning tuning = runtimeAutoTuner.maybeTune(
-            foregroundQueue.size(),
-            backgroundQueue.size(),
+            totalForegroundQueued(),
+            totalBackgroundQueued(),
             queueBound,
             droppedTasks.get(),
             workerCrashes.get(),
@@ -461,14 +537,18 @@ public final class PriorityScheduler {
     }
 
     private void adjustScaling() {
-        double queuePressure = Math.min(1.0, (foregroundQueue.size() + backgroundQueue.size()) / (double) Math.max(1, queueBound));
+        int foregroundQueued = totalForegroundQueued();
+        int backgroundQueued = totalBackgroundQueued();
+        double queuePressure = Math.min(1.0, (foregroundQueued + backgroundQueued) / (double) Math.max(1, queueBound));
         double systemLoad = SystemLoadMonitor.currentSystemLoad();
-        DynamicThreadScaler.ScalingProfile profile = scaler.scale(foregroundQueue.size(), backgroundQueue.size(), queuePressure, systemLoad);
+        DynamicThreadScaler.ScalingProfile profile = scaler.scale(foregroundQueued, backgroundQueued, queuePressure, systemLoad);
         desiredForegroundWorkers.set(profile.foregroundWorkers());
         desiredBackgroundWorkers.set(profile.backgroundWorkers());
     }
 
     public SchedulerSnapshot snapshot() {
+        int foregroundQueued = totalForegroundQueued();
+        int backgroundQueued = totalBackgroundQueued();
         return new SchedulerSnapshot(
             tasksSubmitted.get(),
             tasksExecuted.get(),
@@ -477,8 +557,8 @@ public final class PriorityScheduler {
             duplicatesSuppressed.get(),
             droppedTasks.get(),
             coalesceMap.size(),
-            foregroundQueue.size(),
-            backgroundQueue.size(),
+            foregroundQueued,
+            backgroundQueued,
             workerCrashes.get(),
             desiredForegroundWorkers.get(),
             desiredBackgroundWorkers.get());
@@ -514,5 +594,144 @@ public final class PriorityScheduler {
                                     long workerCrashes,
                                     int desiredForegroundWorkers,
                                     int desiredBackgroundWorkers) {
+    }
+
+    private PriorityTask pollForegroundTask(int workerIndex) throws InterruptedException {
+        PriorityTask task = pollAffinityLane(foregroundAffinityLanes[workerIndex], foregroundAffinityQueued);
+        if (task != null) {
+            return task;
+        }
+        task = foregroundQueue.poll();
+        if (task != null) {
+            return task;
+        }
+        task = tryStealAffinityTask(
+            foregroundAffinityLanes,
+            workerIndex,
+            Math.max(1, desiredForegroundWorkers.get()),
+            foregroundAffinityQueued
+        );
+        if (task != null) {
+            return task;
+        }
+        task = foregroundQueue.poll(FOREGROUND_IDLE_POLL_MILLIS, TimeUnit.MILLISECONDS);
+        if (task != null) {
+            return task;
+        }
+        return pollAffinityLane(foregroundAffinityLanes[workerIndex], foregroundAffinityQueued);
+    }
+
+    private PriorityTask pollBackgroundTask(int workerIndex) throws InterruptedException {
+        PriorityTask task = pollAffinityLane(backgroundAffinityLanes[workerIndex], backgroundAffinityQueued);
+        if (task != null) {
+            return task;
+        }
+        task = backgroundQueue.poll();
+        if (task != null) {
+            return task;
+        }
+        task = tryStealAffinityTask(
+            backgroundAffinityLanes,
+            workerIndex,
+            Math.max(1, desiredBackgroundWorkers.get()),
+            backgroundAffinityQueued
+        );
+        if (task != null) {
+            return task;
+        }
+        task = backgroundQueue.poll(BACKGROUND_IDLE_POLL_MILLIS, TimeUnit.MILLISECONDS);
+        if (task != null) {
+            return task;
+        }
+        return pollAffinityLane(backgroundAffinityLanes[workerIndex], backgroundAffinityQueued);
+    }
+
+    private boolean routeToAffinityLane(PriorityTask task, boolean foreground) {
+        TaskMetadata metadata = task.metadata();
+        if (metadata == null) {
+            return false;
+        }
+        String affinity = metadata.affinityKey();
+        if (affinity == null || affinity.isBlank()) {
+            return false;
+        }
+        AffinityLane[] lanes = foreground ? foregroundAffinityLanes : backgroundAffinityLanes;
+        if (lanes.length == 0) {
+            return false;
+        }
+        int laneIndex = affinityLaneIndex(task.modId(), affinity, lanes.length);
+        AffinityLane lane = lanes[laneIndex];
+        lane.deque.offerLast(task);
+        lane.size.incrementAndGet();
+        if (foreground) {
+            foregroundAffinityQueued.incrementAndGet();
+        } else {
+            backgroundAffinityQueued.incrementAndGet();
+        }
+        return true;
+    }
+
+    private PriorityTask pollAffinityLane(AffinityLane lane, AtomicInteger queuedCounter) {
+        if (lane == null) {
+            return null;
+        }
+        PriorityTask task = lane.deque.pollFirst();
+        if (task != null) {
+            lane.size.updateAndGet(current -> current > 0 ? current - 1 : 0);
+            queuedCounter.updateAndGet(current -> current > 0 ? current - 1 : 0);
+        }
+        return task;
+    }
+
+    private PriorityTask tryStealAffinityTask(AffinityLane[] lanes,
+                                              int workerIndex,
+                                              int activeWorkers,
+                                              AtomicInteger queuedCounter) {
+        if (lanes == null || lanes.length <= 1) {
+            return null;
+        }
+        int activeLaneCount = Math.max(1, Math.min(activeWorkers, lanes.length));
+        for (int offset = 1; offset < lanes.length; offset++) {
+            int targetIndex = (workerIndex + offset) % lanes.length;
+            AffinityLane lane = lanes[targetIndex];
+            boolean inactiveLane = targetIndex >= activeLaneCount;
+            if (lane == null || (!inactiveLane && lane.size.get() < AFFINITY_STEAL_THRESHOLD)) {
+                continue;
+            }
+            PriorityTask stolen = lane.deque.pollLast();
+            if (stolen != null) {
+                lane.size.updateAndGet(current -> current > 0 ? current - 1 : 0);
+                queuedCounter.updateAndGet(current -> current > 0 ? current - 1 : 0);
+                return stolen;
+            }
+        }
+        return null;
+    }
+
+    private int totalForegroundQueued() {
+        return foregroundQueue.size() + foregroundAffinityQueued.get();
+    }
+
+    private int totalBackgroundQueued() {
+        return backgroundQueue.size() + backgroundAffinityQueued.get();
+    }
+
+    private static int affinityLaneIndex(String modId, String affinity, int laneCount) {
+        int hash = 31 * Objects.requireNonNullElse(modId, "").hashCode() + affinity.hashCode();
+        return Math.floorMod(hash, laneCount);
+    }
+
+    private static AffinityLane[] createAffinityLanes(int count) {
+        int safeCount = Math.max(1, count);
+        AffinityLane[] lanes = new AffinityLane[safeCount];
+        for (int i = 0; i < safeCount; i++) {
+            lanes[i] = new AffinityLane();
+        }
+        return lanes;
+    }
+
+    private static final class AffinityLane {
+        private final ConcurrentLinkedDeque<PriorityTask> deque = new ConcurrentLinkedDeque<>();
+        private final AtomicInteger size = new AtomicInteger(0);
     }
 }

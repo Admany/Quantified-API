@@ -1,14 +1,19 @@
 package org.admany.quantified.api;
 
+import org.admany.quantified.api.compute.GpuBackendPreference;
+import org.admany.quantified.api.compute.QuantifiedCompute;
 import org.admany.quantified.api.interfaces.ConnectedMod;
 import org.admany.quantified.api.interfaces.ModCacheManager;
 import org.admany.quantified.api.interfaces.ModConnectionListener;
 import org.admany.quantified.api.interfaces.ModStatistics;
+import org.admany.quantified.api.graph.QuantifiedTaskGraph;
 import org.admany.quantified.api.model.QuantifiedHybrid;
 import org.admany.quantified.api.model.QuantifiedPacket;
 import org.admany.quantified.api.model.QuantifiedTask;
 import org.admany.quantified.api.parallel.ParallelCompute;
 import org.admany.quantified.api.util.ForgeMetadataUtil;
+import org.admany.quantified.api.vulkan.QuantifiedVulkan;
+import org.admany.quantified.core.common.gpu.backend.GpuBackendRouter;
 import org.admany.quantified.core.common.util.ConnectedModImpl;
 import org.admany.quantified.core.forge.QuantifiedCoreForge;
 
@@ -21,6 +26,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.Objects;
 import java.util.function.Supplier;
+import java.util.concurrent.ThreadLocalRandom;
 
 public final class QuantifiedAPI {
 
@@ -167,6 +173,50 @@ public final class QuantifiedAPI {
         return QuantifiedTask.builder(handle.modId(), taskName, work);
     }
 
+    public static QuantifiedTaskGraph.Builder graph(String graphName) {
+        QuantifiedHandle handle = getHandle();
+        return QuantifiedTaskGraph.builder(handle.modId(), graphName, ThreadLocalRandom.current().nextLong());
+    }
+
+    public static QuantifiedTaskGraph.Builder graph(String modId, String graphName) {
+        QuantifiedHandle handle = resolveHandle(modId);
+        return QuantifiedTaskGraph.builder(handle.modId(), graphName, ThreadLocalRandom.current().nextLong());
+    }
+
+    public static <T> QuantifiedCompute.Builder<T> compute(String taskName) {
+        QuantifiedHandle handle = getHandle();
+        return QuantifiedCompute.builder(handle.modId(), taskName, ThreadLocalRandom.current().nextLong());
+    }
+
+    public static <T> QuantifiedCompute.Builder<T> compute(String modId, String taskName) {
+        QuantifiedHandle handle = resolveHandle(modId);
+        return QuantifiedCompute.builder(handle.modId(), taskName, ThreadLocalRandom.current().nextLong());
+    }
+
+    public static <T> QuantifiedVulkan.Builder<T> vulkan(String taskName) {
+        QuantifiedHandle handle = getHandle();
+        return QuantifiedVulkan.builder(handle.modId(), taskName, ThreadLocalRandom.current().nextLong());
+    }
+
+    public static <T> QuantifiedVulkan.Builder<T> vulkan(String modId, String taskName) {
+        QuantifiedHandle handle = resolveHandle(modId);
+        return QuantifiedVulkan.builder(handle.modId(), taskName, ThreadLocalRandom.current().nextLong());
+    }
+
+    public static <T> CompletableFuture<T> submitGraph(QuantifiedTaskGraph.Builder builder,
+                                                       QuantifiedTaskGraph.NodeHandle<T> terminal) {
+        Objects.requireNonNull(builder, "builder");
+        Objects.requireNonNull(terminal, "terminal");
+        QuantifiedHandle handle = resolveHandle(builder.modId());
+        return handle.submitGraph(builder, terminal);
+    }
+
+    public static CompletableFuture<Map<String, Object>> submitGraph(QuantifiedTaskGraph.Builder builder) {
+        Objects.requireNonNull(builder, "builder");
+        QuantifiedHandle handle = resolveHandle(builder.modId());
+        return handle.submitGraphAll(builder);
+    }
+
     public static <T> QuantifiedHybrid.Builder<T> hybridBuilder(String operationName, Supplier<T> work) {
         QuantifiedHandle handle = getHandle();
         return QuantifiedHybrid.builder(handle.modId(), operationName, work);
@@ -258,6 +308,19 @@ public final class QuantifiedAPI {
 
     public static java.util.Collection<ConnectedMod> getConnectedMods() {
         return new java.util.ArrayList<>(connectedMods.values());
+    }
+
+    public static void setGpuBackendPreference(String modId, GpuBackendPreference preference) {
+        QuantifiedHandle handle = resolveHandle(modId);
+        GpuBackendRouter.setModPreference(handle.modId(), preference);
+    }
+
+    public static GpuBackendPreference getGpuBackendPreference(String modId) {
+        if (modId == null || modId.isBlank()) {
+            QuantifiedHandle handle = getHandle();
+            return GpuBackendRouter.getModPreference(handle.modId());
+        }
+        return GpuBackendRouter.getModPreference(modId);
     }
 
     static ConnectedModImpl lookupConnectedMod(String modId) {

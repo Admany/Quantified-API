@@ -1,6 +1,78 @@
 # Quantified API Update Changelogs 
 
-## **No changes needed for mod authors**  
+## Existing mods don't need changes, but v1.4.0 adds new APIs endpoints and some backend controls.
+
+## v1.4.0 - Released on 2026-04-02
+
+### Quick summary :]
+
+- Vulkan has been added as a new GPU acceleration backend alongside OpenCL (OpenCL is now legacy, but I'll keep it for compatability reasons xd).
+- DAG execution was added so mods can submit dependency aware async workflows aka less clutter and makes performance go brrrrrr.
+- New public APIs, `QuantifiedCompute` and `QuantifiedVulkan`, allow ya to target CPU, OpenCL, Vulkak, or backend stuff from one interface.
+- The dashboard has been updated to fit new config options for Vulkan (and some UI elements).
+- GPU routing was tightened, because there was a bug, where GPU tasks went through the CPU... well that's not surprising XD
+
+---
+
+### Added
+
+- New Vulkan public API:
+  - `QuantifiedAPI.vulkan(...)`
+  - `QuantifiedVulkan`
+  - Vulkan helpers for vector addition, matrix multiplication, Monte Carlo Pi and so on
+- New backend agnostic compute builder:
+  - `QuantifiedAPI.compute(...)`
+  - `QuantifiedCompute`
+  - backend preference options like `preferVulkan()`, `preferOpenCL()`, `requireVulkan()`, `requireOpenCL()`, and `cpuOnly()`
+- New DAG/task graph API:
+  - `QuantifiedAPI.graph(...)`
+  - `QuantifiedTaskGraph`
+  - graph submission helpers for only terminal node or full graph execution (depends on the task)
+- New Vulkan backend routing and runtime surfaces:
+  - mod backend preference routing
+  - preferred GPU device selection (only on the webpanel)
+  - explicit Vulkan/OpenCL backend types and preferences (also webpanel)
+  - subprocess Vulkan probe path (because MC doesn't like me when I change thread mem sizes :L )
+- New build/runtime support for Vulkan:
+  - precompiled SPIR-V resources (less wait, and also makes the API smaller)
+  - embedded Vulkan probe helper (Read up xd)
+  - shader compiler pipeline in Forge 1.20.1 resources/build (Tbh nobody uses it on older versions xd)
+- New benchmark and test coverage:
+  - Vulkan vs OpenCL backend comparison benchmark (purely to see if vulkan is faster then OpenCL)
+  - Vulkan utility/runtime tests (to ensure it actually worky)
+  - task graph tests (to ensure DAG is DAGGING)
+  - backend router tests (to make sure that GPU work goes to the GPU, and NOT the CPU xd)
+
+---
+
+### What changed
+
+- `TaskScheduler`, `GpuTaskDispatcher`, so GPU work goes to the GPU rather to the CPU
+- Vulkan runtime now supports:
+  - real device probing (no false or imaginary devices xd)
+  - fallback-aware runtime status reporting (mostly for debug)
+  - delayed first-use initialization (sometimes LWGJL isn't ready instantly)
+  - multi-workspace execution instead of a single fixed submit/wait loop (allows to run multiple Vulkan GPU acceleration tasks at once, rather one at a time)
+- The Vulkan terrain path now returns a compact multi field summary per chunk. (I aint explaining xd)
+- OpenCL VRAM saturation handling now unloads caches and trims buffers instead of nuking the probe and handler....
+- The dashboard and web panel configuration was expanded with:
+  - backend preference controls (Vulkannn)
+  - Vulkan/OpenCL device selectors 
+  - active backend display in the overview (So yk if you're using VK or CL)
+  - richer GPU/Vulkan diagnostic information (so debugging is EASY)
+- Runtime logging has been significantly cleaned up. Vulkan probe failures, missing bindings, and backend fallbacks are easy to debug (Vulkan likes to be quite the a**hole)
+
+---
+
+### Stability/compatibility notes
+
+- Vulkan is optional. If Vulkan just decides to not work for some reason, it tries to fallback to OpenCL and if even that isn't available to the CPU.
+- Existing OpenCL integrations still work (no torture for anyone xd). I recommend using DAG tho.
+- Vulkan shader compilation no longer relies on runtime `shaderc`. Shaders are precompiled into SPIR-V during the build of the jar (smaller jar sizes yk)
+- The runtime now avoids several LWJGL and Vulkan initialization issues:
+  - duplicate probe messages spamming logs
+  - missing probe diagnostics (debugging would be hell without them)
+  - misleading "probe not yet run" fallback states (fun stuff)
 
 ## v1.3.0 - Released on 2026-03-07  
 
