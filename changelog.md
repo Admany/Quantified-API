@@ -8,7 +8,7 @@
 
 - Vulkan has been added as a new GPU acceleration backend alongside OpenCL (OpenCL is now legacy, but I'll keep it for compatability reasons xd).
 - DAG execution was added so mods can submit dependency aware async workflows aka less clutter and makes performance go brrrrrr.
-- New public APIs, `QuantifiedCompute` and `QuantifiedVulkan`, allow ya to target CPU, OpenCL, Vulkak, or backend stuff from one interface.
+- New public APIs, `QuantifiedCompute` and `QuantifiedVulkan`, allow ya to target CPU, OpenCL, Vulkan, or backend stuff from one interface.
 - The dashboard has been updated to fit new config options for Vulkan (and some UI elements).
 - GPU routing was tightened, because there was a bug, where GPU tasks went through the CPU... well that's not surprising XD
 
