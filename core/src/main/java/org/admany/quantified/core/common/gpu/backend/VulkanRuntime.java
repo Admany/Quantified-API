@@ -82,6 +82,12 @@ public final class VulkanRuntime {
                 device.softwareAdapter()))
             .toList();
         if (result.ok()) {
+            String conservativeBlockReason = conservativeBlockReason(devices);
+            if (conservativeBlockReason != null) {
+                LOGGER.warn(prefix(probeId) + conservativeBlockReason);
+                return new AvailabilitySnapshot(true, true, false,
+                    result.maxApiVersion(), result.selectedApiVersion(), conservativeBlockReason, devices);
+            }
             LOGGER.info(prefix(probeId) + "Isolated Vulkan probe succeeded with API "
                 + formatVersion(result.selectedApiVersion()));
             return new AvailabilitySnapshot(true, true, true,
@@ -93,6 +99,28 @@ public final class VulkanRuntime {
         LOGGER.warn(prefix(probeId) + reason);
         return new AvailabilitySnapshot(true, true, false,
             result.maxApiVersion(), result.selectedApiVersion(), reason, devices);
+    }
+
+    private static String conservativeBlockReason(List<ProbeDeviceInfo> devices) {
+        if (Boolean.getBoolean("quantified.vulkan.allowUnsafeLegacyNvidia")) {
+            return null;
+        }
+        if (devices == null || devices.isEmpty()) {
+            return null;
+        }
+        ProbeDeviceInfo primary = devices.get(0);
+        String vendor = primary.vendor() != null ? primary.vendor().toLowerCase(java.util.Locale.ROOT) : "";
+        if (!vendor.contains("nvidia")) {
+            return null;
+        }
+        long localMemoryBytes = primary.localMemoryBytes();
+        long conservativeThreshold = 3L * 1024L * 1024L * 1024L;
+        if (localMemoryBytes > 0 && localMemoryBytes <= conservativeThreshold) {
+            return "Vulkan conservatively disabled on low-VRAM NVIDIA adapters ("
+                + primary.name() + ", " + (localMemoryBytes / (1024 * 1024)) + " MiB local VRAM); "
+                + "OpenCL is preferred for stability. Set -Dquantified.vulkan.allowUnsafeLegacyNvidia=true to override.";
+        }
+        return null;
     }
 
     public static String formatVersion(int apiVersion) {

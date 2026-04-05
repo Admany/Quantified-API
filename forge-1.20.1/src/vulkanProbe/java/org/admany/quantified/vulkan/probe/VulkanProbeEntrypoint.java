@@ -4,17 +4,26 @@ import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VK11;
+import org.lwjgl.vulkan.VkCommandPoolCreateInfo;
 import org.lwjgl.vulkan.VkApplicationInfo;
+import org.lwjgl.vulkan.VkDevice;
+import org.lwjgl.vulkan.VkDeviceCreateInfo;
+import org.lwjgl.vulkan.VkDeviceQueueCreateInfo;
 import org.lwjgl.vulkan.VkInstance;
 import org.lwjgl.vulkan.VkInstanceCreateInfo;
 import org.lwjgl.vulkan.VkPhysicalDevice;
+import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
+import org.lwjgl.vulkan.VkQueue;
 import org.lwjgl.vulkan.VkQueueFamilyProperties;
 
 import java.nio.ByteBuffer;
+import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
+import java.nio.LongBuffer;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
@@ -116,7 +125,17 @@ public final class VulkanProbeEntrypoint {
             if (attempt.instance != null) {
                 try {
                     logDiagnostic("vkCreateInstance(" + formatVersion(apiVersion) + ") -> VK_SUCCESS");
-                    return Result.success(maxInstanceApi, apiVersion, enumerateDevices(attempt.instance));
+                    List<DeviceCandidate> candidates = enumerateDeviceCandidates(attempt.instance);
+                    List<DeviceInfo> devices = candidates.stream().map(DeviceCandidate::info).toList();
+                    BringUpAttempt bringUp = validateLogicalDeviceBringUp(candidates, apiVersion);
+                    if (bringUp.ok()) {
+                        return Result.success(maxInstanceApi, apiVersion, devices);
+                    }
+                    return Result.failed("logical_device_bringup_failed",
+                        "logical device bring-up failed: " + bringUp.detail(),
+                        maxInstanceApi,
+                        apiVersion,
+                        devices);
                 } finally {
                     VK10.vkDestroyInstance(attempt.instance, null);
                 }
@@ -145,7 +164,9 @@ public final class VulkanProbeEntrypoint {
         InstanceAttempt fallbackAttempt = tryCreateInstance(API_1_0);
         if (fallbackAttempt.instance != null) {
             try {
-                List<DeviceInfo> devices = enumerateDevices(fallbackAttempt.instance);
+                List<DeviceInfo> devices = enumerateDeviceCandidates(fallbackAttempt.instance).stream()
+                    .map(DeviceCandidate::info)
+                    .toList();
                 logDiagnostic("vkCreateInstance(1.0.0) -> VK_SUCCESS, devices=" + devices.size());
                 return Result.failed("version_query_failed",
                     "vkEnumerateInstanceVersion failed with " + vkResultName(queryResultCode)
@@ -177,7 +198,9 @@ public final class VulkanProbeEntrypoint {
         InstanceAttempt fallbackAttempt = tryCreateInstance(API_1_0);
         if (fallbackAttempt.instance != null) {
             try {
-                List<DeviceInfo> devices = enumerateDevices(fallbackAttempt.instance);
+                List<DeviceInfo> devices = enumerateDeviceCandidates(fallbackAttempt.instance).stream()
+                    .map(DeviceCandidate::info)
+                    .toList();
                 logDiagnostic("vkCreateInstance(1.0.0) -> VK_SUCCESS, devices=" + devices.size());
                 return Result.failed("api_too_old",
                     "Vulkan 1.2 or newer required (detected " + formatVersion(maxInstanceApi)
@@ -253,7 +276,7 @@ public final class VulkanProbeEntrypoint {
         }
     }
 
-    private static List<DeviceInfo> enumerateDevices(VkInstance instance) {
+    private static List<DeviceCandidate> enumerateDeviceCandidates(VkInstance instance) {
         IntBuffer deviceCount = null;
         PointerBuffer devices = null;
         try {
@@ -267,11 +290,12 @@ public final class VulkanProbeEntrypoint {
             if (secondResult != VK10.VK_SUCCESS) {
                 return List.of();
             }
-            List<DeviceInfo> result = new ArrayList<>(devices.capacity());
+            List<DeviceCandidate> result = new ArrayList<>(devices.capacity());
             for (int i = 0; i < devices.capacity(); i++) {
                 long handle = devices.get(i);
                 VkPhysicalDevice physicalDevice = new VkPhysicalDevice(handle, instance);
-                if (findComputeQueueFamily(physicalDevice) < 0) {
+                int computeQueueFamily = findComputeQueueFamily(physicalDevice);
+                if (computeQueueFamily < 0) {
                     continue;
                 }
                 VkPhysicalDeviceProperties properties = VkPhysicalDeviceProperties.calloc();
@@ -283,18 +307,25 @@ public final class VulkanProbeEntrypoint {
                     int deviceType = properties.deviceType();
                     long localMemoryBytes = queryDeviceLocalMemory(physicalDevice);
                     boolean softwareAdapter = isSoftwareAdapter(deviceName, vendorName, deviceType);
-                    result.add(new DeviceInfo(
+                    DeviceInfo info = new DeviceInfo(
                         buildDeviceId(vendorName, deviceName),
                         deviceName,
                         vendorName,
                         deviceType,
                         localMemoryBytes,
                         softwareAdapter
+                    );
+                    result.add(new DeviceCandidate(
+                        physicalDevice,
+                        computeQueueFamily,
+                        info,
+                        scoreDevice(deviceType, localMemoryBytes, softwareAdapter)
                     ));
                 } finally {
                     properties.free();
                 }
             }
+            result.sort(Comparator.comparingDouble(DeviceCandidate::score).reversed());
             return result;
         } finally {
             if (devices != null) {
@@ -302,6 +333,117 @@ public final class VulkanProbeEntrypoint {
             }
             if (deviceCount != null) {
                 MemoryUtil.memFree(deviceCount);
+            }
+        }
+    }
+
+    private static BringUpAttempt validateLogicalDeviceBringUp(List<DeviceCandidate> candidates, int apiVersion) {
+        if (candidates.isEmpty()) {
+            return BringUpAttempt.failed("no compute-capable physical devices found");
+        }
+        StringBuilder failures = new StringBuilder();
+        for (DeviceCandidate candidate : candidates) {
+            BringUpAttempt attempt = tryBringUpLogicalDevice(candidate, apiVersion);
+            logDiagnostic("vkCreateDevice(" + candidate.info().name() + ") -> " + attempt.detail());
+            if (attempt.ok()) {
+                return attempt;
+            }
+            if (failures.length() > 0) {
+                failures.append(", ");
+            }
+            failures.append(candidate.info().name()).append(": ").append(attempt.detail());
+        }
+        return BringUpAttempt.failed(failures.toString());
+    }
+
+    private static BringUpAttempt tryBringUpLogicalDevice(DeviceCandidate candidate, int apiVersion) {
+        FloatBuffer priorities = null;
+        VkDeviceQueueCreateInfo.Buffer queueInfos = null;
+        VkDeviceQueueCreateInfo queueInfo = null;
+        VkPhysicalDeviceFeatures features = null;
+        VkDeviceCreateInfo deviceInfo = null;
+        PointerBuffer devicePtr = null;
+        LongBuffer commandPoolPtr = null;
+        PointerBuffer queuePtr = null;
+        VkDevice device = null;
+        long commandPool = MemoryUtil.NULL;
+        try {
+            priorities = MemoryUtil.memAllocFloat(1).put(0, 1.0f);
+            queueInfos = VkDeviceQueueCreateInfo.calloc(1);
+            queueInfo = queueInfos.get(0)
+                .sType(VK10.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
+                .queueFamilyIndex(candidate.computeQueueFamily())
+                .pQueuePriorities(priorities);
+            features = VkPhysicalDeviceFeatures.calloc();
+            deviceInfo = VkDeviceCreateInfo.calloc()
+                .sType(VK10.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
+                .pQueueCreateInfos(queueInfos)
+                .pEnabledFeatures(features);
+            devicePtr = MemoryUtil.memAllocPointer(1);
+            int createDeviceResult = VK10.vkCreateDevice(candidate.physicalDevice(), deviceInfo, null, devicePtr);
+            if (createDeviceResult != VK10.VK_SUCCESS) {
+                return BringUpAttempt.failed("vkCreateDevice returned " + vkResultName(createDeviceResult));
+            }
+
+            device = new VkDevice(devicePtr.get(0), candidate.physicalDevice(), deviceInfo);
+            queuePtr = MemoryUtil.memAllocPointer(1);
+            VK10.vkGetDeviceQueue(device, candidate.computeQueueFamily(), 0, queuePtr);
+            VkQueue queue = new VkQueue(queuePtr.get(0), device);
+            if (queue.address() == MemoryUtil.NULL) {
+                return BringUpAttempt.failed("vkGetDeviceQueue returned NULL");
+            }
+
+            commandPoolPtr = MemoryUtil.memAllocLong(1);
+            VkCommandPoolCreateInfo poolInfo = VkCommandPoolCreateInfo.calloc()
+                .sType(VK10.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO)
+                .queueFamilyIndex(candidate.computeQueueFamily())
+                .flags(VK10.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT);
+            try {
+                int commandPoolResult = VK10.vkCreateCommandPool(device, poolInfo, null, commandPoolPtr);
+                if (commandPoolResult != VK10.VK_SUCCESS) {
+                    return BringUpAttempt.failed("vkCreateCommandPool returned " + vkResultName(commandPoolResult));
+                }
+                commandPool = commandPoolPtr.get(0);
+            } finally {
+                poolInfo.free();
+            }
+
+            return BringUpAttempt.ok(candidate.info().name());
+        } catch (Throwable throwable) {
+            return BringUpAttempt.failed(throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+        } finally {
+            if (device != null) {
+                try {
+                    if (commandPool != MemoryUtil.NULL) {
+                        VK10.vkDestroyCommandPool(device, commandPool, null);
+                    }
+                } catch (Throwable ignored) {
+                }
+                try {
+                    VK10.vkDestroyDevice(device, null);
+                } catch (Throwable ignored) {
+                }
+            }
+            if (queuePtr != null) {
+                MemoryUtil.memFree(queuePtr);
+            }
+            if (commandPoolPtr != null) {
+                MemoryUtil.memFree(commandPoolPtr);
+            }
+            if (devicePtr != null) {
+                MemoryUtil.memFree(devicePtr);
+            }
+            if (deviceInfo != null) {
+                deviceInfo.free();
+            }
+            if (features != null) {
+                features.free();
+            }
+            if (queueInfos != null) {
+                queueInfos.free();
+            }
+            if (priorities != null) {
+                MemoryUtil.memFree(priorities);
             }
         }
     }
@@ -460,6 +602,19 @@ public final class VulkanProbeEntrypoint {
         return normalized.isBlank() ? "unknown-vulkan-device" : normalized;
     }
 
+    private static double scoreDevice(int deviceType, long localMemoryBytes, boolean softwareAdapter) {
+        double score = localMemoryBytes;
+        if (softwareAdapter) {
+            score -= 10_000_000_000d;
+        }
+        if (deviceType == VK10.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            score += 3_000_000_000d;
+        } else if (deviceType == VK10.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+            score += 1_000_000_000d;
+        }
+        return score;
+    }
+
     private static String describeThrowable(Throwable throwable) {
         if (throwable == null) {
             return "Unknown Vulkan bootstrap failure";
@@ -504,6 +659,22 @@ public final class VulkanProbeEntrypoint {
     }
 
     private record InstanceAttempt(VkInstance instance, int resultCode, String detail) {
+    }
+
+    private record DeviceCandidate(VkPhysicalDevice physicalDevice,
+                                   int computeQueueFamily,
+                                   DeviceInfo info,
+                                   double score) {
+    }
+
+    private record BringUpAttempt(boolean ok, String detail) {
+        private static BringUpAttempt ok(String deviceName) {
+            return new BringUpAttempt(true, "VK_SUCCESS on " + deviceName);
+        }
+
+        private static BringUpAttempt failed(String detail) {
+            return new BringUpAttempt(false, detail);
+        }
     }
 
     private record VersionQuery(int resultCode, int version) {
