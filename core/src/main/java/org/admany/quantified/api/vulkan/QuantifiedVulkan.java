@@ -1,10 +1,10 @@
 package org.admany.quantified.api.vulkan;
 
 import org.admany.quantified.api.compute.GpuBackendPreference;
-import org.admany.quantified.core.common.gpu.backend.VulkanRuntime;
 import org.admany.quantified.api.opencl.QuantifiedOpenCL;
 import org.admany.quantified.core.common.util.TaskScheduler;
 import org.admany.quantified.core.common.vulkan.core.VulkanContext;
+import org.admany.quantified.core.common.vulkan.core.VulkanManager;
 
 import java.time.Duration;
 import java.util.Objects;
@@ -53,7 +53,7 @@ public final class QuantifiedVulkan {
     }
 
     public static boolean isGpuReady() {
-        return VulkanRuntime.isAvailable();
+        return VulkanManager.isAvailable();
     }
 
     public static final class Builder<T> {
@@ -284,7 +284,7 @@ public final class QuantifiedVulkan {
         if (a.length != b.length) {
             throw new IllegalArgumentException("Vector lengths must match: " + a.length + " vs " + b.length);
         }
-        if (!VulkanRuntime.isAvailable()) {
+        if (!VulkanManager.isAvailable()) {
             return QuantifiedOpenCL.parallelVectorAdd(modId, taskName, taskKey, a, b);
         }
         return QuantifiedVulkan.<float[]>builder(modId, taskName, taskKey)
@@ -324,7 +324,7 @@ public final class QuantifiedVulkan {
         if (a.length == 0 || b.length == 0 || a[0].length != b.length) {
             throw new IllegalArgumentException("Invalid matrix dimensions for multiplication");
         }
-        if (!VulkanRuntime.isAvailable()) {
+        if (!VulkanManager.isAvailable()) {
             return QuantifiedOpenCL.parallelMatrixMultiply(modId, taskName, taskKey, a, b);
         }
         int m = a.length;
@@ -371,7 +371,7 @@ public final class QuantifiedVulkan {
         if (samples <= 0) {
             throw new IllegalArgumentException("Samples must be positive: " + samples);
         }
-        if (!VulkanRuntime.isAvailable()) {
+        if (!VulkanManager.isAvailable()) {
             return QuantifiedOpenCL.parallelMonteCarloPi(modId, taskName, taskKey, samples);
         }
         return QuantifiedVulkan.<Double>builder(modId, taskName, taskKey)

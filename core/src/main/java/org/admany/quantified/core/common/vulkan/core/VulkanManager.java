@@ -81,10 +81,18 @@ public final class VulkanManager {
     private static final String MATRIX_MULTIPLY_SHADER_RESOURCE = "/quantified/shaders/vulkan/matrix_multiply.comp.spv";
     private static final String MONTE_CARLO_PI_SHADER_RESOURCE = "/quantified/shaders/vulkan/monte_carlo_pi.comp.spv";
     private static final String TERRAIN_GENERATION_SHADER_RESOURCE = "/quantified/shaders/vulkan/terrain_generation.comp.spv";
+    private static final String AUTO_RUNTIME_INIT_PROPERTY = "quantified.vulkan.autoRuntimeInit";
 
     private static final AtomicBoolean INITIALIZED = new AtomicBoolean(false);
     private static final Object INIT_MUTEX = new Object();
     private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(MAX_IN_FLIGHT_WORKSPACES, new VulkanThreadFactory());
+    private static final ExecutorService INIT_EXECUTOR = Executors.newSingleThreadExecutor(
+        runnable -> LwjglRuntimeTuning.newDaemonThread(
+            runnable,
+            "Quantified-Vulkan-Init",
+            LwjglRuntimeTuning.gpuThreadStackSizeKb()
+        )
+    );
     private static final ExecutorService PROBE_EXECUTOR = Executors.newSingleThreadExecutor(
         runnable -> LwjglRuntimeTuning.newDaemonThread(
             runnable,
@@ -94,7 +102,9 @@ public final class VulkanManager {
     );
     private static final AtomicReference<String> PREFERRED_DEVICE = new AtomicReference<>();
     private static final AtomicReference<CompletableFuture<Boolean>> ACTIVE_PROBE = new AtomicReference<>();
+    private static final AtomicReference<CompletableFuture<Boolean>> ACTIVE_INIT = new AtomicReference<>();
     private static final AtomicBoolean VULKAN_PROBING = new AtomicBoolean(false);
+    private static final AtomicBoolean DEFERRED_RUNTIME_INIT_LOGGED = new AtomicBoolean(false);
 
     private static volatile State state;
     private static volatile RuntimeStatus lastStatus = RuntimeStatus.failed("Vulkan not initialized");
@@ -126,6 +136,11 @@ public final class VulkanManager {
     public static boolean isProbeRunning() {
         CompletableFuture<Boolean> active = ACTIVE_PROBE.get();
         return VULKAN_PROBING.get() || (active != null && !active.isDone());
+    }
+
+    public static boolean isRuntimeWarmupRunning() {
+        CompletableFuture<Boolean> active = ACTIVE_INIT.get();
+        return active != null && !active.isDone();
     }
 
     public static CompletableFuture<Boolean> forceProbe() {
@@ -210,6 +225,52 @@ public final class VulkanManager {
             DeveloperOverlayManager.recordApiLog("[Vulkan] Probe failed - Unknown reason");
         }
         return false;
+    }
+
+    public static CompletableFuture<Boolean> warmupAsync() {
+        return warmupAsync("manual");
+    }
+
+    public static CompletableFuture<Boolean> warmupAsync(String reason) {
+        if (INITIALIZED.get() && state != null) {
+            return CompletableFuture.completedFuture(true);
+        }
+        if (isInitRetryCoolingDown()) {
+            return CompletableFuture.completedFuture(false);
+        }
+        CompletableFuture<Boolean> existing = ACTIVE_INIT.get();
+        if (existing != null && !existing.isDone()) {
+            return existing;
+        }
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
+        if (!ACTIVE_INIT.compareAndSet(existing, future)) {
+            CompletableFuture<Boolean> concurrent = ACTIVE_INIT.get();
+            return concurrent != null ? concurrent : future;
+        }
+
+        String triggerReason = reason != null && !reason.isBlank() ? reason : "manual";
+        lastStatus = RuntimeStatus.failed("Vulkan runtime initialization queued (" + triggerReason + ")");
+        LOGGER.info("Vulkan runtime initialization queued (" + triggerReason + ")");
+        DeveloperOverlayManager.recordApiLog("[Vulkan] Runtime warmup queued (" + triggerReason + ")");
+        INIT_EXECUTOR.submit(() -> {
+            try {
+                boolean initialized = ensureInitialised();
+                if (initialized) {
+                    DEFERRED_RUNTIME_INIT_LOGGED.set(false);
+                    DeveloperOverlayManager.recordApiLog("[Vulkan] Runtime ready - " + deviceName());
+                }
+                future.complete(initialized);
+            } catch (Throwable throwable) {
+                String detail = describeThrowable(throwable);
+                lastStatus = RuntimeStatus.failed("Vulkan runtime warmup failed: " + detail);
+                LOGGER.warn("Vulkan runtime warmup failed (" + triggerReason + ")", throwable);
+                DeveloperOverlayManager.recordApiLog("[Vulkan] Runtime warmup failed (" + triggerReason + ") - " + detail);
+                future.complete(false);
+            } finally {
+                ACTIVE_INIT.compareAndSet(future, null);
+            }
+        });
+        return future;
     }
 
     public static boolean ensureInitialised() {
@@ -332,15 +393,25 @@ public final class VulkanManager {
         if (task == null) {
             return false;
         }
-        if (!INITIALIZED.get() || state == null) {
-            return !isInitRetryCoolingDown()
-                && VulkanRuntime.isAvailable()
-                && task.estimatedVramBytes() <= MAX_ACCEPTED_VRAM_BYTES;
-        }
-        if (!isAvailable()) {
+        if (task.estimatedVramBytes() > MAX_ACCEPTED_VRAM_BYTES) {
             return false;
         }
-        if (task.estimatedVramBytes() > MAX_ACCEPTED_VRAM_BYTES) {
+        if (!INITIALIZED.get() || state == null) {
+            if (isInitRetryCoolingDown() || !VulkanRuntime.isAvailable()) {
+                return false;
+            }
+            if (Boolean.getBoolean(AUTO_RUNTIME_INIT_PROPERTY)) {
+                warmupAsync("auto-runtime-init");
+            } else if (DEFERRED_RUNTIME_INIT_LOGGED.compareAndSet(false, true)) {
+                String message = "Vulkan probe is available, but the runtime isn't ready yet, deffering tasks to the CPU."
+                    + "Set -D" + AUTO_RUNTIME_INIT_PROPERTY + "=true to allow automatic runtime warmup.";
+                lastStatus = RuntimeStatus.failed(message);
+                LOGGER.info(message);
+                DeveloperOverlayManager.recordApiLog("[Vulkan] Runtime init has been deferred. Batches will fall back to the CPU until runtime is ready.");
+            }
+            return false;
+        }
+        if (!isAvailable()) {
             return false;
         }
         if (EXECUTOR instanceof java.util.concurrent.ThreadPoolExecutor executor) {
