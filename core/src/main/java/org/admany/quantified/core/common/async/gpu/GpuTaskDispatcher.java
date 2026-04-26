@@ -114,9 +114,6 @@ public final class GpuTaskDispatcher {
         if (!metadata.batchable()) {
             return true;
         }
-        if (metadata.gpuRequired()) {
-            return true;
-        }
         if (bucket.size >= metadata.maximumBatchSize()) {
             return true;
         }
@@ -138,9 +135,6 @@ public final class GpuTaskDispatcher {
     private long computeDelayMillis(TaskMetadata metadata) {
         if (metadata == null) {
             return MIN_FLUSH_DELAY_MILLIS;
-        }
-        if (metadata.gpuRequired()) {
-            return 0L;
         }
         double cost = Math.max(0.5, metadata.estimatedCost());
         long delay = (long) Math.ceil(cost);

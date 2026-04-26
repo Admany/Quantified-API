@@ -1,9 +1,247 @@
+buildscript {
+    repositories {
+        mavenCentral()
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+    }
+    dependencies {
+        classpath 'com.google.code.gson:gson:2.10.1'
+    }
+    configurations.classpath {
+        resolutionStrategy.force 'com.google.code.gson:gson:2.10.1'
+    }
+}
+
 allprojects {
     repositories {
         mavenCentral()
         maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        maven {
             name = 'MinecraftForge'
             url = 'https://maven.minecraftforge.net/'
         }
+    }
+}
+
+tasks.register('buildFabric1201', GradleBuild) {
+    dir = file('platforms/fabric-1.20.1')
+    tasks = ['build']
+}
+
+tasks.register('compileFabric1201', GradleBuild) {
+    dir = file('platforms/fabric-1.20.1')
+    tasks = ['compileJava']
+}
+
+tasks.register('buildFabric1211', GradleBuild) {
+    dir = file('platforms/fabric-1.21.1')
+    tasks = ['build']
+}
+
+tasks.register('compileFabric1211', GradleBuild) {
+    dir = file('platforms/fabric-1.21.1')
+    tasks = ['compileJava']
+}
+
+tasks.register('buildNeoForge1211', GradleBuild) {
+    dir = file('platforms/neoforge-1.21.1')
+    tasks = ['build']
+}
+
+tasks.register('universalJar1201', Zip) {
+    group = 'build'
+    description = 'Builds a Forge/Fabric universal jar for Minecraft 1.20.1.'
+
+    dependsOn ':forge-1.20.1:reobfJar'
+    dependsOn 'buildFabric1201'
+
+    archiveBaseName.set("${mod_name}-universal-1.20.1".toLowerCase())
+    archiveVersion.set(mod_version)
+    archiveExtension.set('jar')
+    destinationDirectory.set(layout.buildDirectory.dir('libs'))
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+
+    def forgeJar = project(':forge-1.20.1').tasks.named('shadowJar').flatMap { it.archiveFile }
+    def fabricJar = layout.projectDirectory.file("platforms/fabric-1.20.1/build/libs/${mod_name.toLowerCase()}-fabric-1.20.1-${mod_version}.jar")
+
+    from(provider { zipTree(forgeJar.get().asFile) })
+    from(provider { zipTree(fabricJar.asFile) }) {
+        include 'fabric.mod.json'
+        include 'quantified.accesswidener'
+        include 'org/admany/quantified/core/fabric/**'
+    }
+}
+
+tasks.register('universalJar1211', Zip) {
+    group = 'build'
+    description = 'Builds a Forge/Fabric/NeoForge universal jar for Minecraft 1.21.1.'
+
+    dependsOn ':forge-1.21.1:shadowJar'
+    dependsOn 'buildFabric1211'
+    dependsOn 'buildNeoForge1211'
+
+    archiveBaseName.set("${mod_name}-universal-1.21.1".toLowerCase())
+    archiveVersion.set(mod_version)
+    archiveExtension.set('jar')
+    destinationDirectory.set(layout.buildDirectory.dir('libs'))
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+
+    def forgeJar = project(':forge-1.21.1').tasks.named('shadowJar').flatMap { it.archiveFile }
+    def fabricJar = layout.projectDirectory.file("platforms/fabric-1.21.1/build/libs/${mod_name.toLowerCase()}-fabric-1.21.1-${mod_version}.jar")
+    def neoForgeJar = layout.projectDirectory.file("platforms/neoforge-1.21.1/build/libs/${mod_name.toLowerCase()}-neoforge-1.21.1-${mod_version}.jar")
+
+    from(provider { zipTree(forgeJar.get().asFile) })
+    from(provider { zipTree(fabricJar.asFile) }) {
+        include 'fabric.mod.json'
+        include 'quantified.accesswidener'
+        include 'org/admany/quantified/core/fabric/**'
+    }
+    from(provider { zipTree(neoForgeJar.asFile) }) {
+        include 'META-INF/neoforge.mods.toml'
+        include 'org/admany/quantified/core/neoforge/**'
+    }
+}
+
+tasks.register('buildUniversal') {
+    group = 'build'
+    description = 'Builds every configured universal jar.'
+    dependsOn 'universalJar1201'
+    dependsOn 'universalJar1211'
+    dependsOn 'omniversalJar'
+}
+
+// ── Omni jar (all loaders, all versions) ─────────────────────────────────────
+
+def omniResourcesDir = layout.buildDirectory.dir('generated/omniResources')
+
+tasks.register('generateOmniResources') {
+    inputs.properties([
+        'mod_id'              : project.property('mod_id'),
+        'mod_name'            : project.property('mod_name'),
+        'mod_version'         : project.property('mod_version'),
+        'mod_authors'         : project.property('mod_authors'),
+        'mod_license'         : project.property('mod_license'),
+        'mod_description'     : project.property('mod_description'),
+        'fabric_loader_version': project.property('fabric_loader_version'),
+    ])
+    outputs.dir(omniResourcesDir)
+    doLast {
+        def outDir   = omniResourcesDir.get().asFile
+        def metaInf  = new File(outDir, 'META-INF')
+        metaInf.mkdirs()
+
+        def modId          = project.property('mod_id')
+        def modName        = project.property('mod_name')
+        def modVersion     = project.property('mod_version')
+        def modAuthors     = project.property('mod_authors')
+        def modLicense     = project.property('mod_license')
+        def modDesc        = project.property('mod_description')
+        def fabricLoader   = project.property('fabric_loader_version')
+
+        // Merged mods.toml — covers Forge 47.x (1.20.1) and 52.x (1.21.1)
+        new File(metaInf, 'mods.toml').text = """\
+modLoader="javafml"
+loaderVersion="[47,)"
+license="${modLicense}"
+
+[[mods]]
+modId="${modId}"
+version="${modVersion}"
+displayName="${modName}"
+authors="${modAuthors}"
+description=\'\'\'${modDesc}\'\'\'
+
+[[dependencies.${modId}]]
+    modId="forge"
+    mandatory=true
+    versionRange="[47,)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.${modId}]]
+    modId="minecraft"
+    mandatory=true
+    versionRange="[1.20.1,1.22)"
+    ordering="NONE"
+    side="BOTH"
+"""
+
+        // Merged fabric.mod.json — covers Fabric 1.20.1 and 1.21.1
+        new File(outDir, 'fabric.mod.json').text = """\
+{
+  "schemaVersion": 1,
+  "id": "${modId}",
+  "version": "${modVersion}",
+  "name": "${modName}",
+  "description": "${modDesc}",
+  "authors": [
+    "${modAuthors}"
+  ],
+  "license": "${modLicense}",
+  "icon": "quantifiedapi.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "org.admany.quantified.core.fabric.QuantifiedCoreFabric"
+    ],
+    "client": [
+      "org.admany.quantified.core.fabric.QuantifiedCoreFabricClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=${fabricLoader}",
+    "minecraft": ">=1.20.1 <1.22",
+    "fabric-api": "*"
+  }
+}
+"""
+    }
+}
+
+tasks.register('omniversalJar', Zip) {
+    group = 'build'
+    description = 'Builds a single jar for all loaders across both MC 1.20.1 and 1.21.1.'
+
+    dependsOn 'universalJar1201'
+    dependsOn 'universalJar1211'
+    dependsOn 'generateOmniResources'
+
+    archiveBaseName.set("${mod_name}-omni".toLowerCase())
+    archiveVersion.set(mod_version)
+    archiveExtension.set('jar')
+    destinationDirectory.set(layout.buildDirectory.dir('libs'))
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+
+    def jar1201   = layout.buildDirectory.file("libs/${mod_name.toLowerCase()}-universal-1.20.1-${mod_version}.jar")
+    def jar1211   = layout.buildDirectory.file("libs/${mod_name.toLowerCase()}-universal-1.21.1-${mod_version}.jar")
+
+    // 1) Merged metadata wins (listed first → EXCLUDE keeps these)
+    from(omniResourcesDir)
+
+    // 2) 1.20.1 as the class base (Java 17 bytecode — runs on both Java 17 and 21)
+    //    Skip the per-version metadata files that are replaced by the merged ones above.
+    from(provider { zipTree(jar1201.get().asFile) }) {
+        exclude 'META-INF/mods.toml'
+        exclude 'fabric.mod.json'
+    }
+
+    // 3) 1.21.1-exclusive content: NeoForge classes + its metadata.
+    //    These classes are Java 21 bytecode and are only loaded when NeoForge 1.21.1
+    //    is active (i.e. on a Java 21 JVM), so they are safe to include alongside
+    //    the Java 17 base classes.
+    from(provider { zipTree(jar1211.get().asFile) }) {
+        include 'META-INF/neoforge.mods.toml'
+        include 'org/admany/quantified/core/neoforge/**'
     }
 }

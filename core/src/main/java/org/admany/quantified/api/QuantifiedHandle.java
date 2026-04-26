@@ -9,8 +9,8 @@ import org.admany.quantified.core.common.cache.CacheManager;
 import org.admany.quantified.core.common.cache.interfaces.ThreadSafeCache;
 import org.admany.quantified.core.common.network.NetworkManager;
 import org.admany.quantified.core.common.network.SecureChannel;
+import org.admany.quantified.core.common.platform.QuantifiedCoreRuntime;
 import org.admany.quantified.core.common.telemetry.Metrics;
-import org.admany.quantified.core.forge.QuantifiedCoreForge;
 import org.admany.quantified.core.common.util.ConnectedModImpl;
 import org.admany.quantified.core.common.util.TaskScheduler;
 import org.admany.quantified.api.interfaces.ModCacheManager;
@@ -101,7 +101,7 @@ public final class QuantifiedHandle {
         if (modMetrics != null) {
             modMetrics.recordTaskSubmitted();
         }
-        QuantifiedCoreForge.touchMod(modId);
+        QuantifiedCoreRuntime.touchMod(modId);
         long key = ThreadLocalRandom.current().nextLong();
         Duration timeout = task.timeout().orElse(null);
         PriorityTaskType resolvedPriority = resolvePriority(task);
@@ -139,7 +139,7 @@ public final class QuantifiedHandle {
         );
         return future.whenComplete((result, throwable) -> {
             long durationNanos = System.nanoTime() - startTimeNanos;
-            QuantifiedCoreForge.touchMod(modId);
+            QuantifiedCoreRuntime.touchMod(modId);
             if (throwable == null) {
                 tasksSucceeded.incrementAndGet();
                 Metrics.increment("quantified_api_tasks_success");
@@ -170,7 +170,7 @@ public final class QuantifiedHandle {
                 if (modMetrics != null) {
                     modMetrics.recordCacheHit();
                 }
-                QuantifiedCoreForge.touchMod(modId);
+                QuantifiedCoreRuntime.touchMod(modId);
                 return CompletableFuture.completedFuture(cached);
             }
             cacheMisses.incrementAndGet();
@@ -211,7 +211,7 @@ public final class QuantifiedHandle {
             if (modMetrics != null) {
                 modMetrics.recordCacheHit();
             }
-            QuantifiedCoreForge.touchMod(modId);
+            QuantifiedCoreRuntime.touchMod(modId);
             return cached;
         }
         cacheMisses.incrementAndGet();
@@ -220,7 +220,7 @@ public final class QuantifiedHandle {
         }
         T computed = loader.get();
         if (computed == null) {
-            QuantifiedCoreForge.touchMod(modId);
+            QuantifiedCoreRuntime.touchMod(modId);
             return null;
         }
         cache.put(key, computed);
@@ -228,7 +228,7 @@ public final class QuantifiedHandle {
             modMetrics.recordCacheEntryAdded();
             refreshModCacheTotals(modMetrics);
         }
-        QuantifiedCoreForge.touchMod(modId);
+        QuantifiedCoreRuntime.touchMod(modId);
         return computed;
     }
 
@@ -247,7 +247,7 @@ public final class QuantifiedHandle {
             if (modMetrics != null) {
                 modMetrics.recordCacheHit();
             }
-            QuantifiedCoreForge.touchMod(modId);
+            QuantifiedCoreRuntime.touchMod(modId);
             return CompletableFuture.completedFuture(cached);
         }
 
@@ -277,7 +277,7 @@ public final class QuantifiedHandle {
             true,
             modId
         ).whenComplete((result, throwable) -> {
-            QuantifiedCoreForge.touchMod(modId);
+            QuantifiedCoreRuntime.touchMod(modId);
             if (throwable == null && result != null && modMetrics != null) {
                 modMetrics.recordCacheEntryAdded();
                 refreshModCacheTotals(modMetrics);
@@ -321,7 +321,7 @@ public final class QuantifiedHandle {
             failed,
             hits,
             misses,
-            Optional.ofNullable(QuantifiedCoreForge.getModInfo(modId)).map(info -> info.lastActivity).orElse(0L)
+            Optional.ofNullable(QuantifiedCoreRuntime.getModInfo(modId)).map(info -> info.lastActivity).orElse(0L)
         );
     }
 

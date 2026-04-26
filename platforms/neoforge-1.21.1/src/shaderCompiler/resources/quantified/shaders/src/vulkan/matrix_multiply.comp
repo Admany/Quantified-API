@@ -1,0 +1,32 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(std430, set = 0, binding = 0) readonly buffer InA { float a[]; };
+layout(std430, set = 0, binding = 1) readonly buffer InB { float b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer OutC { float c[]; };
+layout(push_constant) uniform Push { int m; int n; int p; } pushData;
+shared float tileA[16][16];
+shared float tileB[16][16];
+void main() {
+    int row = int(gl_GlobalInvocationID.x);
+    int col = int(gl_GlobalInvocationID.y);
+    int localRow = int(gl_LocalInvocationID.x);
+    int localCol = int(gl_LocalInvocationID.y);
+    float sum = 0.0;
+    int tiles = (pushData.p + 15) / 16;
+    for (int tile = 0; tile < tiles; tile++) {
+        int aCol = tile * 16 + localCol;
+        int bRow = tile * 16 + localRow;
+        tileA[localRow][localCol] =
+            (row < pushData.m && aCol < pushData.p) ? a[row * pushData.p + aCol] : 0.0;
+        tileB[localRow][localCol] =
+            (bRow < pushData.p && col < pushData.n) ? b[bRow * pushData.n + col] : 0.0;
+        barrier();
+        for (int k = 0; k < 16; k++) {
+            sum += tileA[localRow][k] * tileB[k][localCol];
+        }
+        barrier();
+    }
+    if (row < pushData.m && col < pushData.n) {
+        c[row * pushData.n + col] = sum;
+    }
+}

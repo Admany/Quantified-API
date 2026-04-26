@@ -566,7 +566,7 @@ public class ConnectedModImpl implements ConnectedMod {
                 return future;
             }
 
-            NetworkManager networkManager = org.admany.quantified.core.forge.QuantifiedCoreForge.getNetworkManager();
+            NetworkManager networkManager = org.admany.quantified.core.common.platform.QuantifiedCoreRuntime.getNetworkManager();
             if (networkManager == null) {
                 CompletableFuture<Void> future = new CompletableFuture<>();
                 future.completeExceptionally(new IllegalStateException("Network manager not available"));
@@ -597,7 +597,7 @@ public class ConnectedModImpl implements ConnectedMod {
                 return future;
             }
 
-            NetworkManager networkManager = org.admany.quantified.core.forge.QuantifiedCoreForge.getNetworkManager();
+            NetworkManager networkManager = org.admany.quantified.core.common.platform.QuantifiedCoreRuntime.getNetworkManager();
             if (networkManager == null) {
                 CompletableFuture<Void> future = new CompletableFuture<>();
                 future.completeExceptionally(new IllegalStateException("Network manager not available"));
@@ -625,7 +625,7 @@ public class ConnectedModImpl implements ConnectedMod {
                 return future;
             }
 
-            NetworkManager networkManager = org.admany.quantified.core.forge.QuantifiedCoreForge.getNetworkManager();
+            NetworkManager networkManager = org.admany.quantified.core.common.platform.QuantifiedCoreRuntime.getNetworkManager();
             if (networkManager == null) {
                 CompletableFuture<T> future = new CompletableFuture<>();
                 future.completeExceptionally(new IllegalStateException("Network manager not available"));

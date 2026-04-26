@@ -1,7 +1,7 @@
 package org.admany.quantified.core.common.resilience;
 
-import org.admany.quantified.core.forge.QuantifiedCoreForge;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
+import org.admany.quantified.core.common.platform.QuantifiedCoreRuntime;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -73,7 +73,7 @@ public class AutoHealthChecker {
 
         registerHealthCheck("mods_connected", Duration.ofMinutes(2), () -> {
             try {
-                var mods = QuantifiedCoreForge.getRegisteredMods();
+                var mods = QuantifiedCoreRuntime.getRegisteredMods();
                 return !mods.isEmpty();
             } catch (Exception e) {
                 return false;

@@ -5,7 +5,7 @@ import org.admany.quantified.core.common.cache.interfaces.ThreadSafeCache;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.opencl.task.FluidAdvectionTask;
 import org.admany.quantified.core.common.opencl.task.HistogramTask;
-import org.admany.quantified.core.forge.QuantifiedCoreForge;
+import org.admany.quantified.core.common.platform.QuantifiedCoreRuntime;
 
 import java.time.Duration;
 import java.util.Random;
@@ -135,7 +135,7 @@ public final class StressTestController {
                     0.0,
                     0.0,
                     0.0,
-                    QuantifiedCoreForge.MODID
+                    QuantifiedCoreRuntime.MODID
                 ));
             }
             if (recordCycle) {
@@ -352,7 +352,7 @@ public final class StressTestController {
         for (int i = 0; i < 16; i++) { // Increased for better GPU stress
             int[] data = RANDOM.ints(2048, 0, 2048).toArray();
             HistogramTask histogramTask = new HistogramTask.Builder(
-                QuantifiedCoreForge.MODID,
+                QuantifiedCoreRuntime.MODID,
                 "dev_gpu_test_histogram",
                 taskIdCounter.incrementAndGet(),
                 data
@@ -386,7 +386,7 @@ public final class StressTestController {
                 }
             }
             FluidAdvectionTask fluidTask = new FluidAdvectionTask.Builder(
-                QuantifiedCoreForge.MODID,
+                QuantifiedCoreRuntime.MODID,
                 "dev_gpu_test_fluid",
                 taskIdCounter.incrementAndGet(),
                 grid

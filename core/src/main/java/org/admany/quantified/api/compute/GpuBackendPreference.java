@@ -27,4 +27,14 @@ public enum GpuBackendPreference {
     public boolean isCpuOnly() {
         return this == CPU_ONLY;
     }
+
+    public String displayLabel() {
+        return switch (this) {
+            case AUTO, VULKAN_PREFERRED -> "Auto (Vulkan first)";
+            case OPENCL_PREFERRED -> "OpenCL preferred";
+            case VULKAN_REQUIRED -> "Vulkan only";
+            case OPENCL_REQUIRED -> "OpenCL only";
+            case CPU_ONLY -> "CPU only";
+        };
+    }
 }

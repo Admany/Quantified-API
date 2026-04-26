@@ -1,5 +1,9 @@
 pluginManagement {
     repositories {
+        maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
         gradlePluginPortal()
         maven {
             name = 'MinecraftForge'
@@ -16,6 +20,10 @@ dependencyResolutionManagement {
     repositories {
         mavenCentral()
         maven {
+            name = 'Fabric'
+            url = 'https://maven.fabricmc.net/'
+        }
+        maven {
             name = 'MinecraftForge'
             url = 'https://maven.minecraftforge.net/'
         }
@@ -23,6 +31,8 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = 'quantified-api'
-include 'forge-1.18.2'
-include 'forge-1.19.2'
 include 'forge-1.20.1'
+include 'forge-1.21.1'
+
+project(':forge-1.20.1').projectDir = file('platforms/forge-1.20.1')
+project(':forge-1.21.1').projectDir = file('platforms/forge-1.21.1')

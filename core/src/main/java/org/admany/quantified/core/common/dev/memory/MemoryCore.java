@@ -1,8 +1,7 @@
 package org.admany.quantified.core.common.dev.memory;
 
-import net.minecraft.core.BlockPos;
-import net.minecraft.world.level.block.state.BlockState;
-
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Method;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
@@ -10,7 +9,7 @@ public final class MemoryCore {
 
     private static final ThreadLocal<BlockPosPool> blockPosPool = ThreadLocal.withInitial(BlockPosPool::new);
     private static final ThreadLocal<BlockStatePool> blockStatePool = ThreadLocal.withInitial(BlockStatePool::new);
-    private static final ConcurrentHashMap<BlockState, Integer> blockStateFrequency = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Object, Integer> blockStateFrequency = new ConcurrentHashMap<>();
 
     private MemoryCore() {}
 
@@ -22,12 +21,11 @@ public final class MemoryCore {
         return blockStatePool.get();
     }
 
-    public static void recordBlockStateUsage(BlockState state) {
+    public static void recordBlockStateUsage(Object state) {
         blockStateFrequency.merge(state, 1, Integer::sum);
     }
 
-
-    public static BlockState getFrequentBlockState() {
+    public static Object getFrequentBlockState() {
         return blockStateFrequency.entrySet().stream()
             .max(java.util.Map.Entry.comparingByValue())
             .map(java.util.Map.Entry::getKey)
@@ -35,19 +33,21 @@ public final class MemoryCore {
     }
 
     public static class BlockPosPool {
-        private final ConcurrentLinkedQueue<BlockPos.MutableBlockPos> pool = new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<Object> pool = new ConcurrentLinkedQueue<>();
 
-        public BlockPos.MutableBlockPos acquire(int x, int y, int z) {
-            BlockPos.MutableBlockPos pos = pool.poll();
+        public Object acquire(int x, int y, int z) {
+            Object pos = pool.poll();
             if (pos == null) {
-                pos = new BlockPos.MutableBlockPos();
+                pos = newMutableBlockPos();
             }
-            pos.set(x, y, z);
+            setPosition(pos, x, y, z);
             return pos;
         }
 
-        public void release(BlockPos.MutableBlockPos pos) {
-            pool.offer(pos);
+        public void release(Object pos) {
+            if (pos != null) {
+                pool.offer(pos);
+            }
         }
 
         public int size() {
@@ -56,13 +56,13 @@ public final class MemoryCore {
     }
 
     public static class BlockStatePool {
-        private final ConcurrentLinkedQueue<BlockState> pool = new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<Object> pool = new ConcurrentLinkedQueue<>();
 
-        public BlockState acquire() {
+        public Object acquire() {
             return pool.poll();
         }
 
-        public void release(BlockState state) {
+        public void release(Object state) {
             if (state != null) {
                 pool.offer(state);
             }
@@ -70,6 +70,25 @@ public final class MemoryCore {
 
         public int size() {
             return pool.size();
+        }
+    }
+
+    private static Object newMutableBlockPos() {
+        try {
+            Class<?> mutable = Class.forName("net.minecraft.core.BlockPos$MutableBlockPos");
+            Constructor<?> ctor = mutable.getConstructor();
+            return ctor.newInstance();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Minecraft MutableBlockPos is unavailable", e);
+        }
+    }
+
+    private static void setPosition(Object pos, int x, int y, int z) {
+        try {
+            Method set = pos.getClass().getMethod("set", int.class, int.class, int.class);
+            set.invoke(pos, x, y, z);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Failed to update Minecraft MutableBlockPos reflectively", e);
         }
     }
 }

@@ -923,11 +923,11 @@ public final class DeveloperDashboardServer {
 
     private static JsonArray buildGpuBackendOptions() {
         JsonArray options = new JsonArray();
-        options.add(selectOption(GpuBackendPreference.VULKAN_PREFERRED.name(), "Auto (Vulkan first)"));
-        options.add(selectOption(GpuBackendPreference.OPENCL_PREFERRED.name(), "OpenCL preferred"));
-        options.add(selectOption(GpuBackendPreference.VULKAN_REQUIRED.name(), "Vulkan only"));
-        options.add(selectOption(GpuBackendPreference.OPENCL_REQUIRED.name(), "OpenCL only"));
-        options.add(selectOption(GpuBackendPreference.CPU_ONLY.name(), "CPU only"));
+        options.add(selectOption(GpuBackendPreference.VULKAN_PREFERRED.name(), GpuBackendPreference.VULKAN_PREFERRED.displayLabel()));
+        options.add(selectOption(GpuBackendPreference.OPENCL_PREFERRED.name(), GpuBackendPreference.OPENCL_PREFERRED.displayLabel()));
+        options.add(selectOption(GpuBackendPreference.VULKAN_REQUIRED.name(), GpuBackendPreference.VULKAN_REQUIRED.displayLabel()));
+        options.add(selectOption(GpuBackendPreference.OPENCL_REQUIRED.name(), GpuBackendPreference.OPENCL_REQUIRED.displayLabel()));
+        options.add(selectOption(GpuBackendPreference.CPU_ONLY.name(), GpuBackendPreference.CPU_ONLY.displayLabel()));
         return options;
     }
 
@@ -1018,6 +1018,10 @@ public final class DeveloperDashboardServer {
                 if ((gpuAccelerationChanged || gpuPreferenceChanged || vulkanDeviceChanged) && VulkanRuntime.hasBindings()) {
                     VulkanProbeScheduler.triggerProbe("dashboard-config");
                 }
+                if ((gpuAccelerationChanged || gpuPreferenceChanged || vulkanDeviceChanged) && VulkanRuntime.hasBindings()
+                    && shouldWarmupVulkanAfterConfig(updatedGpuPreference)) {
+                    VulkanManager.warmupAsync("dashboard-config");
+                }
                 if (gpuAccelerationChanged || gpuPreferenceChanged || openclDeviceChanged) {
                     AsyncProbeScheduler.triggerProbe("dashboard-config");
                 }
@@ -1032,6 +1036,19 @@ public final class DeveloperDashboardServer {
             return null;
         }
         return "auto".equalsIgnoreCase(deviceId.trim()) ? null : deviceId;
+    }
+
+    private static boolean shouldWarmupVulkanAfterConfig(String gpuPreference) {
+        if (gpuPreference == null || gpuPreference.isBlank()) {
+            return true;
+        }
+        try {
+            GpuBackendPreference preference = GpuBackendPreference.valueOf(gpuPreference.trim());
+            return preference == GpuBackendPreference.VULKAN_PREFERRED
+                || preference == GpuBackendPreference.VULKAN_REQUIRED;
+        } catch (IllegalArgumentException ignored) {
+            return true;
+        }
     }
 
     private static Object coerceConfigValue(Class<?> type, JsonElement value) {

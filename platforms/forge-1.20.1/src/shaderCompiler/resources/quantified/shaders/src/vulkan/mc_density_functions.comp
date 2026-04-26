@@ -1,0 +1,174 @@
+#version 450
+#pragma STDGL no_contraction
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InCoords {
+    float coords[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer InProgram {
+    float program[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer AuxValues {
+    float auxValues[];
+};
+
+layout(std430, set = 0, binding = 3) writeonly buffer OutDensity {
+    float density[];
+};
+
+layout(push_constant) uniform Push {
+    int sampleCount;
+    int instructionCount;
+} pushData;
+
+const int OP_END = 0;
+const int OP_CONST = 1;
+const int OP_X = 2;
+const int OP_Y = 3;
+const int OP_Z = 4;
+const int OP_ADD = 10;
+const int OP_SUB = 11;
+const int OP_MUL = 12;
+const int OP_DIV = 13;
+const int OP_MIN = 14;
+const int OP_MAX = 15;
+const int OP_ABS = 16;
+const int OP_SQUARE = 17;
+const int OP_CUBE = 18;
+const int OP_CLAMP = 19;
+const int OP_LERP = 20;
+const int OP_NEG = 21;
+const int OP_NEG_MUL = 22;
+const int OP_GE = 23;
+const int OP_LT = 24;
+const int OP_AUX = 25;
+
+const int REGISTER_COUNT = 64;
+
+float arg(uint instruction, int slot) {
+    return program[instruction * 4u + uint(slot)];
+}
+
+int registerIndex(float value) {
+    return clamp(int(value), 0, REGISTER_COUNT - 1);
+}
+
+float fadd(float left, float right) {
+    precise float result = left + right;
+    return result;
+}
+
+float fsub(float left, float right) {
+    precise float result = left - right;
+    return result;
+}
+
+float fmul(float left, float right) {
+    precise float result = left * right;
+    return result;
+}
+
+float fdiv(float left, float right) {
+    precise float result = left / right;
+    return result;
+}
+
+float fmin2(float left, float right) {
+    precise float result = left < right ? left : right;
+    return result;
+}
+
+float fmax2(float left, float right) {
+    precise float result = left > right ? left : right;
+    return result;
+}
+
+float fclamp(float value, float low, float high) {
+    return fmin2(fmax2(value, low), high);
+}
+
+float flerp(float from, float to, float factor) {
+    precise float t = fclamp(factor, 0.0, 1.0);
+    precise float delta = fsub(to, from);
+    precise float scaled = fmul(delta, t);
+    return fadd(from, scaled);
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uint(pushData.sampleCount)) {
+        return;
+    }
+
+    uint coordBase = id * 3u;
+    float x = coords[coordBase];
+    float y = coords[coordBase + 1u];
+    float z = coords[coordBase + 2u];
+    precise float registers[REGISTER_COUNT];
+    for (int i = 0; i < REGISTER_COUNT; i++) {
+        registers[i] = 0.0;
+    }
+    registers[0] = 0.0;
+    registers[1] = x;
+    registers[2] = y;
+    registers[3] = z;
+
+    int instructionLimit = min(pushData.instructionCount, 256);
+    for (int i = 0; i < instructionLimit; i++) {
+        uint instruction = uint(i);
+        int op = int(arg(instruction, 0));
+        int dst = registerIndex(arg(instruction, 1));
+        int a = registerIndex(arg(instruction, 2));
+        int b = registerIndex(arg(instruction, 3));
+
+        if (op == OP_END) {
+            break;
+        } else if (op == OP_CONST) {
+            registers[dst] = arg(instruction, 2);
+        } else if (op == OP_X) {
+            registers[dst] = x;
+        } else if (op == OP_Y) {
+            registers[dst] = y;
+        } else if (op == OP_Z) {
+            registers[dst] = z;
+        } else if (op == OP_ADD) {
+            registers[dst] = fadd(registers[a], registers[b]);
+        } else if (op == OP_SUB) {
+            registers[dst] = fsub(registers[a], registers[b]);
+        } else if (op == OP_MUL) {
+            registers[dst] = fmul(registers[a], registers[b]);
+        } else if (op == OP_DIV) {
+            registers[dst] = fdiv(registers[a], registers[b]);
+        } else if (op == OP_MIN) {
+            registers[dst] = fmin2(registers[a], registers[b]);
+        } else if (op == OP_MAX) {
+            registers[dst] = fmax2(registers[a], registers[b]);
+        } else if (op == OP_ABS) {
+            registers[dst] = abs(registers[a]);
+        } else if (op == OP_SQUARE) {
+            registers[dst] = fmul(registers[a], registers[a]);
+        } else if (op == OP_CUBE) {
+            registers[dst] = fmul(fmul(registers[a], registers[a]), registers[a]);
+        } else if (op == OP_CLAMP) {
+            registers[dst] = fclamp(registers[dst], registers[a], registers[b]);
+        } else if (op == OP_LERP) {
+            registers[dst] = flerp(registers[dst], registers[a], registers[b]);
+        } else if (op == OP_NEG) {
+            registers[dst] = -registers[a];
+        } else if (op == OP_NEG_MUL) {
+            registers[dst] = registers[a] > 0.0 ? registers[a] : fmul(registers[a], registers[b]);
+        } else if (op == OP_GE) {
+            registers[dst] = registers[a] >= registers[b] ? 1.0 : 0.0;
+        } else if (op == OP_LT) {
+            registers[dst] = registers[a] < registers[b] ? 1.0 : 0.0;
+        } else if (op == OP_AUX) {
+            int auxIndex = max(0, int(arg(instruction, 2)));
+            registers[dst] = auxValues[uint(auxIndex) * uint(pushData.sampleCount) + id];
+        }
+    }
+
+    density[id] = registers[0];
+}

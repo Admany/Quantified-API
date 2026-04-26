@@ -14,8 +14,8 @@ import org.admany.quantified.api.parallel.ParallelCompute;
 import org.admany.quantified.api.util.ForgeMetadataUtil;
 import org.admany.quantified.api.vulkan.QuantifiedVulkan;
 import org.admany.quantified.core.common.gpu.backend.GpuBackendRouter;
+import org.admany.quantified.core.common.platform.QuantifiedCoreRuntime;
 import org.admany.quantified.core.common.util.ConnectedModImpl;
-import org.admany.quantified.core.forge.QuantifiedCoreForge;
 
 import java.time.Duration;
 import java.util.List;
@@ -59,7 +59,7 @@ public final class QuantifiedAPI {
         });
         currentHandle.set(handle);
         
-        QuantifiedCoreForge.registerMod(modId, versionForHandle);
+        QuantifiedCoreRuntime.registerMod(modId, versionForHandle);
 
         ConnectedMod existingMod = connectedMods.get(modId);
         if (existingMod != null) {
@@ -358,7 +358,7 @@ public final class QuantifiedAPI {
                     version = "unknown";
                 }
                 try {
-                    QuantifiedCoreForge.registerMod(id, version);
+                    QuantifiedCoreRuntime.registerMod(id, version);
                 } catch (Throwable ignored) {
                 }
                 return new QuantifiedHandle(id, version);
@@ -392,7 +392,7 @@ public final class QuantifiedAPI {
                     version = "unknown";
                 }
                 try {
-                    QuantifiedCoreForge.registerMod(id, version);
+                    QuantifiedCoreRuntime.registerMod(id, version);
                 } catch (Throwable ignored) {
                 }
                 return new QuantifiedHandle(id, version);

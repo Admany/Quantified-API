@@ -8,6 +8,8 @@ import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VK10;
+import org.lwjgl.vulkan.VK11;
+import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkApplicationInfo;
 import org.lwjgl.vulkan.VkBufferCopy;
 import org.lwjgl.vulkan.VkBufferCreateInfo;
@@ -31,8 +33,10 @@ import org.lwjgl.vulkan.VkMemoryAllocateInfo;
 import org.lwjgl.vulkan.VkMemoryBarrier;
 import org.lwjgl.vulkan.VkMemoryRequirements;
 import org.lwjgl.vulkan.VkPhysicalDevice;
+import org.lwjgl.vulkan.VkPhysicalDeviceFloatControlsProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
+import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPipelineLayoutCreateInfo;
 import org.lwjgl.vulkan.VkPushConstantRange;
 import org.lwjgl.vulkan.VkQueue;
@@ -49,6 +53,7 @@ import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.nio.LongBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -77,11 +82,18 @@ public final class VulkanManager {
     private static final int VECTOR_ELEMENTS_PER_INVOCATION = 8;
     private static final int TERRAIN_LOCAL_SIZE_X = 256;
     private static final int TERRAIN_OUTPUT_COMPONENTS = 4;
+    private static final int MC_DENSITY_LOCAL_SIZE_X = 256;
+    private static final int MC_DENSITY_PROGRAM_STRIDE = 4;
+    private static final int MC_DENSITY_MAX_INSTRUCTIONS = 256;
     private static final String VECTOR_ADD_SHADER_RESOURCE = "/quantified/shaders/vulkan/vector_add.comp.spv";
     private static final String MATRIX_MULTIPLY_SHADER_RESOURCE = "/quantified/shaders/vulkan/matrix_multiply.comp.spv";
     private static final String MONTE_CARLO_PI_SHADER_RESOURCE = "/quantified/shaders/vulkan/monte_carlo_pi.comp.spv";
     private static final String TERRAIN_GENERATION_SHADER_RESOURCE = "/quantified/shaders/vulkan/terrain_generation.comp.spv";
+    private static final String MC_DENSITY_FUNCTIONS_SHADER_RESOURCE = "/quantified/shaders/vulkan/mc_density_functions.comp.spv";
     private static final String AUTO_RUNTIME_INIT_PROPERTY = "quantified.vulkan.autoRuntimeInit";
+    private static final String REQUIRE_DETERMINISTIC_FLOAT32_PROPERTY = "quantified.vulkan.requireDeterministicFloat32";
+    private static final boolean REQUIRE_DETERMINISTIC_FLOAT32 =
+        Boolean.parseBoolean(System.getProperty(REQUIRE_DETERMINISTIC_FLOAT32_PROPERTY, "true"));
 
     private static final AtomicBoolean INITIALIZED = new AtomicBoolean(false);
     private static final Object INIT_MUTEX = new Object();
@@ -334,14 +346,14 @@ public final class VulkanManager {
             for (VulkanRuntime.ProbeDeviceInfo device : runtime.devices()) {
                 devices.add(new VulkanDeviceInfo(
                     device.id(),
-                    device.name(),
+                    sanitizeDeviceName(device.name()),
                     device.vendor(),
                     device.localMemoryBytes(),
                     device.deviceType(),
                     device.softwareAdapter()
                 ));
             }
-            return devices;
+            return dedupeDeviceInfos(devices);
         }
         int apiVersion = preferredApiVersion(runtime);
         if (apiVersion == 0) {
@@ -363,7 +375,7 @@ public final class VulkanManager {
                     selection.softwareAdapter()
                 ));
             }
-            return devices;
+            return dedupeDeviceInfos(devices);
         } catch (Throwable throwable) {
             String reason = describeThrowable(throwable);
             lastStatus = RuntimeStatus.failed(reason);
@@ -519,23 +531,145 @@ public final class VulkanManager {
 
     float[] executeTerrainGeneration(float[] inputCoords) {
         Objects.requireNonNull(inputCoords, "inputCoords");
+        if (inputCoords.length % 3 != 0) {
+            throw new IllegalArgumentException("Terrain generation input must be packed xyz triples");
+        }
         if (inputCoords.length == 0) {
             return new float[0];
         }
+        int sampleCount = inputCoords.length / 3;
         State local = requireState();
         Program program = local.programs.get("terrain_generation");
-        try (WorkspaceLease lease = acquireWorkspace(local, program, "terrain_generation:" + inputCoords.length,
+        try (WorkspaceLease lease = acquireWorkspace(local, program, "terrain_generation:" + sampleCount,
             WorkloadProfile.COMPUTE_DENSE,
-            groupCount(inputCoords.length, TERRAIN_LOCAL_SIZE_X), 1, 1,
+            groupCount(sampleCount, TERRAIN_LOCAL_SIZE_X), 1, 1,
             1,
-            new int[]{inputCoords.length},
+            new int[]{sampleCount},
             (long) inputCoords.length * Float.BYTES,
-            (long) inputCoords.length * TERRAIN_OUTPUT_COMPONENTS * Float.BYTES)) {
+            (long) sampleCount * TERRAIN_OUTPUT_COMPONENTS * Float.BYTES)) {
             DispatchWorkspace workspace = lease.workspace();
             writeFloatArray(workspace.buffers[0], inputCoords);
             dispatch(local, workspace);
-            return readFloatArray(workspace.buffers[1], inputCoords.length * TERRAIN_OUTPUT_COMPONENTS);
+            return readFloatArray(workspace.buffers[1], sampleCount * TERRAIN_OUTPUT_COMPONENTS);
         }
+    }
+
+    float[] executeMcDensityFunctions(float[] packedCoords, float[] encodedProgram, int instructionCount) {
+        return executeMcDensityFunctions(packedCoords, encodedProgram, instructionCount, new float[0], 0);
+    }
+
+    float[] executeMcDensityFunctions(float[] packedCoords,
+                                      float[] encodedProgram,
+                                      int instructionCount,
+                                      float[] auxValues,
+                                      int auxValueCount) {
+        Objects.requireNonNull(packedCoords, "packedCoords");
+        Objects.requireNonNull(encodedProgram, "encodedProgram");
+        Objects.requireNonNull(auxValues, "auxValues");
+        if (packedCoords.length % 3 != 0) {
+            throw new IllegalArgumentException("Packed coordinate array must be xyz triples");
+        }
+        int sampleCount = packedCoords.length / 3;
+        if (sampleCount == 0) {
+            return new float[0];
+        }
+        int availableInstructions = encodedProgram.length / MC_DENSITY_PROGRAM_STRIDE;
+        if (instructionCount <= 0 || instructionCount > availableInstructions) {
+            throw new IllegalArgumentException("Invalid density instruction count: " + instructionCount
+                + " available=" + availableInstructions);
+        }
+        if (instructionCount > MC_DENSITY_MAX_INSTRUCTIONS) {
+            throw new IllegalArgumentException("Density instruction count exceeds "
+                + MC_DENSITY_MAX_INSTRUCTIONS + ": " + instructionCount);
+        }
+        if (auxValueCount < 0) {
+            throw new IllegalArgumentException("Aux value count must be non-negative: " + auxValueCount);
+        }
+        if (auxValues.length < auxValueCount * sampleCount) {
+            throw new IllegalArgumentException("Aux values are shorter than aux count: "
+                + auxValues.length + " floats for " + auxValueCount + " aux values and " + sampleCount + " samples");
+        }
+
+        State local = requireState();
+        Program program = local.programs.get("mc_density_functions");
+        float[] programSlice = Arrays.copyOf(encodedProgram, instructionCount * MC_DENSITY_PROGRAM_STRIDE);
+        try (WorkspaceLease lease = prepareMcDensityDispatch(local, program, packedCoords, sampleCount,
+            programSlice, instructionCount, auxValues, auxValueCount)) {
+            dispatch(local, lease.workspace());
+            return readFloatArray(lease.workspace().buffers[3], sampleCount);
+        }
+    }
+
+    float[][] executeMcDensityFunctionBatch(List<McDensityVulkanTask> tasks) {
+        Objects.requireNonNull(tasks, "tasks");
+        if (tasks.isEmpty()) {
+            return new float[0][];
+        }
+
+        float[][] results = new float[tasks.size()][];
+        List<McDensityBatchGroup> groups = new ArrayList<>();
+        for (int i = 0; i < tasks.size(); i++) {
+            McDensityVulkanTask task = Objects.requireNonNull(tasks.get(i), "tasks[" + i + "]");
+            if (task.sampleCount() == 0) {
+                results[i] = new float[0];
+                continue;
+            }
+            McDensityBatchGroup group = null;
+            for (McDensityBatchGroup candidate : groups) {
+                if (candidate.matches(task)) {
+                    group = candidate;
+                    break;
+                }
+            }
+            if (group == null) {
+                group = new McDensityBatchGroup(task.encodedProgram(), task.instructionCount(), task.auxValueCount());
+                groups.add(group);
+            }
+            group.add(i, task);
+        }
+
+        List<PreparedMcDensityGroup> prepared = new ArrayList<>(groups.size());
+        try {
+            State local = requireState();
+            Program program = local.programs.get("mc_density_functions");
+            for (McDensityBatchGroup group : groups) {
+                float[] packedCoords = new float[group.totalSamples * 3];
+                int coordOffset = 0;
+                for (McDensityVulkanTask task : group.tasks) {
+                    float[] taskCoords = task.packedCoords();
+                    System.arraycopy(taskCoords, 0, packedCoords, coordOffset, taskCoords.length);
+                    coordOffset += taskCoords.length;
+                }
+
+                float[] auxValues = group.combineAuxValues();
+                WorkspaceLease lease = prepareMcDensityDispatch(local, program, packedCoords, group.totalSamples,
+                    group.encodedProgram, group.instructionCount, auxValues, group.auxValueCount);
+                prepared.add(new PreparedMcDensityGroup(group, lease));
+            }
+
+            List<DispatchWorkspace> workspaces = new ArrayList<>(prepared.size());
+            for (PreparedMcDensityGroup preparedGroup : prepared) {
+                workspaces.add(preparedGroup.lease.workspace());
+            }
+            dispatch(local, workspaces);
+
+            for (PreparedMcDensityGroup preparedGroup : prepared) {
+                McDensityBatchGroup group = preparedGroup.group;
+                float[] combined = readFloatArray(preparedGroup.lease.workspace().buffers[3], group.totalSamples);
+                int outputOffset = 0;
+                for (int i = 0; i < group.tasks.size(); i++) {
+                    McDensityVulkanTask task = group.tasks.get(i);
+                    int sampleCount = task.sampleCount();
+                    results[group.indices.get(i)] = Arrays.copyOfRange(combined, outputOffset, outputOffset + sampleCount);
+                    outputOffset += sampleCount;
+                }
+            }
+        } finally {
+            for (PreparedMcDensityGroup preparedGroup : prepared) {
+                preparedGroup.lease.close();
+            }
+        }
+        return results;
     }
 
     private State requireState() {
@@ -552,6 +686,13 @@ public final class VulkanManager {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             PhysicalSelection selection = pickPhysicalDevice(instance);
             VkPhysicalDevice physicalDevice = new VkPhysicalDevice(selection.physicalDeviceHandle(), instance);
+            FloatControlSummary floatControls = queryFloatControls(physicalDevice, apiVersion, stack);
+            LOGGER.info("[Vulkan] Float controls: {}", floatControls.summary());
+            if (REQUIRE_DETERMINISTIC_FLOAT32 && !floatControls.deterministicFloat32()) {
+                throw new IllegalStateException("Vulkan device does not expose strict float32 controls required for deterministic compute: "
+                    + floatControls.summary() + ". Set -D" + REQUIRE_DETERMINISTIC_FLOAT32_PROPERTY
+                    + "=false to allow faster-but-less-strict GPU math.");
+            }
             FloatBuffer priorities = stack.floats(1.0f);
             VkDeviceQueueCreateInfo.Buffer queueInfo = VkDeviceQueueCreateInfo.calloc(1, stack)
                 .sType(VK10.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
@@ -584,6 +725,7 @@ public final class VulkanManager {
             created.programs.put("matrix_multiply", createProgram(created, "matrix_multiply", MATRIX_MULTIPLY_SHADER_RESOURCE, 3, Integer.BYTES * 3));
             created.programs.put("monte_carlo_pi", createProgram(created, "monte_carlo_pi", MONTE_CARLO_PI_SHADER_RESOURCE, 1, Integer.BYTES));
             created.programs.put("terrain_generation", createProgram(created, "terrain_generation", TERRAIN_GENERATION_SHADER_RESOURCE, 2, Integer.BYTES));
+            created.programs.put("mc_density_functions", createProgram(created, "mc_density_functions", MC_DENSITY_FUNCTIONS_SHADER_RESOURCE, 4, Integer.BYTES * 2));
             return created;
         } catch (Throwable throwable) {
             try {
@@ -610,7 +752,7 @@ public final class VulkanManager {
             throw new IllegalStateException("Preferred Vulkan device not found: " + preferred);
         }
 
-        return selections.stream()
+        return autoSelectCandidates(selections).stream()
             .max((left, right) -> Double.compare(left.score(), right.score()))
             .orElseThrow(() -> new IllegalStateException("No Vulkan device with a compute queue found"));
     }
@@ -637,13 +779,16 @@ public final class VulkanManager {
 
                 VkPhysicalDeviceProperties properties = VkPhysicalDeviceProperties.calloc(stack);
                 VK10.vkGetPhysicalDeviceProperties(physicalDevice, properties);
-                String deviceName = properties.deviceNameString();
+                String rawDeviceName = properties.deviceNameString();
                 int deviceType = properties.deviceType();
                 int vendorId = properties.vendorID();
-                String vendorName = vendorName(vendorId, deviceName);
+                String vendorName = vendorName(vendorId, rawDeviceName);
                 long localMemoryBytes = queryDeviceLocalMemory(physicalDevice, stack);
-                boolean softwareAdapter = isSoftwareAdapter(deviceName, vendorName, deviceType);
-                double score = scoreDevice(deviceType, localMemoryBytes, softwareAdapter);
+                int maxComputeInvocations = properties.limits().maxComputeWorkGroupInvocations();
+                int maxComputeSharedMemoryBytes = properties.limits().maxComputeSharedMemorySize();
+                boolean softwareAdapter = isSoftwareAdapter(rawDeviceName, vendorName, deviceType);
+                String deviceName = sanitizeDeviceName(rawDeviceName);
+                double score = scoreDevice(deviceType, vendorName, localMemoryBytes, maxComputeInvocations, maxComputeSharedMemoryBytes, softwareAdapter);
                 String deviceId = buildDeviceId(vendorName, deviceName);
                 selections.add(new PhysicalSelection(
                     physicalDeviceHandle,
@@ -657,7 +802,7 @@ public final class VulkanManager {
                     score
                 ));
             }
-            return selections;
+            return dedupeSelections(selections);
         }
     }
 
@@ -687,6 +832,32 @@ public final class VulkanManager {
             }
         }
         return bytes;
+    }
+
+    private static FloatControlSummary queryFloatControls(VkPhysicalDevice physicalDevice,
+                                                          int apiVersion,
+                                                          MemoryStack stack) {
+        if (apiVersion < VK12.VK_API_VERSION_1_2) {
+            return FloatControlSummary.unavailable("Vulkan API < 1.2");
+        }
+
+        VkPhysicalDeviceFloatControlsProperties floatControls = VkPhysicalDeviceFloatControlsProperties.calloc(stack)
+            .sType(VK12.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES);
+        VkPhysicalDeviceProperties2 properties2 = VkPhysicalDeviceProperties2.calloc(stack)
+            .sType(VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2)
+            .pNext(floatControls.address());
+        VK11.vkGetPhysicalDeviceProperties2(physicalDevice, properties2);
+
+        return new FloatControlSummary(
+            true,
+            floatControls.shaderRoundingModeRTEFloat32(),
+            floatControls.shaderSignedZeroInfNanPreserveFloat32(),
+            floatControls.shaderDenormPreserveFloat32(),
+            floatControls.shaderDenormFlushToZeroFloat32(),
+            floatControls.denormBehaviorIndependence(),
+            floatControls.roundingModeIndependence(),
+            null
+        );
     }
 
     private static VkInstance createInstance(int apiVersion) {
@@ -789,7 +960,88 @@ public final class VulkanManager {
 
     private static String buildDeviceId(String vendorName, String deviceName) {
         String combined = ((vendorName != null ? vendorName : "") + "-" + (deviceName != null ? deviceName : "")).trim();
-        return combined.isBlank() ? "unknown-vulkan-device" : combined;
+        String normalized = normalizeDeviceKey(combined);
+        return normalized.isBlank() ? "unknown-vulkan-device" : normalized;
+    }
+
+    private static String sanitizeDeviceName(String deviceName) {
+        if (deviceName == null) {
+            return "Unknown Vulkan Device";
+        }
+        String sanitized = deviceName
+            .replaceAll("(?i)\\bDirect3D12\\b", "")
+            .replaceAll("(?i)\\bD3D12\\b", "")
+            .replaceAll("(?i)\\bDX12\\b", "")
+            .replaceAll("\\s+", " ")
+            .trim();
+        return sanitized.isEmpty() ? deviceName.trim() : sanitized;
+    }
+
+    private static List<PhysicalSelection> autoSelectCandidates(List<PhysicalSelection> selections) {
+        List<PhysicalSelection> discrete = selections.stream()
+            .filter(selection -> !selection.softwareAdapter())
+            .filter(selection -> selection.deviceType() == VK10.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+            .toList();
+        return discrete.isEmpty() ? selections : discrete;
+    }
+
+    private static List<PhysicalSelection> dedupeSelections(List<PhysicalSelection> selections) {
+        java.util.LinkedHashMap<String, PhysicalSelection> unique = new java.util.LinkedHashMap<>();
+        for (PhysicalSelection selection : selections) {
+            String key = normalizeDeviceKey(selection.deviceName());
+            PhysicalSelection existing = unique.get(key);
+            if (existing == null || preferSelection(selection, existing)) {
+                unique.put(key, selection);
+            }
+        }
+        return new ArrayList<>(unique.values());
+    }
+
+    private static List<VulkanDeviceInfo> dedupeDeviceInfos(List<VulkanDeviceInfo> devices) {
+        java.util.LinkedHashMap<String, VulkanDeviceInfo> unique = new java.util.LinkedHashMap<>();
+        for (VulkanDeviceInfo device : devices) {
+            String key = normalizeDeviceKey(device.name());
+            VulkanDeviceInfo existing = unique.get(key);
+            if (existing == null || preferDeviceInfo(device, existing)) {
+                unique.put(key, device);
+            }
+        }
+        return new ArrayList<>(unique.values());
+    }
+
+    private static boolean preferSelection(PhysicalSelection selection, PhysicalSelection existing) {
+        if (selection.softwareAdapter() != existing.softwareAdapter()) {
+            return !selection.softwareAdapter();
+        }
+        if (selection.deviceType() != existing.deviceType()) {
+            return deviceTypeRank(selection.deviceType()) > deviceTypeRank(existing.deviceType());
+        }
+        if (selection.localMemoryBytes() != existing.localMemoryBytes()) {
+            return selection.localMemoryBytes() > existing.localMemoryBytes();
+        }
+        return selection.score() > existing.score();
+    }
+
+    private static boolean preferDeviceInfo(VulkanDeviceInfo device, VulkanDeviceInfo existing) {
+        if (device.softwareAdapter() != existing.softwareAdapter()) {
+            return !device.softwareAdapter();
+        }
+        if (device.deviceType() != existing.deviceType()) {
+            return deviceTypeRank(device.deviceType()) > deviceTypeRank(existing.deviceType());
+        }
+        if (device.localMemoryBytes() != existing.localMemoryBytes()) {
+            return device.localMemoryBytes() > existing.localMemoryBytes();
+        }
+        return device.id().compareTo(existing.id()) > 0;
+    }
+
+    private static int deviceTypeRank(int deviceType) {
+        return switch (deviceType) {
+            case VK10.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU -> 4;
+            case VK10.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU -> 3;
+            case VK10.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU -> 2;
+            default -> 1;
+        };
     }
 
     private static String vendorName(int vendorId, String deviceName) {
@@ -833,17 +1085,30 @@ public final class VulkanManager {
             || lowerName.contains("d3d12");
     }
 
-    private static double scoreDevice(int deviceType, long localMemoryBytes, boolean softwareAdapter) {
+    private static double scoreDevice(int deviceType,
+                                      String vendorName,
+                                      long localMemoryBytes,
+                                      int maxComputeInvocations,
+                                      int maxComputeSharedMemoryBytes,
+                                      boolean softwareAdapter) {
         if (softwareAdapter) {
-            return -1_000_000d + localMemoryBytes;
+            return -1_000_000_000_000_000d + localMemoryBytes;
         }
         double typeScore = switch (deviceType) {
-            case VK10.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU -> 4_000_000_000_000d;
-            case VK10.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU -> 3_000_000_000_000d;
-            case VK10.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU -> 2_000_000_000_000d;
+            case VK10.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU -> 1_000_000_000_000_000d;
+            case VK10.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU -> 100_000_000_000_000d;
+            case VK10.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU -> 10_000_000_000_000d;
             default -> 1_000_000_000_000d;
         };
-        return typeScore + localMemoryBytes;
+        double vendorScore = isDedicatedGpuVendor(vendorName) ? 10_000_000_000_000d : 0d;
+        double computeScore = (double) Math.max(0, maxComputeInvocations) * 1_000_000_000d
+            + (double) Math.max(0, maxComputeSharedMemoryBytes) * 1_000_000d;
+        return typeScore + vendorScore + computeScore + localMemoryBytes;
+    }
+
+    private static boolean isDedicatedGpuVendor(String vendorName) {
+        String vendor = vendorName != null ? vendorName.toLowerCase(java.util.Locale.ROOT) : "";
+        return vendor.contains("nvidia") || vendor.contains("amd");
     }
 
     private static String describeThrowable(Throwable throwable) {
@@ -950,6 +1215,65 @@ public final class VulkanManager {
             ignored -> createWorkspacePool(state, program, workloadProfile, groupCountX, groupCountY, groupCountZ,
                 inputBufferCount, pushConstants, bufferSizes));
         return new WorkspaceLease(pool, pool.borrow());
+    }
+
+    private static WorkspaceLease prepareMcDensityDispatch(State state,
+                                                           Program program,
+                                                           float[] packedCoords,
+                                                           int sampleCount,
+                                                           float[] programSlice,
+                                                           int instructionCount,
+                                                           float[] auxValues,
+                                                           int auxValueCount) {
+        int sampleCapacity = alignUp(sampleCount, MC_DENSITY_LOCAL_SIZE_X);
+        int programHash = Arrays.hashCode(programSlice);
+        WorkspaceLease lease = acquireWorkspace(state, program,
+            "mc_density_functions:" + sampleCapacity + ":" + instructionCount + ":" + auxValueCount + ":"
+                + Integer.toHexString(programHash),
+            WorkloadProfile.COMPUTE_DENSE,
+            groupCount(sampleCapacity, MC_DENSITY_LOCAL_SIZE_X), 1, 1,
+            3,
+            new int[]{sampleCapacity, instructionCount},
+            (long) sampleCapacity * 3L * Float.BYTES,
+            (long) programSlice.length * Float.BYTES,
+            Math.max(1L, (long) auxValueCount * sampleCapacity) * Float.BYTES,
+            (long) sampleCapacity * Float.BYTES);
+        boolean success = false;
+        try {
+            DispatchWorkspace workspace = lease.workspace();
+            writeFloatArrayPadded(workspace.buffers[0], packedCoords, sampleCapacity * 3);
+            writeFloatArray(workspace.buffers[1], programSlice);
+            writeMcDensityAuxValues(workspace.buffers[2], auxValues, auxValueCount, sampleCount, sampleCapacity);
+            success = true;
+            return lease;
+        } finally {
+            if (!success) {
+                lease.close();
+            }
+        }
+    }
+
+    private static void writeMcDensityAuxValues(AllocatedBuffer buffer,
+                                                float[] values,
+                                                int auxValueCount,
+                                                int sampleCount,
+                                                int sampleCapacity) {
+        int paddedLength = Math.max(1, auxValueCount * sampleCapacity);
+        FloatBuffer mapped = MemoryUtil.memFloatBuffer(buffer.mappedPointer, paddedLength);
+        mapped.clear();
+        if (auxValueCount <= 0) {
+            mapped.put(0.0f);
+            mapped.flip();
+            return;
+        }
+        for (int auxIndex = 0; auxIndex < auxValueCount; auxIndex++) {
+            int srcOffset = auxIndex * sampleCount;
+            mapped.put(values, srcOffset, sampleCount);
+            for (int i = sampleCount; i < sampleCapacity; i++) {
+                mapped.put(0.0f);
+            }
+        }
+        mapped.flip();
     }
 
     private static DispatchWorkspacePool createWorkspacePool(State state,
@@ -1350,6 +1674,19 @@ public final class VulkanManager {
         mapped.flip();
     }
 
+    private static void writeFloatArrayPadded(AllocatedBuffer buffer, float[] values, int paddedLength) {
+        if (values.length > paddedLength) {
+            throw new IllegalArgumentException("Input exceeds padded buffer length: " + values.length + " > " + paddedLength);
+        }
+        FloatBuffer mapped = MemoryUtil.memFloatBuffer(buffer.mappedPointer, paddedLength);
+        mapped.clear();
+        mapped.put(values);
+        for (int i = values.length; i < paddedLength; i++) {
+            mapped.put(0.0f);
+        }
+        mapped.flip();
+    }
+
     private static void writeInt(AllocatedBuffer buffer, int value) {
         java.nio.IntBuffer mapped = MemoryUtil.memIntBuffer(buffer.mappedPointer, 1);
         mapped.put(0, value);
@@ -1370,16 +1707,28 @@ public final class VulkanManager {
 
     private static void dispatch(State state,
                                  DispatchWorkspace workspace) {
+        dispatch(state, List.of(workspace));
+    }
+
+    private static void dispatch(State state,
+                                 List<DispatchWorkspace> workspaces) {
+        if (workspaces == null || workspaces.isEmpty()) {
+            return;
+        }
+        DispatchWorkspace fenceOwner = workspaces.get(0);
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            checkVk(VK10.vkResetFences(state.device, stack.longs(workspace.fence)), "vkResetFences");
-            PointerBuffer commandBufferPtr = stack.pointers(workspace.commandBuffer.address());
+            checkVk(VK10.vkResetFences(state.device, stack.longs(fenceOwner.fence)), "vkResetFences");
+            PointerBuffer commandBufferPtr = stack.mallocPointer(workspaces.size());
+            for (int i = 0; i < workspaces.size(); i++) {
+                commandBufferPtr.put(i, workspaces.get(i).commandBuffer.address());
+            }
             VkSubmitInfo submitInfo = VkSubmitInfo.calloc(stack)
                 .sType(VK10.VK_STRUCTURE_TYPE_SUBMIT_INFO)
                 .pCommandBuffers(commandBufferPtr);
             synchronized (state.computeQueueLock) {
-                checkVk(VK10.vkQueueSubmit(state.computeQueue, submitInfo, workspace.fence), "vkQueueSubmit");
+                checkVk(VK10.vkQueueSubmit(state.computeQueue, submitInfo, fenceOwner.fence), "vkQueueSubmit");
             }
-            checkVk(VK10.vkWaitForFences(state.device, stack.longs(workspace.fence), true, EXECUTION_TIMEOUT_NANOS), "vkWaitForFences");
+            checkVk(VK10.vkWaitForFences(state.device, stack.longs(fenceOwner.fence), true, EXECUTION_TIMEOUT_NANOS), "vkWaitForFences");
         }
     }
 
@@ -1492,6 +1841,13 @@ public final class VulkanManager {
         return Math.max(1, (valueCount + localSize - 1) / localSize);
     }
 
+    private static int alignUp(int value, int alignment) {
+        if (value <= 0) {
+            return 0;
+        }
+        return ((value + alignment - 1) / alignment) * alignment;
+    }
+
     private static void checkVk(int result, String operation) {
         if (result != VK10.VK_SUCCESS) {
             throw new IllegalStateException(operation + " failed with Vulkan result " + result);
@@ -1549,6 +1905,51 @@ public final class VulkanManager {
         boolean softwareAdapter,
         double score
     ) {
+    }
+
+    private record FloatControlSummary(
+        boolean available,
+        boolean roundToNearestEvenFloat32,
+        boolean signedZeroInfNanPreserveFloat32,
+        boolean denormPreserveFloat32,
+        boolean denormFlushToZeroFloat32,
+        int denormBehaviorIndependence,
+        int roundingModeIndependence,
+        String unavailableReason
+    ) {
+        private static FloatControlSummary unavailable(String reason) {
+            return new FloatControlSummary(false, false, false, false, false, 0, 0, reason);
+        }
+
+        private boolean deterministicFloat32() {
+            return available && roundToNearestEvenFloat32 && signedZeroInfNanPreserveFloat32;
+        }
+
+        private String summary() {
+            if (!available) {
+                return "unavailable (" + unavailableReason + ")";
+            }
+            return "rte32=" + roundToNearestEvenFloat32
+                + ", preserveZeroInfNan32=" + signedZeroInfNanPreserveFloat32
+                + ", denormPreserve32=" + denormPreserveFloat32
+                + ", denormFtz32=" + denormFlushToZeroFloat32
+                + ", denormIndependence=" + independenceName(denormBehaviorIndependence)
+                + ", roundingIndependence=" + independenceName(roundingModeIndependence)
+                + ", strictFloat32=" + deterministicFloat32();
+        }
+
+        private static String independenceName(int value) {
+            if (value == VK12.VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL) {
+                return "all";
+            }
+            if (value == VK12.VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY) {
+                return "32bit-only";
+            }
+            if (value == VK12.VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE) {
+                return "none";
+            }
+            return Integer.toString(value);
+        }
     }
 
     private record Program(String name,
@@ -1634,6 +2035,53 @@ public final class VulkanManager {
     private enum BufferRole {
         INPUT,
         OUTPUT
+    }
+
+    private static final class McDensityBatchGroup {
+        private final float[] encodedProgram;
+        private final int instructionCount;
+        private final int auxValueCount;
+        private final List<Integer> indices = new ArrayList<>();
+        private final List<McDensityVulkanTask> tasks = new ArrayList<>();
+        private int totalSamples;
+
+        private McDensityBatchGroup(float[] encodedProgram, int instructionCount, int auxValueCount) {
+            this.encodedProgram = encodedProgram;
+            this.instructionCount = instructionCount;
+            this.auxValueCount = auxValueCount;
+        }
+
+        private boolean matches(McDensityVulkanTask task) {
+            return instructionCount == task.instructionCount()
+                && auxValueCount == task.auxValueCount()
+                && Arrays.equals(encodedProgram, task.encodedProgram());
+        }
+
+        private void add(int index, McDensityVulkanTask task) {
+            indices.add(index);
+            tasks.add(task);
+            totalSamples += task.sampleCount();
+        }
+
+        private float[] combineAuxValues() {
+            if (auxValueCount <= 0) {
+                return new float[0];
+            }
+            float[] combined = new float[auxValueCount * totalSamples];
+            for (int auxIndex = 0; auxIndex < auxValueCount; auxIndex++) {
+                int outputOffset = auxIndex * totalSamples;
+                for (McDensityVulkanTask task : tasks) {
+                    float[] taskAux = task.auxValues();
+                    int sampleCount = task.sampleCount();
+                    System.arraycopy(taskAux, auxIndex * sampleCount, combined, outputOffset, sampleCount);
+                    outputOffset += sampleCount;
+                }
+            }
+            return combined;
+        }
+    }
+
+    private record PreparedMcDensityGroup(McDensityBatchGroup group, WorkspaceLease lease) {
     }
 
     private static final class State {

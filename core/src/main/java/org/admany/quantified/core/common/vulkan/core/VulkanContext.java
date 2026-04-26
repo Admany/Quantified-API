@@ -1,5 +1,7 @@
 package org.admany.quantified.core.common.vulkan.core;
 
+import java.util.List;
+
 public final class VulkanContext {
 
     private final VulkanManager manager;
@@ -22,6 +24,22 @@ public final class VulkanContext {
 
     public float[] terrainGeneration(float[] inputCoords) {
         return manager.executeTerrainGeneration(inputCoords);
+    }
+
+    public float[] mcDensityFunctions(float[] packedCoords, float[] encodedProgram, int instructionCount) {
+        return manager.executeMcDensityFunctions(packedCoords, encodedProgram, instructionCount);
+    }
+
+    public float[] mcDensityFunctions(float[] packedCoords,
+                                      float[] encodedProgram,
+                                      int instructionCount,
+                                      float[] auxValues,
+                                      int auxValueCount) {
+        return manager.executeMcDensityFunctions(packedCoords, encodedProgram, instructionCount, auxValues, auxValueCount);
+    }
+
+    public float[][] mcDensityFunctionsBatch(List<McDensityVulkanTask> tasks) {
+        return manager.executeMcDensityFunctionBatch(tasks);
     }
 
     public String deviceName() {

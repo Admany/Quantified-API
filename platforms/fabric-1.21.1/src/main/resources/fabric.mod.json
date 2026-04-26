@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "${mod_id}",
+  "version": "${version}",
+  "name": "${mod_name}",
+  "description": "${mod_description}",
+  "authors": [
+    "${mod_authors}"
+  ],
+  "license": "${mod_license}",
+  "icon": "quantifiedapi.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "org.admany.quantified.core.fabric.QuantifiedCoreFabric"
+    ],
+    "client": [
+      "org.admany.quantified.core.fabric.QuantifiedCoreFabricClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=${fabric_loader_version}",
+    "minecraft": "${minecraft_version_range}",
+    "fabric-api": "*"
+  }
+}
