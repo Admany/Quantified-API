@@ -121,12 +121,31 @@ public final class VulkanManager {
     private static volatile State state;
     private static volatile RuntimeStatus lastStatus = RuntimeStatus.failed("Vulkan not initialized");
     private static volatile long nextInitRetryMs = 0L;
+    private static final ConcurrentHashMap<String, byte[]> REGISTERED_DENSITY_SHADERS = new ConcurrentHashMap<>();
 
     private VulkanManager() {
     }
 
     public static boolean isAvailable() {
         return INITIALIZED.get() && state != null;
+    }
+
+    public static void registerDensityShader(String key, byte[] spirv) {
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(spirv, "spirv");
+        REGISTERED_DENSITY_SHADERS.put(key, spirv.clone());
+    }
+
+    public static void unregisterDensityShader(String key) {
+        Objects.requireNonNull(key, "key");
+        REGISTERED_DENSITY_SHADERS.remove(key);
+        State local = state;
+        if (local != null) {
+            Program removed = local.programs.remove("density_shader:" + key);
+            if (removed != null) {
+                destroyProgram(local, removed);
+            }
+        }
     }
 
     public static RuntimeStatus runtimeStatus() {
@@ -622,7 +641,7 @@ public final class VulkanManager {
                 }
             }
             if (group == null) {
-                group = new McDensityBatchGroup(task.encodedProgram(), task.instructionCount(), task.auxValueCount());
+                group = new McDensityBatchGroup(task.encodedProgram(), task.instructionCount(), task.auxValueCount(), task.shaderKey());
                 groups.add(group);
             }
             group.add(i, task);
@@ -631,8 +650,9 @@ public final class VulkanManager {
         List<PreparedMcDensityGroup> prepared = new ArrayList<>(groups.size());
         try {
             State local = requireState();
-            Program program = local.programs.get("mc_density_functions");
+            Program defaultProgram = local.programs.get("mc_density_functions");
             for (McDensityBatchGroup group : groups) {
+                Program program = resolveProgram(local, defaultProgram, group.shaderKey);
                 float[] packedCoords = new float[group.totalSamples * 3];
                 int coordOffset = 0;
                 for (McDensityVulkanTask task : group.tasks) {
@@ -1199,6 +1219,106 @@ public final class VulkanManager {
         } finally {
             MemoryUtil.memFree(spirv);
         }
+    }
+
+    private static Program createProgramFromBytes(State state, String name, byte[] spirv, int storageBufferCount, int pushConstantBytes) {
+        ByteBuffer buffer = MemoryUtil.memAlloc(spirv.length);
+        try {
+            buffer.put(spirv).flip();
+            return createProgramFromBuffer(state, name, buffer, storageBufferCount, pushConstantBytes);
+        } finally {
+            MemoryUtil.memFree(buffer);
+        }
+    }
+
+    private static Program createProgramFromBuffer(State state, String name, ByteBuffer spirv, int storageBufferCount, int pushConstantBytes) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            LongBuffer shaderModulePtr = stack.mallocLong(1);
+            VkShaderModuleCreateInfo shaderInfo = VkShaderModuleCreateInfo.calloc(stack)
+                .sType(VK10.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO)
+                .pCode(spirv);
+            checkVk(VK10.vkCreateShaderModule(state.device, shaderInfo, null, shaderModulePtr), "vkCreateShaderModule");
+            long shaderModule = shaderModulePtr.get(0);
+            try {
+                VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(storageBufferCount, stack);
+                for (int i = 0; i < storageBufferCount; i++) {
+                    bindings.get(i)
+                        .binding(i)
+                        .descriptorCount(1)
+                        .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+                        .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+                }
+                LongBuffer descriptorLayoutPtr = stack.mallocLong(1);
+                VkDescriptorSetLayoutCreateInfo descriptorLayoutInfo = VkDescriptorSetLayoutCreateInfo.calloc(stack)
+                    .sType(VK10.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO)
+                    .pBindings(bindings);
+                checkVk(VK10.vkCreateDescriptorSetLayout(state.device, descriptorLayoutInfo, null, descriptorLayoutPtr),
+                    "vkCreateDescriptorSetLayout");
+                long descriptorSetLayout = descriptorLayoutPtr.get(0);
+                try {
+                    LongBuffer pipelineLayoutPtr = stack.mallocLong(1);
+                    VkPipelineLayoutCreateInfo pipelineLayoutInfo = VkPipelineLayoutCreateInfo.calloc(stack)
+                        .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO)
+                        .pSetLayouts(stack.longs(descriptorSetLayout));
+                    if (pushConstantBytes > 0) {
+                        VkPushConstantRange.Buffer pushRange = VkPushConstantRange.calloc(1, stack)
+                            .stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT)
+                            .offset(0)
+                            .size(pushConstantBytes);
+                        pipelineLayoutInfo.pPushConstantRanges(pushRange);
+                    }
+                    checkVk(VK10.vkCreatePipelineLayout(state.device, pipelineLayoutInfo, null, pipelineLayoutPtr),
+                        "vkCreatePipelineLayout");
+                    long pipelineLayout = pipelineLayoutPtr.get(0);
+                    try {
+                        org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo stageInfo =
+                            org.lwjgl.vulkan.VkPipelineShaderStageCreateInfo.calloc(stack)
+                                .sType(VK10.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO)
+                                .stage(VK10.VK_SHADER_STAGE_COMPUTE_BIT)
+                                .module(shaderModule)
+                                .pName(stack.UTF8("main"));
+                        VkComputePipelineCreateInfo.Buffer pipelineInfo = VkComputePipelineCreateInfo.calloc(1, stack)
+                            .sType(VK10.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO)
+                            .stage(stageInfo)
+                            .layout(pipelineLayout);
+                        LongBuffer pipelinePtr = stack.mallocLong(1);
+                        checkVk(VK10.vkCreateComputePipelines(state.device, VK10.VK_NULL_HANDLE, pipelineInfo, null, pipelinePtr),
+                            "vkCreateComputePipelines");
+                        return new Program(name, pipelinePtr.get(0), pipelineLayout, descriptorSetLayout, storageBufferCount, pushConstantBytes);
+                    } catch (Throwable throwable) {
+                        VK10.vkDestroyPipelineLayout(state.device, pipelineLayout, null);
+                        throw throwable;
+                    }
+                } catch (Throwable throwable) {
+                    VK10.vkDestroyDescriptorSetLayout(state.device, descriptorSetLayout, null);
+                    throw throwable;
+                }
+            } finally {
+                VK10.vkDestroyShaderModule(state.device, shaderModule, null);
+            }
+        }
+    }
+
+    private static Program resolveProgram(State state, Program defaultProgram, String shaderKey) {
+        if (shaderKey == null) {
+            return defaultProgram;
+        }
+        String programKey = "density_shader:" + shaderKey;
+        Program cached = state.programs.get(programKey);
+        if (cached != null) {
+            return cached;
+        }
+        byte[] spirv = REGISTERED_DENSITY_SHADERS.get(shaderKey);
+        if (spirv == null) {
+            return defaultProgram;
+        }
+        Program compiled = createProgramFromBytes(state, programKey, spirv, 4, 8);
+        Program existing = state.programs.putIfAbsent(programKey, compiled);
+        if (existing != null) {
+            destroyProgram(state, compiled);
+            return existing;
+        }
+        return compiled;
     }
 
     private static WorkspaceLease acquireWorkspace(State state,
@@ -1798,6 +1918,24 @@ public final class VulkanManager {
         }
     }
 
+    private static void destroyProgram(State state, Program program) {
+        if (state == null || program == null) {
+            return;
+        }
+        try {
+            VK10.vkDestroyPipeline(state.device, program.pipeline, null);
+        } catch (Throwable ignored) {
+        }
+        try {
+            VK10.vkDestroyPipelineLayout(state.device, program.pipelineLayout, null);
+        } catch (Throwable ignored) {
+        }
+        try {
+            VK10.vkDestroyDescriptorSetLayout(state.device, program.descriptorSetLayout, null);
+        } catch (Throwable ignored) {
+        }
+    }
+
     private static void destroyWorkspace(State state, DispatchWorkspace workspace) {
         if (state == null || workspace == null) {
             return;
@@ -2041,19 +2179,22 @@ public final class VulkanManager {
         private final float[] encodedProgram;
         private final int instructionCount;
         private final int auxValueCount;
+        private final String shaderKey;
         private final List<Integer> indices = new ArrayList<>();
         private final List<McDensityVulkanTask> tasks = new ArrayList<>();
         private int totalSamples;
 
-        private McDensityBatchGroup(float[] encodedProgram, int instructionCount, int auxValueCount) {
+        private McDensityBatchGroup(float[] encodedProgram, int instructionCount, int auxValueCount, String shaderKey) {
             this.encodedProgram = encodedProgram;
             this.instructionCount = instructionCount;
             this.auxValueCount = auxValueCount;
+            this.shaderKey = shaderKey;
         }
 
         private boolean matches(McDensityVulkanTask task) {
             return instructionCount == task.instructionCount()
                 && auxValueCount == task.auxValueCount()
+                && Objects.equals(shaderKey, task.shaderKey())
                 && Arrays.equals(encodedProgram, task.encodedProgram());
         }
 

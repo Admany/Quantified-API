@@ -62,6 +62,14 @@ public final class QuantifiedVulkan {
         return VulkanManager.isAvailable();
     }
 
+    public static void registerDensityShader(String key, byte[] spirv) {
+        VulkanManager.registerDensityShader(key, spirv);
+    }
+
+    public static void unregisterDensityShader(String key) {
+        VulkanManager.unregisterDensityShader(key);
+    }
+
     public static final class Builder<T> {
         private final String modId;
         private final String taskName;

@@ -16,6 +16,7 @@ public final class McDensityVulkanTask extends VulkanTask<float[]> {
     private final int auxValueCount;
     private final int sampleCount;
     private final long estimatedVramBytes;
+    private final String shaderKey;
 
     public McDensityVulkanTask(String modId,
                                String name,
@@ -25,7 +26,7 @@ public final class McDensityVulkanTask extends VulkanTask<float[]> {
                                int instructionCount,
                                Supplier<float[]> cpuFallback,
                                Duration timeout) {
-        this(modId, name, taskKey, packedCoords, encodedProgram, instructionCount, new float[0], 0, cpuFallback, timeout);
+        this(modId, name, taskKey, packedCoords, encodedProgram, instructionCount, new float[0], 0, null, cpuFallback, timeout);
     }
 
     public McDensityVulkanTask(String modId,
@@ -38,12 +39,26 @@ public final class McDensityVulkanTask extends VulkanTask<float[]> {
                                int auxValueCount,
                                Supplier<float[]> cpuFallback,
                                Duration timeout) {
+        this(modId, name, taskKey, packedCoords, encodedProgram, instructionCount, auxValues, auxValueCount, null, cpuFallback, timeout);
+    }
+
+    public McDensityVulkanTask(String modId,
+                               String name,
+                               long taskKey,
+                               float[] packedCoords,
+                               float[] encodedProgram,
+                               int instructionCount,
+                               float[] auxValues,
+                               int auxValueCount,
+                               String shaderKey,
+                               Supplier<float[]> cpuFallback,
+                               Duration timeout) {
         super(modId, name, taskKey, cpuFallback, timeout);
         Objects.requireNonNull(packedCoords, "packedCoords");
         Objects.requireNonNull(encodedProgram, "encodedProgram");
         Objects.requireNonNull(auxValues, "auxValues");
         if (packedCoords.length % 3 != 0) {
-            throw new IllegalArgumentException("Packed coordinate array must be xyz triples");
+            throw new IllegalArgumentException("Packed coords length must be divisible by 3: " + packedCoords.length);
         }
         int samples = packedCoords.length / 3;
         if (instructionCount <= 0) {
@@ -67,6 +82,7 @@ public final class McDensityVulkanTask extends VulkanTask<float[]> {
         this.instructionCount = instructionCount;
         this.auxValueCount = auxValueCount;
         this.sampleCount = samples;
+        this.shaderKey = shaderKey;
         this.estimatedVramBytes = (long) (this.packedCoords.length + this.encodedProgram.length
             + this.auxValues.length + this.sampleCount)
             * Float.BYTES;
@@ -109,5 +125,9 @@ public final class McDensityVulkanTask extends VulkanTask<float[]> {
 
     int sampleCount() {
         return sampleCount;
+    }
+
+    public String shaderKey() {
+        return shaderKey;
     }
 }
