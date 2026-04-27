@@ -27,6 +27,13 @@ apply plugin: 'fabric-loom'
 apply plugin: 'maven-publish'
 */
 
+// Load shared mod metadata from root gradle.properties
+def rootProps = new Properties()
+file('../../gradle.properties').withInputStream { rootProps.load(it) }
+['mod_id', 'mod_name', 'mod_license', 'mod_version', 'mod_group_id', 'mod_authors', 'mod_description'].each { key ->
+    ext.set(key, rootProps.getProperty(key))
+}
+
 def minecraft_version = project.property('minecraft_version_fabric_1_20_1')
 def minecraft_version_range = project.property('minecraft_version_range_fabric_1_20_1')
 def fabric_loader_version = project.property('fabric_loader_version')
