@@ -1,5 +1,6 @@
 package org.admany.quantified.core.common.vulkan.core;
 
+import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
 import org.admany.quantified.core.common.gpu.backend.VulkanRuntime;
 import org.admany.quantified.core.common.util.LwjglRuntimeTuning;
@@ -30,21 +31,26 @@ import org.lwjgl.vulkan.VkFenceCreateInfo;
 import org.lwjgl.vulkan.VkInstance;
 import org.lwjgl.vulkan.VkInstanceCreateInfo;
 import org.lwjgl.vulkan.VkMemoryAllocateInfo;
-import org.lwjgl.vulkan.VkMemoryBarrier;
 import org.lwjgl.vulkan.VkMemoryRequirements;
 import org.lwjgl.vulkan.VkPhysicalDevice;
 import org.lwjgl.vulkan.VkPhysicalDeviceFloatControlsProperties;
+import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
+import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
 import org.lwjgl.vulkan.VkPipelineLayoutCreateInfo;
 import org.lwjgl.vulkan.VkPushConstantRange;
 import org.lwjgl.vulkan.VkQueue;
 import org.lwjgl.vulkan.VkQueueFamilyProperties;
+import org.lwjgl.vulkan.VkSemaphoreCreateInfo;
+import org.lwjgl.vulkan.VkSemaphoreTypeCreateInfo;
+import org.lwjgl.vulkan.VkSemaphoreWaitInfo;
 import org.lwjgl.vulkan.VkShaderModuleCreateInfo;
 import org.lwjgl.vulkan.VkSubmitInfo;
+import org.lwjgl.vulkan.VkBufferMemoryBarrier;
+import org.lwjgl.vulkan.VkTimelineSemaphoreSubmitInfo;
 import org.lwjgl.vulkan.VkWriteDescriptorSet;
-import org.lwjgl.vulkan.QuantifiedVkBootstrap;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -65,6 +71,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -76,21 +83,25 @@ public final class VulkanManager {
     private static final int MAX_PENDING_TASKS = 256;
     private static final int MAX_IN_FLIGHT_WORKSPACES = 3;
     private static final long MAX_ACCEPTED_VRAM_BYTES = 512L * 1024L * 1024L;
+    private static final long INLINE_VRAM_BYTES_LIMIT = 32L * 1024L * 1024L;
+    private static final int INLINE_COMPUTE_UNITS_LIMIT = 1_500_000;
     private static final long INIT_RETRY_COOLDOWN_MS = 30_000L;
     private static final long DEVICE_LOCAL_TRANSFER_THRESHOLD_BYTES = 256L * 1024L;
+    private static final long DEFAULT_SLAB_BYTES = 256L * 1024L * 1024L;
+    private static final long MIN_SLAB_BYTES = 16L * 1024L * 1024L;
+    private static final String SLAB_BYTES_PROPERTY = "quantified.vulkan.slabBytes";
     private static final int VECTOR_LOCAL_SIZE_X = 256;
     private static final int VECTOR_ELEMENTS_PER_INVOCATION = 8;
+    private static final int MONTE_CARLO_SAMPLES_PER_INVOCATION = 32;
     private static final int TERRAIN_LOCAL_SIZE_X = 256;
     private static final int TERRAIN_OUTPUT_COMPONENTS = 4;
-    private static final int MC_DENSITY_LOCAL_SIZE_X = 256;
-    private static final int MC_DENSITY_PROGRAM_STRIDE = 4;
-    private static final int MC_DENSITY_MAX_INSTRUCTIONS = 256;
     private static final String VECTOR_ADD_SHADER_RESOURCE = "/quantified/shaders/vulkan/vector_add.comp.spv";
     private static final String MATRIX_MULTIPLY_SHADER_RESOURCE = "/quantified/shaders/vulkan/matrix_multiply.comp.spv";
     private static final String MONTE_CARLO_PI_SHADER_RESOURCE = "/quantified/shaders/vulkan/monte_carlo_pi.comp.spv";
     private static final String TERRAIN_GENERATION_SHADER_RESOURCE = "/quantified/shaders/vulkan/terrain_generation.comp.spv";
-    private static final String MC_DENSITY_FUNCTIONS_SHADER_RESOURCE = "/quantified/shaders/vulkan/mc_density_functions.comp.spv";
     private static final String AUTO_RUNTIME_INIT_PROPERTY = "quantified.vulkan.autoRuntimeInit";
+    private static final String PROBE_ONLY_PROPERTY = "quantified.vulkan.probeOnly";
+    private static final String TIMELINE_SEMAPHORES_PROPERTY = "quantified.vulkan.timelineSemaphores";
     private static final String REQUIRE_DETERMINISTIC_FLOAT32_PROPERTY = "quantified.vulkan.requireDeterministicFloat32";
     private static final boolean REQUIRE_DETERMINISTIC_FLOAT32 =
         Boolean.parseBoolean(System.getProperty(REQUIRE_DETERMINISTIC_FLOAT32_PROPERTY, "true"));
@@ -121,31 +132,11 @@ public final class VulkanManager {
     private static volatile State state;
     private static volatile RuntimeStatus lastStatus = RuntimeStatus.failed("Vulkan not initialized");
     private static volatile long nextInitRetryMs = 0L;
-    private static final ConcurrentHashMap<String, byte[]> REGISTERED_DENSITY_SHADERS = new ConcurrentHashMap<>();
-
     private VulkanManager() {
     }
 
     public static boolean isAvailable() {
         return INITIALIZED.get() && state != null;
-    }
-
-    public static void registerDensityShader(String key, byte[] spirv) {
-        Objects.requireNonNull(key, "key");
-        Objects.requireNonNull(spirv, "spirv");
-        REGISTERED_DENSITY_SHADERS.put(key, spirv.clone());
-    }
-
-    public static void unregisterDensityShader(String key) {
-        Objects.requireNonNull(key, "key");
-        REGISTERED_DENSITY_SHADERS.remove(key);
-        State local = state;
-        if (local != null) {
-            Program removed = local.programs.remove("density_shader:" + key);
-            if (removed != null) {
-                destroyProgram(local, removed);
-            }
-        }
     }
 
     public static RuntimeStatus runtimeStatus() {
@@ -174,7 +165,22 @@ public final class VulkanManager {
         return active != null && !active.isDone();
     }
 
+    private static void queueAutomaticWarmup(String reason) {
+        if (INITIALIZED.get() && state != null) {
+            return;
+        }
+        if (isInitRetryCoolingDown() || !VulkanRuntime.isAvailable()) {
+            return;
+        }
+        DEFERRED_RUNTIME_INIT_LOGGED.set(false);
+        warmupAsync(reason);
+    }
+
     public static CompletableFuture<Boolean> forceProbe() {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            lastStatus = RuntimeStatus.failed("GPU acceleration disabled in configuration");
+            return CompletableFuture.completedFuture(false);
+        }
         CompletableFuture<Boolean> existing = ACTIVE_PROBE.get();
         if (existing != null && !existing.isDone()) {
             return existing;
@@ -208,10 +214,12 @@ public final class VulkanManager {
         try {
             VulkanRuntime.AvailabilitySnapshot snapshot = VulkanRuntime.reprobe();
             if (snapshot.available()) {
-                lastStatus = RuntimeStatus.failed("Vulkan probe succeeded; runtime initialization deferred until first use");
-                LOGGER.info("Vulkan probe succeeded for {} device(s); runtime initialization deferred until first use",
+                LOGGER.info("Vulkan probe succeeded for {} device(s); queueing runtime warmup",
                     snapshot.devices().size());
                 DeveloperOverlayManager.recordApiLog("[Vulkan] Probe succeeded - " + deviceName());
+                if (!Boolean.getBoolean(PROBE_ONLY_PROPERTY)) {
+                    queueAutomaticWarmup("probe-succeeded");
+                }
                 return true;
             }
             String reason = snapshot.failureReason();
@@ -229,6 +237,10 @@ public final class VulkanManager {
     }
 
     public static boolean forceProbeSynchronous() {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            lastStatus = RuntimeStatus.failed("GPU acceleration disabled in configuration");
+            return false;
+        }
         if (INITIALIZED.get() && state != null) {
             return true;
         }
@@ -241,10 +253,12 @@ public final class VulkanManager {
         // vkCreateInstance on a small-stack thread (render thread etc.).
         VulkanRuntime.AvailabilitySnapshot snapshot = VulkanRuntime.reprobe();
         if (snapshot.available()) {
-            lastStatus = RuntimeStatus.failed("Vulkan probe succeeded; runtime initialization deferred until first use");
-            LOGGER.info("Vulkan probe succeeded for {} device(s); runtime initialization deferred until first use",
+            LOGGER.info("Vulkan probe succeeded for {} device(s); queueing runtime warmup",
                 snapshot.devices().size());
             DeveloperOverlayManager.recordApiLog("[Vulkan] Probe succeeded - " + deviceName());
+            if (!Boolean.getBoolean(PROBE_ONLY_PROPERTY)) {
+                queueAutomaticWarmup("probe-succeeded-sync");
+            }
             return true;
         }
         String reason = snapshot.failureReason();
@@ -263,6 +277,10 @@ public final class VulkanManager {
     }
 
     public static CompletableFuture<Boolean> warmupAsync(String reason) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            lastStatus = RuntimeStatus.failed("GPU acceleration disabled in configuration");
+            return CompletableFuture.completedFuture(false);
+        }
         if (INITIALIZED.get() && state != null) {
             return CompletableFuture.completedFuture(true);
         }
@@ -305,6 +323,10 @@ public final class VulkanManager {
     }
 
     public static boolean ensureInitialised() {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            lastStatus = RuntimeStatus.failed("GPU acceleration disabled in configuration");
+            return false;
+        }
         if (INITIALIZED.get() && state != null) {
             return true;
         }
@@ -412,12 +434,41 @@ public final class VulkanManager {
 
     public static <T> CompletableFuture<T> executeOnGpu(VulkanTask<T> task) {
         Objects.requireNonNull(task, "task");
+        if (!INITIALIZED.get() || state == null) {
+            if (!isInitRetryCoolingDown() && VulkanRuntime.isAvailable()) {
+                queueAutomaticWarmup("execute-on-gpu");
+            }
+            return CompletableFuture.completedFuture(task.cpuFallback().get());
+        }
+        if (shouldExecuteInline(task)) {
+            try {
+                if (!ensureInitialised()) {
+                    return CompletableFuture.completedFuture(task.cpuFallback().get());
+                }
+                return CompletableFuture.completedFuture(task.executeOnGPU(VulkanManagerHolder.CONTEXT));
+            } catch (Throwable throwable) {
+                LOGGER.debug("Inline Vulkan execution failed, falling back to async for task {}", task.name(), throwable);
+            }
+        }
         return CompletableFuture.supplyAsync(() -> {
             if (!ensureInitialised()) {
-                throw new IllegalStateException(runtimeStatus().failureReason());
+                return task.cpuFallback().get();
             }
-            return task.executeOnGPU(new VulkanContext(VulkanManagerHolder.INSTANCE));
+            return task.executeOnGPU(VulkanManagerHolder.CONTEXT);
         }, EXECUTOR);
+    }
+
+    private static boolean shouldExecuteInline(VulkanTask<?> task) {
+        if (task.timeout().isPresent()) {
+            return false;
+        }
+        if (Thread.currentThread().getName().startsWith("Quantified-Vulkan")) {
+            return false;
+        }
+        if (task.estimatedVramBytes() > INLINE_VRAM_BYTES_LIMIT) {
+            return false;
+        }
+        return task.estimatedComputeUnits() <= INLINE_COMPUTE_UNITS_LIMIT;
     }
 
     public static boolean canAcceptTask(VulkanTask<?> task) {
@@ -431,14 +482,12 @@ public final class VulkanManager {
             if (isInitRetryCoolingDown() || !VulkanRuntime.isAvailable()) {
                 return false;
             }
-            if (Boolean.getBoolean(AUTO_RUNTIME_INIT_PROPERTY)) {
-                warmupAsync("auto-runtime-init");
-            } else if (DEFERRED_RUNTIME_INIT_LOGGED.compareAndSet(false, true)) {
-                String message = "Vulkan probe is available, but the runtime isn't ready yet, deffering tasks to the CPU."
-                    + "Set -D" + AUTO_RUNTIME_INIT_PROPERTY + "=true to allow automatic runtime warmup.";
-                lastStatus = RuntimeStatus.failed(message);
+            queueAutomaticWarmup("task-submission");
+            if (DEFERRED_RUNTIME_INIT_LOGGED.compareAndSet(false, true)) {
+                String message = "Vulkan probe found a device and runtime warmup has been queued. "
+                    + "Tasks will fall back to the CPU until the runtime is ready.";
                 LOGGER.info(message);
-                DeveloperOverlayManager.recordApiLog("[Vulkan] Runtime init has been deferred. Batches will fall back to the CPU until runtime is ready.");
+                DeveloperOverlayManager.recordApiLog("[Vulkan] Runtime warmup queued automatically. Batches will fall back to the CPU until runtime is ready.");
             }
             return false;
         }
@@ -514,7 +563,7 @@ public final class VulkanManager {
         try (WorkspaceLease lease = acquireWorkspace(local, program,
             "matrix_multiply:" + m + ":" + n + ":" + p,
             WorkloadProfile.COMPUTE_DENSE,
-            groupCount(m, 16), groupCount(n, 16), 1,
+            groupCount(n, 16), groupCount(m, 16), 1,
             2,
             new int[]{m, n, p},
             (long) flatA.length * Float.BYTES,
@@ -536,7 +585,7 @@ public final class VulkanManager {
         Program program = local.programs.get("monte_carlo_pi");
         try (WorkspaceLease lease = acquireWorkspace(local, program, "monte_carlo_pi:" + samples,
             WorkloadProfile.REDUCTION,
-            groupCount(samples, 256), 1, 1,
+            groupCount(samples, 256 * MONTE_CARLO_SAMPLES_PER_INVOCATION), 1, 1,
             0,
             new int[]{samples},
             Integer.BYTES)) {
@@ -573,125 +622,6 @@ public final class VulkanManager {
         }
     }
 
-    float[] executeMcDensityFunctions(float[] packedCoords, float[] encodedProgram, int instructionCount) {
-        return executeMcDensityFunctions(packedCoords, encodedProgram, instructionCount, new float[0], 0);
-    }
-
-    float[] executeMcDensityFunctions(float[] packedCoords,
-                                      float[] encodedProgram,
-                                      int instructionCount,
-                                      float[] auxValues,
-                                      int auxValueCount) {
-        Objects.requireNonNull(packedCoords, "packedCoords");
-        Objects.requireNonNull(encodedProgram, "encodedProgram");
-        Objects.requireNonNull(auxValues, "auxValues");
-        if (packedCoords.length % 3 != 0) {
-            throw new IllegalArgumentException("Packed coordinate array must be xyz triples");
-        }
-        int sampleCount = packedCoords.length / 3;
-        if (sampleCount == 0) {
-            return new float[0];
-        }
-        int availableInstructions = encodedProgram.length / MC_DENSITY_PROGRAM_STRIDE;
-        if (instructionCount <= 0 || instructionCount > availableInstructions) {
-            throw new IllegalArgumentException("Invalid density instruction count: " + instructionCount
-                + " available=" + availableInstructions);
-        }
-        if (instructionCount > MC_DENSITY_MAX_INSTRUCTIONS) {
-            throw new IllegalArgumentException("Density instruction count exceeds "
-                + MC_DENSITY_MAX_INSTRUCTIONS + ": " + instructionCount);
-        }
-        if (auxValueCount < 0) {
-            throw new IllegalArgumentException("Aux value count must be non-negative: " + auxValueCount);
-        }
-        if (auxValues.length < auxValueCount * sampleCount) {
-            throw new IllegalArgumentException("Aux values are shorter than aux count: "
-                + auxValues.length + " floats for " + auxValueCount + " aux values and " + sampleCount + " samples");
-        }
-
-        State local = requireState();
-        Program program = local.programs.get("mc_density_functions");
-        float[] programSlice = Arrays.copyOf(encodedProgram, instructionCount * MC_DENSITY_PROGRAM_STRIDE);
-        try (WorkspaceLease lease = prepareMcDensityDispatch(local, program, packedCoords, sampleCount,
-            programSlice, instructionCount, auxValues, auxValueCount)) {
-            dispatch(local, lease.workspace());
-            return readFloatArray(lease.workspace().buffers[3], sampleCount);
-        }
-    }
-
-    float[][] executeMcDensityFunctionBatch(List<McDensityVulkanTask> tasks) {
-        Objects.requireNonNull(tasks, "tasks");
-        if (tasks.isEmpty()) {
-            return new float[0][];
-        }
-
-        float[][] results = new float[tasks.size()][];
-        List<McDensityBatchGroup> groups = new ArrayList<>();
-        for (int i = 0; i < tasks.size(); i++) {
-            McDensityVulkanTask task = Objects.requireNonNull(tasks.get(i), "tasks[" + i + "]");
-            if (task.sampleCount() == 0) {
-                results[i] = new float[0];
-                continue;
-            }
-            McDensityBatchGroup group = null;
-            for (McDensityBatchGroup candidate : groups) {
-                if (candidate.matches(task)) {
-                    group = candidate;
-                    break;
-                }
-            }
-            if (group == null) {
-                group = new McDensityBatchGroup(task.encodedProgram(), task.instructionCount(), task.auxValueCount(), task.shaderKey());
-                groups.add(group);
-            }
-            group.add(i, task);
-        }
-
-        List<PreparedMcDensityGroup> prepared = new ArrayList<>(groups.size());
-        try {
-            State local = requireState();
-            Program defaultProgram = local.programs.get("mc_density_functions");
-            for (McDensityBatchGroup group : groups) {
-                Program program = resolveProgram(local, defaultProgram, group.shaderKey);
-                float[] packedCoords = new float[group.totalSamples * 3];
-                int coordOffset = 0;
-                for (McDensityVulkanTask task : group.tasks) {
-                    float[] taskCoords = task.packedCoords();
-                    System.arraycopy(taskCoords, 0, packedCoords, coordOffset, taskCoords.length);
-                    coordOffset += taskCoords.length;
-                }
-
-                float[] auxValues = group.combineAuxValues();
-                WorkspaceLease lease = prepareMcDensityDispatch(local, program, packedCoords, group.totalSamples,
-                    group.encodedProgram, group.instructionCount, auxValues, group.auxValueCount);
-                prepared.add(new PreparedMcDensityGroup(group, lease));
-            }
-
-            List<DispatchWorkspace> workspaces = new ArrayList<>(prepared.size());
-            for (PreparedMcDensityGroup preparedGroup : prepared) {
-                workspaces.add(preparedGroup.lease.workspace());
-            }
-            dispatch(local, workspaces);
-
-            for (PreparedMcDensityGroup preparedGroup : prepared) {
-                McDensityBatchGroup group = preparedGroup.group;
-                float[] combined = readFloatArray(preparedGroup.lease.workspace().buffers[3], group.totalSamples);
-                int outputOffset = 0;
-                for (int i = 0; i < group.tasks.size(); i++) {
-                    McDensityVulkanTask task = group.tasks.get(i);
-                    int sampleCount = task.sampleCount();
-                    results[group.indices.get(i)] = Arrays.copyOfRange(combined, outputOffset, outputOffset + sampleCount);
-                    outputOffset += sampleCount;
-                }
-            }
-        } finally {
-            for (PreparedMcDensityGroup preparedGroup : prepared) {
-                preparedGroup.lease.close();
-            }
-        }
-        return results;
-    }
-
     private State requireState() {
         State local = state;
         if (local == null && !ensureInitialised()) {
@@ -713,6 +643,8 @@ public final class VulkanManager {
                     + floatControls.summary() + ". Set -D" + REQUIRE_DETERMINISTIC_FLOAT32_PROPERTY
                     + "=false to allow faster-but-less-strict GPU math.");
             }
+            boolean timelineSemaphoreSupported = Boolean.parseBoolean(System.getProperty(TIMELINE_SEMAPHORES_PROPERTY, "true"))
+                && supportsTimelineSemaphores(physicalDevice, apiVersion, stack);
             FloatBuffer priorities = stack.floats(1.0f);
             VkDeviceQueueCreateInfo.Buffer queueInfo = VkDeviceQueueCreateInfo.calloc(1, stack)
                 .sType(VK10.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
@@ -722,10 +654,17 @@ public final class VulkanManager {
             VkDeviceCreateInfo deviceInfo = VkDeviceCreateInfo.calloc(stack)
                 .sType(VK10.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
                 .pQueueCreateInfos(queueInfo);
+            VkPhysicalDeviceVulkan12Features enabledVulkan12Features = null;
+            if (timelineSemaphoreSupported) {
+                enabledVulkan12Features = VkPhysicalDeviceVulkan12Features.calloc(stack)
+                    .sType(VK12.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+                    .timelineSemaphore(true);
+                deviceInfo.pNext(enabledVulkan12Features.address());
+            }
 
             PointerBuffer devicePtr = stack.mallocPointer(1);
             checkVk(VK10.vkCreateDevice(physicalDevice, deviceInfo, null, devicePtr), "vkCreateDevice");
-            VkDevice device = QuantifiedVkBootstrap.wrapDevice(devicePtr.get(0), physicalDevice, deviceInfo, apiVersion);
+            VkDevice device = new VkDevice(devicePtr.get(0), physicalDevice, deviceInfo, apiVersion);
 
             PointerBuffer queuePtr = stack.mallocPointer(1);
             VK10.vkGetDeviceQueue(device, selection.computeQueueFamily, 0, queuePtr);
@@ -740,12 +679,13 @@ public final class VulkanManager {
 
             State created = new State(instance, physicalDevice, device, queue,
                 poolPtr.get(0), selection.deviceName,
-                selection.deviceType == VK10.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
+                selection.deviceType == VK10.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
+                new VulkanMemoryAllocator(device),
+                timelineSemaphoreSupported ? createTimelineSemaphore(device, stack) : VK10.VK_NULL_HANDLE);
             created.programs.put("vector_add", createProgram(created, "vector_add", VECTOR_ADD_SHADER_RESOURCE, 3, Integer.BYTES));
             created.programs.put("matrix_multiply", createProgram(created, "matrix_multiply", MATRIX_MULTIPLY_SHADER_RESOURCE, 3, Integer.BYTES * 3));
             created.programs.put("monte_carlo_pi", createProgram(created, "monte_carlo_pi", MONTE_CARLO_PI_SHADER_RESOURCE, 1, Integer.BYTES));
             created.programs.put("terrain_generation", createProgram(created, "terrain_generation", TERRAIN_GENERATION_SHADER_RESOURCE, 2, Integer.BYTES));
-            created.programs.put("mc_density_functions", createProgram(created, "mc_density_functions", MC_DENSITY_FUNCTIONS_SHADER_RESOURCE, 4, Integer.BYTES * 2));
             return created;
         } catch (Throwable throwable) {
             try {
@@ -775,6 +715,32 @@ public final class VulkanManager {
         return autoSelectCandidates(selections).stream()
             .max((left, right) -> Double.compare(left.score(), right.score()))
             .orElseThrow(() -> new IllegalStateException("No Vulkan device with a compute queue found"));
+    }
+
+    private static boolean supportsTimelineSemaphores(VkPhysicalDevice physicalDevice, int apiVersion, MemoryStack stack) {
+        if (compareApiVersion(apiVersion, 1, 2, 0) < 0) {
+            return false;
+        }
+        VkPhysicalDeviceVulkan12Features features12 = VkPhysicalDeviceVulkan12Features.calloc(stack)
+            .sType(VK12.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+        VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack)
+            .sType(VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
+            .pNext(features12.address());
+        VK11.vkGetPhysicalDeviceFeatures2(physicalDevice, features2);
+        return features12.timelineSemaphore();
+    }
+
+    private static long createTimelineSemaphore(VkDevice device, MemoryStack stack) {
+        VkSemaphoreTypeCreateInfo typeInfo = VkSemaphoreTypeCreateInfo.calloc(stack)
+            .sType(VK12.VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO)
+            .semaphoreType(VK12.VK_SEMAPHORE_TYPE_TIMELINE)
+            .initialValue(0L);
+        VkSemaphoreCreateInfo semaphoreInfo = VkSemaphoreCreateInfo.calloc(stack)
+            .sType(VK10.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO)
+            .pNext(typeInfo.address());
+        LongBuffer semaphorePtr = stack.mallocLong(1);
+        checkVk(VK10.vkCreateSemaphore(device, semaphoreInfo, null, semaphorePtr), "vkCreateSemaphore");
+        return semaphorePtr.get(0);
     }
 
     private static List<PhysicalSelection> enumeratePhysicalDevices(VkInstance instance) {
@@ -907,7 +873,7 @@ public final class VulkanManager {
 
                     instancePtr = MemoryUtil.memAllocPointer(1);
                     checkVk(VK10.vkCreateInstance(instanceInfo, null, instancePtr), "vkCreateInstance");
-                    return QuantifiedVkBootstrap.wrapInstance(instancePtr.get(0), instanceInfo);
+                    return new VkInstance(instancePtr.get(0), instanceInfo);
                 } finally {
                     if (instancePtr != null) {
                         MemoryUtil.memFree(instancePtr);
@@ -1299,28 +1265,6 @@ public final class VulkanManager {
         }
     }
 
-    private static Program resolveProgram(State state, Program defaultProgram, String shaderKey) {
-        if (shaderKey == null) {
-            return defaultProgram;
-        }
-        String programKey = "density_shader:" + shaderKey;
-        Program cached = state.programs.get(programKey);
-        if (cached != null) {
-            return cached;
-        }
-        byte[] spirv = REGISTERED_DENSITY_SHADERS.get(shaderKey);
-        if (spirv == null) {
-            return defaultProgram;
-        }
-        Program compiled = createProgramFromBytes(state, programKey, spirv, 4, 8);
-        Program existing = state.programs.putIfAbsent(programKey, compiled);
-        if (existing != null) {
-            destroyProgram(state, compiled);
-            return existing;
-        }
-        return compiled;
-    }
-
     private static WorkspaceLease acquireWorkspace(State state,
                                                    Program program,
                                                    String workspaceKey,
@@ -1335,65 +1279,6 @@ public final class VulkanManager {
             ignored -> createWorkspacePool(state, program, workloadProfile, groupCountX, groupCountY, groupCountZ,
                 inputBufferCount, pushConstants, bufferSizes));
         return new WorkspaceLease(pool, pool.borrow());
-    }
-
-    private static WorkspaceLease prepareMcDensityDispatch(State state,
-                                                           Program program,
-                                                           float[] packedCoords,
-                                                           int sampleCount,
-                                                           float[] programSlice,
-                                                           int instructionCount,
-                                                           float[] auxValues,
-                                                           int auxValueCount) {
-        int sampleCapacity = alignUp(sampleCount, MC_DENSITY_LOCAL_SIZE_X);
-        int programHash = Arrays.hashCode(programSlice);
-        WorkspaceLease lease = acquireWorkspace(state, program,
-            "mc_density_functions:" + sampleCapacity + ":" + instructionCount + ":" + auxValueCount + ":"
-                + Integer.toHexString(programHash),
-            WorkloadProfile.COMPUTE_DENSE,
-            groupCount(sampleCapacity, MC_DENSITY_LOCAL_SIZE_X), 1, 1,
-            3,
-            new int[]{sampleCapacity, instructionCount},
-            (long) sampleCapacity * 3L * Float.BYTES,
-            (long) programSlice.length * Float.BYTES,
-            Math.max(1L, (long) auxValueCount * sampleCapacity) * Float.BYTES,
-            (long) sampleCapacity * Float.BYTES);
-        boolean success = false;
-        try {
-            DispatchWorkspace workspace = lease.workspace();
-            writeFloatArrayPadded(workspace.buffers[0], packedCoords, sampleCapacity * 3);
-            writeFloatArray(workspace.buffers[1], programSlice);
-            writeMcDensityAuxValues(workspace.buffers[2], auxValues, auxValueCount, sampleCount, sampleCapacity);
-            success = true;
-            return lease;
-        } finally {
-            if (!success) {
-                lease.close();
-            }
-        }
-    }
-
-    private static void writeMcDensityAuxValues(AllocatedBuffer buffer,
-                                                float[] values,
-                                                int auxValueCount,
-                                                int sampleCount,
-                                                int sampleCapacity) {
-        int paddedLength = Math.max(1, auxValueCount * sampleCapacity);
-        FloatBuffer mapped = MemoryUtil.memFloatBuffer(buffer.mappedPointer, paddedLength);
-        mapped.clear();
-        if (auxValueCount <= 0) {
-            mapped.put(0.0f);
-            mapped.flip();
-            return;
-        }
-        for (int auxIndex = 0; auxIndex < auxValueCount; auxIndex++) {
-            int srcOffset = auxIndex * sampleCount;
-            mapped.put(values, srcOffset, sampleCount);
-            for (int i = sampleCount; i < sampleCapacity; i++) {
-                mapped.put(0.0f);
-            }
-        }
-        mapped.flip();
     }
 
     private static DispatchWorkspacePool createWorkspacePool(State state,
@@ -1525,17 +1410,65 @@ public final class VulkanManager {
                             .size(workspace.buffers[i].sizeBytes));
                 }
             }
-            if (hasStagedInputs) {
-                VkMemoryBarrier.Buffer uploadBarrier = VkMemoryBarrier.calloc(1, stack)
-                    .sType(VK10.VK_STRUCTURE_TYPE_MEMORY_BARRIER)
-                    .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
-                    .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT);
+            int stagedInputCount = 0;
+            int hostInputCount = 0;
+            for (int i = 0; i < workspace.inputBufferCount; i++) {
+                if (workspace.buffers[i].staged) {
+                    stagedInputCount++;
+                } else {
+                    hostInputCount++;
+                }
+            }
+            if (hostInputCount > 0) {
+                VkBufferMemoryBarrier.Buffer hostInputBarriers = VkBufferMemoryBarrier.calloc(hostInputCount, stack);
+                int barrierIndex = 0;
+                for (int i = 0; i < workspace.inputBufferCount; i++) {
+                    AllocatedBuffer buffer = workspace.buffers[i];
+                    if (buffer.staged) {
+                        continue;
+                    }
+                    hostInputBarriers.get(barrierIndex++)
+                        .sType(VK10.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                        .srcAccessMask(VK10.VK_ACCESS_HOST_WRITE_BIT)
+                        .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT)
+                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .buffer(buffer.hostBuffer)
+                        .offset(0)
+                        .size(buffer.sizeBytes);
+                }
+                VK10.vkCmdPipelineBarrier(workspace.commandBuffer,
+                    VK10.VK_PIPELINE_STAGE_HOST_BIT,
+                    VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0,
+                    null,
+                    hostInputBarriers,
+                    null);
+            }
+            if (stagedInputCount > 0) {
+                VkBufferMemoryBarrier.Buffer uploadBarriers = VkBufferMemoryBarrier.calloc(stagedInputCount, stack);
+                int barrierIndex = 0;
+                for (int i = 0; i < workspace.inputBufferCount; i++) {
+                    AllocatedBuffer buffer = workspace.buffers[i];
+                    if (!buffer.staged) {
+                        continue;
+                    }
+                    uploadBarriers.get(barrierIndex++)
+                        .sType(VK10.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                        .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT)
+                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .buffer(buffer.deviceBuffer)
+                        .offset(0)
+                        .size(buffer.sizeBytes);
+                }
                 VK10.vkCmdPipelineBarrier(workspace.commandBuffer,
                     VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     0,
-                    uploadBarrier,
                     null,
+                    uploadBarriers,
                     null);
             }
 
@@ -1556,29 +1489,70 @@ public final class VulkanManager {
                 Math.max(1, workspace.groupCountY),
                 Math.max(1, workspace.groupCountZ));
 
-            boolean hasStagedOutputs = false;
+            int stagedOutputCount = 0;
+            int hostOutputCount = 0;
             for (int i = workspace.inputBufferCount; i < workspace.buffers.length; i++) {
                 if (workspace.buffers[i].staged) {
-                    hasStagedOutputs = true;
-                    break;
+                    stagedOutputCount++;
+                } else {
+                    hostOutputCount++;
                 }
             }
 
-            VkMemoryBarrier.Buffer barrier = VkMemoryBarrier.calloc(1, stack)
-                .sType(VK10.VK_STRUCTURE_TYPE_MEMORY_BARRIER)
-                .srcAccessMask(VK10.VK_ACCESS_SHADER_WRITE_BIT)
-                .dstAccessMask(hasStagedOutputs
-                    ? (VK10.VK_ACCESS_TRANSFER_READ_BIT | VK10.VK_ACCESS_HOST_READ_BIT | VK10.VK_ACCESS_HOST_WRITE_BIT)
-                    : (VK10.VK_ACCESS_HOST_READ_BIT | VK10.VK_ACCESS_HOST_WRITE_BIT));
-            VK10.vkCmdPipelineBarrier(workspace.commandBuffer,
-                VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                hasStagedOutputs ? (VK10.VK_PIPELINE_STAGE_TRANSFER_BIT | VK10.VK_PIPELINE_STAGE_HOST_BIT) : VK10.VK_PIPELINE_STAGE_HOST_BIT,
-                0,
-                barrier,
-                null,
-                null);
+            if (stagedOutputCount > 0) {
+                VkBufferMemoryBarrier.Buffer stagedOutputBarriers = VkBufferMemoryBarrier.calloc(stagedOutputCount, stack);
+                int barrierIndex = 0;
+                for (int i = workspace.inputBufferCount; i < workspace.buffers.length; i++) {
+                    AllocatedBuffer buffer = workspace.buffers[i];
+                    if (!buffer.staged) {
+                        continue;
+                    }
+                    stagedOutputBarriers.get(barrierIndex++)
+                        .sType(VK10.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                        .srcAccessMask(VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                        .dstAccessMask(VK10.VK_ACCESS_TRANSFER_READ_BIT)
+                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .buffer(buffer.deviceBuffer)
+                        .offset(0)
+                        .size(buffer.sizeBytes);
+                }
+                VK10.vkCmdPipelineBarrier(workspace.commandBuffer,
+                    VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    null,
+                    stagedOutputBarriers,
+                    null);
+            }
+            if (hostOutputCount > 0) {
+                VkBufferMemoryBarrier.Buffer hostOutputBarriers = VkBufferMemoryBarrier.calloc(hostOutputCount, stack);
+                int barrierIndex = 0;
+                for (int i = workspace.inputBufferCount; i < workspace.buffers.length; i++) {
+                    AllocatedBuffer buffer = workspace.buffers[i];
+                    if (buffer.staged) {
+                        continue;
+                    }
+                    hostOutputBarriers.get(barrierIndex++)
+                        .sType(VK10.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                        .srcAccessMask(VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                        .dstAccessMask(VK10.VK_ACCESS_HOST_READ_BIT)
+                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .buffer(buffer.hostBuffer)
+                        .offset(0)
+                        .size(buffer.sizeBytes);
+                }
+                VK10.vkCmdPipelineBarrier(workspace.commandBuffer,
+                    VK10.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK10.VK_PIPELINE_STAGE_HOST_BIT,
+                    0,
+                    null,
+                    hostOutputBarriers,
+                    null);
+            }
 
-            if (hasStagedOutputs) {
+            if (stagedOutputCount > 0) {
                 for (int i = workspace.inputBufferCount; i < workspace.buffers.length; i++) {
                     if (!workspace.buffers[i].staged) {
                         continue;
@@ -1591,16 +1565,29 @@ public final class VulkanManager {
                             .dstOffset(0)
                             .size(workspace.buffers[i].sizeBytes));
                 }
-                VkMemoryBarrier.Buffer readbackBarrier = VkMemoryBarrier.calloc(1, stack)
-                    .sType(VK10.VK_STRUCTURE_TYPE_MEMORY_BARRIER)
-                    .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
-                    .dstAccessMask(VK10.VK_ACCESS_HOST_READ_BIT);
+                VkBufferMemoryBarrier.Buffer readbackBarriers = VkBufferMemoryBarrier.calloc(stagedOutputCount, stack);
+                int barrierIndex = 0;
+                for (int i = workspace.inputBufferCount; i < workspace.buffers.length; i++) {
+                    AllocatedBuffer buffer = workspace.buffers[i];
+                    if (!buffer.staged) {
+                        continue;
+                    }
+                    readbackBarriers.get(barrierIndex++)
+                        .sType(VK10.VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER)
+                        .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .dstAccessMask(VK10.VK_ACCESS_HOST_READ_BIT)
+                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                        .buffer(buffer.hostBuffer)
+                        .offset(0)
+                        .size(buffer.sizeBytes);
+                }
                 VK10.vkCmdPipelineBarrier(workspace.commandBuffer,
                     VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK10.VK_PIPELINE_STAGE_HOST_BIT,
                     0,
-                    readbackBarrier,
                     null,
+                    readbackBarriers,
                     null);
             }
             checkVk(VK10.vkEndCommandBuffer(workspace.commandBuffer), "vkEndCommandBuffer");
@@ -1617,12 +1604,7 @@ public final class VulkanManager {
 
         boolean useDeviceLocal = sizeBytes >= DEVICE_LOCAL_TRANSFER_THRESHOLD_BYTES;
         return switch (workloadProfile) {
-            case BANDWIDTH -> {
-                if (useDeviceLocal) {
-                    yield createStagedStorageBuffer(state, sizeBytes, role == BufferRole.OUTPUT);
-                }
-                yield createHostVisibleStorageBuffer(state, sizeBytes, role == BufferRole.OUTPUT);
-            }
+            case BANDWIDTH -> createHostVisibleStorageBuffer(state, sizeBytes, role == BufferRole.OUTPUT);
             case COMPUTE_DENSE -> {
                 if (useDeviceLocal) {
                     yield createStagedStorageBuffer(state, sizeBytes, role == BufferRole.OUTPUT);
@@ -1654,8 +1636,8 @@ public final class VulkanManager {
                 VK10.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 0,
                 false);
-            return new AllocatedBuffer(deviceBuffer.buffer, deviceBuffer.memory, hostBuffer.buffer, hostBuffer.memory,
-                sizeBytes, hostBuffer.mappedPointer, true);
+            return new AllocatedBuffer(deviceBuffer.buffer, deviceBuffer.memory, deviceBuffer.allocation,
+                hostBuffer.buffer, hostBuffer.memory, hostBuffer.allocation, sizeBytes, hostBuffer.mappedPointer, true);
         } catch (Throwable throwable) {
             destroyRawBuffer(state, hostBuffer);
             destroyRawBuffer(state, deviceBuffer);
@@ -1670,7 +1652,7 @@ public final class VulkanManager {
             VK10.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK10.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
             preferHostCached ? VK10.VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0,
             true);
-        return new AllocatedBuffer(buffer.buffer, buffer.memory, buffer.buffer, buffer.memory,
+        return new AllocatedBuffer(buffer.buffer, buffer.memory, buffer.allocation, buffer.buffer, buffer.memory, buffer.allocation,
             sizeBytes, buffer.mappedPointer, false);
     }
 
@@ -1695,31 +1677,20 @@ public final class VulkanManager {
             VK10.vkGetBufferMemoryRequirements(state.device, buffer, requirements);
 
             int memoryType = findMemoryType(state.physicalDevice, requirements.memoryTypeBits(), requiredFlags, preferredFlags, stack);
-            VkMemoryAllocateInfo allocInfo = VkMemoryAllocateInfo.calloc(stack)
-                .sType(VK10.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
-                .allocationSize(requirements.size())
-                .memoryTypeIndex(memoryType);
-
-            LongBuffer memoryPtr = stack.mallocLong(1);
+            MemoryAllocation allocation;
             try {
-                checkVk(VK10.vkAllocateMemory(state.device, allocInfo, null, memoryPtr), "vkAllocateMemory");
+                allocation = state.memoryAllocator.allocate(memoryType, requirements.size(), requirements.alignment(), mapMemory);
             } catch (Throwable throwable) {
                 VK10.vkDestroyBuffer(state.device, buffer, null);
                 throw throwable;
             }
 
-            long memory = memoryPtr.get(0);
             try {
-                checkVk(VK10.vkBindBufferMemory(state.device, buffer, memory, 0), "vkBindBufferMemory");
-                long mappedPointer = MemoryUtil.NULL;
-                if (mapMemory) {
-                    PointerBuffer mappedPtr = stack.mallocPointer(1);
-                    checkVk(VK10.vkMapMemory(state.device, memory, 0, sizeBytes, 0, mappedPtr), "vkMapMemory");
-                    mappedPointer = mappedPtr.get(0);
-                }
-                return new RawBuffer(buffer, memory, sizeBytes, mappedPointer);
+                checkVk(VK10.vkBindBufferMemory(state.device, buffer, allocation.memory, allocation.offset), "vkBindBufferMemory");
+                long mappedPointer = allocation.mappedBase == MemoryUtil.NULL ? MemoryUtil.NULL : allocation.mappedBase + allocation.offset;
+                return new RawBuffer(buffer, allocation.memory, allocation.offset, sizeBytes, mappedPointer, allocation);
             } catch (Throwable throwable) {
-                VK10.vkFreeMemory(state.device, memory, null);
+                state.memoryAllocator.free(allocation);
                 VK10.vkDestroyBuffer(state.device, buffer, null);
                 throw throwable;
             }
@@ -1730,9 +1701,11 @@ public final class VulkanManager {
         if (state == null || buffer == null) {
             return;
         }
-        destroyRawBuffer(state, new RawBuffer(buffer.hostBuffer, buffer.hostMemory, buffer.sizeBytes, buffer.mappedPointer));
+        destroyRawBuffer(state, new RawBuffer(buffer.hostBuffer, buffer.hostMemory, buffer.hostAllocation.offset,
+            buffer.sizeBytes, buffer.mappedPointer, buffer.hostAllocation));
         if (buffer.staged && (buffer.deviceBuffer != buffer.hostBuffer || buffer.deviceMemory != buffer.hostMemory)) {
-            destroyRawBuffer(state, new RawBuffer(buffer.deviceBuffer, buffer.deviceMemory, buffer.sizeBytes, MemoryUtil.NULL));
+            destroyRawBuffer(state, new RawBuffer(buffer.deviceBuffer, buffer.deviceMemory, buffer.deviceAllocation.offset,
+                buffer.sizeBytes, MemoryUtil.NULL, buffer.deviceAllocation));
         }
     }
 
@@ -1741,17 +1714,11 @@ public final class VulkanManager {
             return;
         }
         try {
-            if (buffer.mappedPointer != MemoryUtil.NULL) {
-                VK10.vkUnmapMemory(state.device, buffer.memory);
-            }
-        } catch (Throwable ignored) {
-        }
-        try {
             VK10.vkDestroyBuffer(state.device, buffer.buffer, null);
         } catch (Throwable ignored) {
         }
         try {
-            VK10.vkFreeMemory(state.device, buffer.memory, null);
+            state.memoryAllocator.free(buffer.allocation);
         } catch (Throwable ignored) {
         }
     }
@@ -1791,6 +1758,20 @@ public final class VulkanManager {
         FloatBuffer mapped = MemoryUtil.memFloatBuffer(buffer.mappedPointer, values.length);
         mapped.clear();
         mapped.put(values);
+        mapped.flip();
+    }
+
+    private static void writeFloatArrayOrDefault(AllocatedBuffer buffer, float[] values, int length) {
+        int writeLen = Math.max(1, length);
+        FloatBuffer mapped = MemoryUtil.memFloatBuffer(buffer.mappedPointer, writeLen);
+        mapped.clear();
+        int copyLen = Math.min(values.length, length);
+        for (int i = 0; i < copyLen; i++) {
+            mapped.put(values[i]);
+        }
+        for (int i = copyLen; i < writeLen; i++) {
+            mapped.put(0.0f);
+        }
         mapped.flip();
     }
 
@@ -1835,6 +1816,10 @@ public final class VulkanManager {
         if (workspaces == null || workspaces.isEmpty()) {
             return;
         }
+        if (state.timelineSemaphore != VK10.VK_NULL_HANDLE) {
+            dispatchTimeline(state, workspaces);
+            return;
+        }
         DispatchWorkspace fenceOwner = workspaces.get(0);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             checkVk(VK10.vkResetFences(state.device, stack.longs(fenceOwner.fence)), "vkResetFences");
@@ -1848,6 +1833,36 @@ public final class VulkanManager {
             synchronized (state.computeQueueLock) {
                 checkVk(VK10.vkQueueSubmit(state.computeQueue, submitInfo, fenceOwner.fence), "vkQueueSubmit");
             }
+            checkVk(VK10.vkWaitForFences(state.device, stack.longs(fenceOwner.fence), true, EXECUTION_TIMEOUT_NANOS), "vkWaitForFences");
+        }
+    }
+
+    private static void dispatchTimeline(State state,
+                                         List<DispatchWorkspace> workspaces) {
+        DispatchWorkspace fenceOwner = workspaces.get(0);
+        long signalValue = state.nextTimelineValue.incrementAndGet();
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            checkVk(VK10.vkResetFences(state.device, stack.longs(fenceOwner.fence)), "vkResetFences");
+            PointerBuffer commandBufferPtr = stack.mallocPointer(workspaces.size());
+            for (int i = 0; i < workspaces.size(); i++) {
+                commandBufferPtr.put(i, workspaces.get(i).commandBuffer.address());
+            }
+            VkTimelineSemaphoreSubmitInfo timelineInfo = VkTimelineSemaphoreSubmitInfo.calloc(stack)
+                .sType(VK12.VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO)
+                .pSignalSemaphoreValues(stack.longs(signalValue));
+            VkSubmitInfo submitInfo = VkSubmitInfo.calloc(stack)
+                .sType(VK10.VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                .pNext(timelineInfo.address())
+                .pCommandBuffers(commandBufferPtr)
+                .pSignalSemaphores(stack.longs(state.timelineSemaphore));
+            synchronized (state.computeQueueLock) {
+                checkVk(VK10.vkQueueSubmit(state.computeQueue, submitInfo, fenceOwner.fence), "vkQueueSubmit");
+            }
+            VkSemaphoreWaitInfo waitInfo = VkSemaphoreWaitInfo.calloc(stack)
+                .sType(VK12.VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO)
+                .pSemaphores(stack.longs(state.timelineSemaphore))
+                .pValues(stack.longs(signalValue));
+            checkVk(VK12.vkWaitSemaphores(state.device, waitInfo, EXECUTION_TIMEOUT_NANOS), "vkWaitSemaphores");
             checkVk(VK10.vkWaitForFences(state.device, stack.longs(fenceOwner.fence), true, EXECUTION_TIMEOUT_NANOS), "vkWaitForFences");
         }
     }
@@ -1904,6 +1919,16 @@ public final class VulkanManager {
             }
         }
         state.programs.clear();
+        try {
+            state.memoryAllocator.destroy();
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (state.timelineSemaphore != VK10.VK_NULL_HANDLE) {
+                VK10.vkDestroySemaphore(state.device, state.timelineSemaphore, null);
+            }
+        } catch (Throwable ignored) {
+        }
         try {
             VK10.vkDestroyCommandPool(state.device, state.commandPool, null);
         } catch (Throwable ignored) {
@@ -1986,6 +2011,18 @@ public final class VulkanManager {
         return ((value + alignment - 1) / alignment) * alignment;
     }
 
+    private static long alignUp(long value, long alignment) {
+        if (value <= 0L) {
+            return 0L;
+        }
+        return ((value + alignment - 1L) / alignment) * alignment;
+    }
+
+    private static long configuredSlabBytes() {
+        long configured = Long.getLong(SLAB_BYTES_PROPERTY, DEFAULT_SLAB_BYTES);
+        return Math.max(MIN_SLAB_BYTES, configured);
+    }
+
     private static void checkVk(int result, String operation) {
         if (result != VK10.VK_SUCCESS) {
             throw new IllegalStateException(operation + " failed with Vulkan result " + result);
@@ -2020,6 +2057,7 @@ public final class VulkanManager {
 
     private static final class VulkanManagerHolder {
         private static final VulkanManager INSTANCE = new VulkanManager();
+        private static final VulkanContext CONTEXT = new VulkanContext(INSTANCE);
     }
 
     public record VulkanDeviceInfo(
@@ -2151,8 +2189,10 @@ public final class VulkanManager {
 
     private record AllocatedBuffer(long deviceBuffer,
                                    long deviceMemory,
+                                   MemoryAllocation deviceAllocation,
                                    long hostBuffer,
                                    long hostMemory,
+                                   MemoryAllocation hostAllocation,
                                    long sizeBytes,
                                    long mappedPointer,
                                    boolean staged) {
@@ -2161,7 +2201,227 @@ public final class VulkanManager {
         }
     }
 
-    private record RawBuffer(long buffer, long memory, long sizeBytes, long mappedPointer) {
+    private record RawBuffer(long buffer,
+                             long memory,
+                             long memoryOffset,
+                             long sizeBytes,
+                             long mappedPointer,
+                             MemoryAllocation allocation) {
+    }
+
+    private static final class MemoryAllocation {
+        private final MemorySlab slab;
+        private final long memory;
+        private final long offset;
+        private final long size;
+        private final long mappedBase;
+        private final boolean dedicated;
+        private boolean freed;
+
+        private MemoryAllocation(MemorySlab slab, long memory, long offset, long size, long mappedBase, boolean dedicated) {
+            this.slab = slab;
+            this.memory = memory;
+            this.offset = offset;
+            this.size = size;
+            this.mappedBase = mappedBase;
+            this.dedicated = dedicated;
+        }
+    }
+
+    private static final class VulkanMemoryAllocator {
+        private final VkDevice device;
+        private final List<MemorySlab> slabs = new ArrayList<>();
+
+        private VulkanMemoryAllocator(VkDevice device) {
+            this.device = device;
+        }
+
+        private synchronized MemoryAllocation allocate(int memoryType, long size, long alignment, boolean mapped) {
+            long alignedSize = alignUp(size, Math.max(1L, alignment));
+            long slabSize = configuredSlabBytes();
+            if (alignedSize > slabSize / 2) {
+                return allocateDedicated(memoryType, alignedSize, mapped);
+            }
+            for (MemorySlab slab : slabs) {
+                if (slab.memoryType == memoryType && slab.mapped == mapped) {
+                    MemoryAllocation allocation = slab.tryAllocate(alignedSize, Math.max(1L, alignment));
+                    if (allocation != null) {
+                        return allocation;
+                    }
+                }
+            }
+            MemorySlab slab = createSlab(memoryType, Math.max(slabSize, alignedSize), mapped);
+            slabs.add(slab);
+            MemoryAllocation allocation = slab.tryAllocate(alignedSize, Math.max(1L, alignment));
+            if (allocation == null) {
+                throw new IllegalStateException("Unable to suballocate Vulkan memory slab");
+            }
+            return allocation;
+        }
+
+        private MemoryAllocation allocateDedicated(int memoryType, long size, boolean mapped) {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkMemoryAllocateInfo allocInfo = VkMemoryAllocateInfo.calloc(stack)
+                    .sType(VK10.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
+                    .allocationSize(size)
+                    .memoryTypeIndex(memoryType);
+                LongBuffer memoryPtr = stack.mallocLong(1);
+                checkVk(VK10.vkAllocateMemory(device, allocInfo, null, memoryPtr), "vkAllocateMemory");
+                long memory = memoryPtr.get(0);
+                long mappedBase = MemoryUtil.NULL;
+                if (mapped) {
+                    PointerBuffer mappedPtr = stack.mallocPointer(1);
+                    try {
+                        checkVk(VK10.vkMapMemory(device, memory, 0, size, 0, mappedPtr), "vkMapMemory");
+                        mappedBase = mappedPtr.get(0);
+                    } catch (Throwable throwable) {
+                        VK10.vkFreeMemory(device, memory, null);
+                        throw throwable;
+                    }
+                }
+                return new MemoryAllocation(null, memory, 0, size, mappedBase, true);
+            }
+        }
+
+        private MemorySlab createSlab(int memoryType, long size, boolean mapped) {
+            long allocationSize = Math.max(MIN_SLAB_BYTES, size);
+            while (allocationSize >= size) {
+                try {
+                    return createSlabAttempt(memoryType, allocationSize, mapped);
+                } catch (Throwable throwable) {
+                    if (allocationSize == size) {
+                        throw throwable;
+                    }
+                    allocationSize = Math.max(size, allocationSize / 2);
+                }
+            }
+            throw new IllegalStateException("Unable to create Vulkan memory slab");
+        }
+
+        private MemorySlab createSlabAttempt(int memoryType, long size, boolean mapped) {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkMemoryAllocateInfo allocInfo = VkMemoryAllocateInfo.calloc(stack)
+                    .sType(VK10.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
+                    .allocationSize(size)
+                    .memoryTypeIndex(memoryType);
+                LongBuffer memoryPtr = stack.mallocLong(1);
+                checkVk(VK10.vkAllocateMemory(device, allocInfo, null, memoryPtr), "vkAllocateMemory");
+                long memory = memoryPtr.get(0);
+                long mappedBase = MemoryUtil.NULL;
+                if (mapped) {
+                    PointerBuffer mappedPtr = stack.mallocPointer(1);
+                    try {
+                        checkVk(VK10.vkMapMemory(device, memory, 0, size, 0, mappedPtr), "vkMapMemory");
+                        mappedBase = mappedPtr.get(0);
+                    } catch (Throwable throwable) {
+                        VK10.vkFreeMemory(device, memory, null);
+                        throw throwable;
+                    }
+                }
+                return new MemorySlab(device, memoryType, memory, size, mappedBase, mapped);
+            }
+        }
+
+        private synchronized void free(MemoryAllocation allocation) {
+            if (allocation == null || allocation.freed) {
+                return;
+            }
+            allocation.freed = true;
+            if (allocation.dedicated) {
+                if (allocation.mappedBase != MemoryUtil.NULL) {
+                    VK10.vkUnmapMemory(device, allocation.memory);
+                }
+                VK10.vkFreeMemory(device, allocation.memory, null);
+                return;
+            }
+            allocation.slab.free(allocation.offset, allocation.size);
+        }
+
+        private synchronized void destroy() {
+            for (MemorySlab slab : slabs) {
+                slab.destroy();
+            }
+            slabs.clear();
+        }
+    }
+
+    private static final class MemorySlab {
+        private final VkDevice device;
+        private final int memoryType;
+        private final long memory;
+        private final long size;
+        private final long mappedBase;
+        private final boolean mapped;
+        private final List<FreeRange> freeRanges = new ArrayList<>();
+
+        private MemorySlab(VkDevice device, int memoryType, long memory, long size, long mappedBase, boolean mapped) {
+            this.device = device;
+            this.memoryType = memoryType;
+            this.memory = memory;
+            this.size = size;
+            this.mappedBase = mappedBase;
+            this.mapped = mapped;
+            this.freeRanges.add(new FreeRange(0, size));
+        }
+
+        private MemoryAllocation tryAllocate(long requestSize, long alignment) {
+            for (int i = 0; i < freeRanges.size(); i++) {
+                FreeRange range = freeRanges.get(i);
+                long alignedOffset = alignUp(range.offset, alignment);
+                long padding = alignedOffset - range.offset;
+                long required = padding + requestSize;
+                if (required > range.size) {
+                    continue;
+                }
+                long suffixOffset = alignedOffset + requestSize;
+                long suffixSize = range.offset + range.size - suffixOffset;
+                if (padding > 0 && suffixSize > 0) {
+                    range.size = padding;
+                    freeRanges.add(i + 1, new FreeRange(suffixOffset, suffixSize));
+                } else if (padding > 0) {
+                    range.size = padding;
+                } else if (suffixSize > 0) {
+                    range.offset = suffixOffset;
+                    range.size = suffixSize;
+                } else {
+                    freeRanges.remove(i);
+                }
+                return new MemoryAllocation(this, memory, alignedOffset, requestSize, mappedBase, false);
+            }
+            return null;
+        }
+
+        private void free(long offset, long size) {
+            freeRanges.add(new FreeRange(offset, size));
+            freeRanges.sort((left, right) -> Long.compare(left.offset, right.offset));
+            for (int i = 0; i < freeRanges.size() - 1; i++) {
+                FreeRange current = freeRanges.get(i);
+                FreeRange next = freeRanges.get(i + 1);
+                if (current.offset + current.size >= next.offset) {
+                    long end = Math.max(current.offset + current.size, next.offset + next.size);
+                    current.size = end - current.offset;
+                    freeRanges.remove(i + 1);
+                    i--;
+                }
+            }
+        }
+
+        private void destroy() {
+            if (mappedBase != MemoryUtil.NULL) {
+                VK10.vkUnmapMemory(device, memory);
+            }
+            VK10.vkFreeMemory(device, memory, null);
+        }
+    }
+
+    private static final class FreeRange {
+        private long offset;
+        private long size;
+
+        private FreeRange(long offset, long size) {
+            this.offset = offset;
+            this.size = size;
+        }
     }
 
     private enum WorkloadProfile {
@@ -2175,56 +2435,6 @@ public final class VulkanManager {
         OUTPUT
     }
 
-    private static final class McDensityBatchGroup {
-        private final float[] encodedProgram;
-        private final int instructionCount;
-        private final int auxValueCount;
-        private final String shaderKey;
-        private final List<Integer> indices = new ArrayList<>();
-        private final List<McDensityVulkanTask> tasks = new ArrayList<>();
-        private int totalSamples;
-
-        private McDensityBatchGroup(float[] encodedProgram, int instructionCount, int auxValueCount, String shaderKey) {
-            this.encodedProgram = encodedProgram;
-            this.instructionCount = instructionCount;
-            this.auxValueCount = auxValueCount;
-            this.shaderKey = shaderKey;
-        }
-
-        private boolean matches(McDensityVulkanTask task) {
-            return instructionCount == task.instructionCount()
-                && auxValueCount == task.auxValueCount()
-                && Objects.equals(shaderKey, task.shaderKey())
-                && Arrays.equals(encodedProgram, task.encodedProgram());
-        }
-
-        private void add(int index, McDensityVulkanTask task) {
-            indices.add(index);
-            tasks.add(task);
-            totalSamples += task.sampleCount();
-        }
-
-        private float[] combineAuxValues() {
-            if (auxValueCount <= 0) {
-                return new float[0];
-            }
-            float[] combined = new float[auxValueCount * totalSamples];
-            for (int auxIndex = 0; auxIndex < auxValueCount; auxIndex++) {
-                int outputOffset = auxIndex * totalSamples;
-                for (McDensityVulkanTask task : tasks) {
-                    float[] taskAux = task.auxValues();
-                    int sampleCount = task.sampleCount();
-                    System.arraycopy(taskAux, auxIndex * sampleCount, combined, outputOffset, sampleCount);
-                    outputOffset += sampleCount;
-                }
-            }
-            return combined;
-        }
-    }
-
-    private record PreparedMcDensityGroup(McDensityBatchGroup group, WorkspaceLease lease) {
-    }
-
     private static final class State {
         private final VkInstance instance;
         private final VkPhysicalDevice physicalDevice;
@@ -2234,6 +2444,9 @@ public final class VulkanManager {
         private final long commandPool;
         private final String deviceName;
         private final boolean prefersDeviceLocalTransfers;
+        private final VulkanMemoryAllocator memoryAllocator;
+        private final long timelineSemaphore;
+        private final AtomicLong nextTimelineValue = new AtomicLong(0L);
         private final Map<String, Program> programs = new ConcurrentHashMap<>();
         private final Map<String, DispatchWorkspacePool> workspaces = new ConcurrentHashMap<>();
 
@@ -2243,7 +2456,9 @@ public final class VulkanManager {
                       VkQueue computeQueue,
                       long commandPool,
                       String deviceName,
-                      boolean prefersDeviceLocalTransfers) {
+                      boolean prefersDeviceLocalTransfers,
+                      VulkanMemoryAllocator memoryAllocator,
+                      long timelineSemaphore) {
             this.instance = instance;
             this.physicalDevice = physicalDevice;
             this.device = device;
@@ -2251,6 +2466,8 @@ public final class VulkanManager {
             this.commandPool = commandPool;
             this.deviceName = deviceName;
             this.prefersDeviceLocalTransfers = prefersDeviceLocalTransfers;
+            this.memoryAllocator = memoryAllocator;
+            this.timelineSemaphore = timelineSemaphore;
         }
     }
 

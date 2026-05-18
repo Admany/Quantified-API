@@ -49,11 +49,18 @@ public final class ModPriorityManager {
     public void recordTaskComplete(String modId) {
         ModStats stats = modStats.get(modId);
         if (stats != null) {
-            stats.activeTasks.decrementAndGet();
-            stats.inFlightTasks.decrementAndGet();
+            stats.activeTasks.updateAndGet(current -> current > 0 ? current - 1 : 0);
+            stats.inFlightTasks.updateAndGet(current -> current > 0 ? current - 1 : 0);
             stats.completedTasks.increment();
         }
         totalTasks.decrement();
+    }
+
+    public void releaseReservation(String modId) {
+        ModStats stats = modStats.get(modId);
+        if (stats != null) {
+            stats.inFlightTasks.updateAndGet(current -> current > 0 ? current - 1 : 0);
+        }
     }
 
     private double computeFairnessMultiplier(ModStats stats) {

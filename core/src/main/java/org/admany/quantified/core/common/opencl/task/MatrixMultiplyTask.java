@@ -74,9 +74,9 @@ public final class MatrixMultiplyTask extends OpenCLTask<double[][]> {
         context.setKernelArgBuffer(kernel, 0, allocA.offset()); // bufferA handle
         context.setKernelArgBuffer(kernel, 1, allocB.offset()); // bufferB handle
         context.setKernelArgBuffer(kernel, 2, allocC.offset()); // bufferC handle
-        context.setKernelArg(kernel, 3, m);
-        context.setKernelArg(kernel, 4, n);
-        context.setKernelArg(kernel, 5, p);
+        context.setKernelArgInt(kernel, 3, m);
+        context.setKernelArgInt(kernel, 4, n);
+        context.setKernelArgInt(kernel, 5, p);
 
         // Execute kernel
         try (MemoryStack stack = MemoryStack.stackPush()) {

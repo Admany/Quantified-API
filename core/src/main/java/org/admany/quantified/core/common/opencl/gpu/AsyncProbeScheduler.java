@@ -9,6 +9,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.util.LwjglRuntimeTuning;
@@ -32,6 +33,10 @@ public class AsyncProbeScheduler {
     private static volatile boolean succeeded = false;
 
     public static synchronized void scheduleBackgroundProbe() {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            markDisabled();
+            return;
+        }
         if (scheduled) {
             LOGGER.fine("OpenCL background probe already scheduled");
             return;
@@ -49,6 +54,11 @@ public class AsyncProbeScheduler {
     }
 
     public static void triggerProbe(String reason) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            markDisabled();
+            reset();
+            return;
+        }
         if (succeeded) {
             return;
         }
@@ -73,6 +83,10 @@ public class AsyncProbeScheduler {
     }
 
     private static void scheduleProbe(Duration delay, String trigger) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            markDisabled();
+            return;
+        }
         if (succeeded) {
             return;
         }
@@ -93,6 +107,10 @@ public class AsyncProbeScheduler {
     }
 
     private static void runProbe(String trigger, int attemptNo) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            markDisabled();
+            return;
+        }
         if (succeeded) {
             return;
         }
@@ -124,7 +142,16 @@ public class AsyncProbeScheduler {
         }
     }
 
+    private static void markDisabled() {
+        LOGGER.info("Skipping OpenCL probe because enableGpuAcceleration=false");
+        DeveloperOverlayManager.recordApiLog("[OpenCL] Probe skipped - GPU acceleration disabled in config");
+    }
+
     private static void scheduleRetry(String reason) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            markDisabled();
+            return;
+        }
         if (succeeded) {
             return;
         }

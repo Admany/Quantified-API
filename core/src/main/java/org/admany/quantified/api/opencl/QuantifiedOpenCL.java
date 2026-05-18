@@ -50,6 +50,15 @@ public final class QuantifiedOpenCL {
         void setKernelArg(long kernel, int argIndex, long argValue);
         void enqueueNDRangeKernel(long kernel, int workDim, PointerBuffer globalWorkSize);
         void finish();
+        default float[] vectorAdd(float[] a, float[] b) {
+            throw new UnsupportedOperationException("vectorAdd");
+        }
+        default float[][] matrixMultiply(float[][] a, float[][] b) {
+            throw new UnsupportedOperationException("matrixMultiply");
+        }
+        default double monteCarloPi(int samples) {
+            throw new UnsupportedOperationException("monteCarloPi");
+        }
     }
 
     public interface Workload<T> {
@@ -399,6 +408,21 @@ public final class QuantifiedOpenCL {
         public void finish() {
             delegate.finish();
         }
+
+        @Override
+        public float[] vectorAdd(float[] a, float[] b) {
+            return delegate.vectorAdd(a, b);
+        }
+
+        @Override
+        public float[][] matrixMultiply(float[][] a, float[][] b) {
+            return delegate.matrixMultiply(a, b);
+        }
+
+        @Override
+        public double monteCarloPi(int samples) {
+            return delegate.monteCarloPi(samples);
+        }
     }
 
     // ===== HIGH-LEVEL GPU UTILITY METHODS =====
@@ -536,51 +560,7 @@ public final class QuantifiedOpenCL {
 
         @Override
         public float[] execute(Context context) throws Exception {
-            long kernel = context.createKernel("vector_add");
-            try {
-                long bufferA = context.createBuffer(CL10.CL_MEM_READ_ONLY, (long) a.length * 4L);
-                long bufferB = context.createBuffer(CL10.CL_MEM_READ_ONLY, (long) b.length * 4L);
-                long bufferC = context.createBuffer(CL10.CL_MEM_WRITE_ONLY, (long) a.length * 4L);
-
-                try {
-                    ByteBuffer byteBufferA = ByteBuffer.allocateDirect(a.length * 4).order(java.nio.ByteOrder.nativeOrder());
-                    byteBufferA.asFloatBuffer().put(a);
-                    byteBufferA.rewind();
-                    context.enqueueWriteBuffer(bufferA, true, 0, (long) a.length * 4L, byteBufferA);
-
-                    ByteBuffer byteBufferB = ByteBuffer.allocateDirect(b.length * 4).order(java.nio.ByteOrder.nativeOrder());
-                    byteBufferB.asFloatBuffer().put(b);
-                    byteBufferB.rewind();
-                    context.enqueueWriteBuffer(bufferB, true, 0, (long) b.length * 4L, byteBufferB);
-
-                    context.setKernelArgBuffer(kernel, 0, bufferA);
-                    context.setKernelArgBuffer(kernel, 1, bufferB);
-                    context.setKernelArgBuffer(kernel, 2, bufferC);
-
-                    // Execute kernel
-                    PointerBuffer workSize = PointerBuffer.allocateDirect(1);
-                    workSize.put(0, a.length);
-                    workSize.rewind();
-                    context.enqueueNDRangeKernel(kernel, 1, workSize);
-                    context.finish();
-
-                    // Read result
-                    ByteBuffer resultBuffer = ByteBuffer.allocateDirect(a.length * 4).order(java.nio.ByteOrder.nativeOrder());
-                    context.enqueueReadBuffer(bufferC, true, 0, (long) a.length * 4L, resultBuffer);
-                    resultBuffer.rewind();
-
-                    float[] result = new float[a.length];
-                    resultBuffer.asFloatBuffer().get(result);
-                    return result;
-
-                } finally {
-                    context.releaseBuffer(bufferA);
-                    context.releaseBuffer(bufferB);
-                    context.releaseBuffer(bufferC);
-                }
-            } finally {
-                context.releaseKernel(kernel);
-            }
+            return context.vectorAdd(a, b);
         }
     }
 
@@ -609,85 +589,7 @@ public final class QuantifiedOpenCL {
 
         @Override
         public float[][] execute(Context context) throws Exception {
-            long kernel = context.createKernel("matrix_multiply");
-            try {
-                // Flatten matrices to 1D arrays
-                float[] flatA = flattenMatrix(a);
-                float[] flatB = flattenMatrix(b);
-                float[] flatC = new float[m * n];
-
-                // Create buffers
-                long bufferA = context.createBuffer(CL10.CL_MEM_READ_ONLY, (long) flatA.length * 4L);
-                long bufferB = context.createBuffer(CL10.CL_MEM_READ_ONLY, (long) flatB.length * 4L);
-                long bufferC = context.createBuffer(CL10.CL_MEM_WRITE_ONLY, (long) flatC.length * 4L);
-
-                try {
-                    // Write input data
-                    writeFloatArray(context, bufferA, flatA);
-                    writeFloatArray(context, bufferB, flatB);
-
-                    // Set kernel arguments
-                    context.setKernelArgBuffer(kernel, 0, bufferA);
-                    context.setKernelArgBuffer(kernel, 1, bufferB);
-                    context.setKernelArgBuffer(kernel, 2, bufferC);
-                    context.setKernelArg(kernel, 3, m);
-                    context.setKernelArg(kernel, 4, n);
-                    context.setKernelArg(kernel, 5, p);
-
-                    // Execute kernel (2D work size for matrix operations)
-                    PointerBuffer workSize = PointerBuffer.allocateDirect(2);
-                    workSize.put(0, m);
-                    workSize.put(1, n);
-                    workSize.rewind();
-                    context.enqueueNDRangeKernel(kernel, 2, workSize);
-                    context.finish();
-
-                    // Read result
-                    flatC = readFloatArray(context, bufferC, flatC.length);
-                    return reconstructMatrix(flatC, m, n);
-
-                } finally {
-                    context.releaseBuffer(bufferA);
-                    context.releaseBuffer(bufferB);
-                    context.releaseBuffer(bufferC);
-                }
-            } finally {
-                context.releaseKernel(kernel);
-            }
-        }
-
-        private float[] flattenMatrix(float[][] matrix) {
-            int rows = matrix.length;
-            int cols = matrix[0].length;
-            float[] flat = new float[rows * cols];
-            for (int i = 0; i < rows; i++) {
-                System.arraycopy(matrix[i], 0, flat, i * cols, cols);
-            }
-            return flat;
-        }
-
-        private float[][] reconstructMatrix(float[] flat, int rows, int cols) {
-            float[][] matrix = new float[rows][cols];
-            for (int i = 0; i < rows; i++) {
-                System.arraycopy(flat, i * cols, matrix[i], 0, cols);
-            }
-            return matrix;
-        }
-
-        private void writeFloatArray(Context context, long buffer, float[] data) {
-            ByteBuffer byteBuffer = ByteBuffer.allocateDirect(data.length * 4).order(java.nio.ByteOrder.nativeOrder());
-            byteBuffer.asFloatBuffer().put(data);
-            byteBuffer.rewind();
-            context.enqueueWriteBuffer(buffer, true, 0, (long) data.length * 4L, byteBuffer);
-        }
-
-        private float[] readFloatArray(Context context, long buffer, int length) {
-            ByteBuffer resultBuffer = ByteBuffer.allocateDirect(length * 4).order(java.nio.ByteOrder.nativeOrder());
-            context.enqueueReadBuffer(buffer, true, 0, (long) length * 4L, resultBuffer);
-            resultBuffer.rewind();
-            float[] result = new float[length];
-            resultBuffer.asFloatBuffer().get(result);
-            return result;
+            return context.matrixMultiply(a, b);
         }
     }
 
@@ -710,44 +612,7 @@ public final class QuantifiedOpenCL {
 
         @Override
         public Double execute(Context context) throws Exception {
-            long kernel = context.createKernel("monte_carlo_pi");
-            try {
-                // Create buffer for results
-                long bufferResults = context.createBuffer(CL10.CL_MEM_WRITE_ONLY, (long) samples * 4L);
-
-                try {
-                    // Set kernel arguments
-                    context.setKernelArgBuffer(kernel, 0, bufferResults);
-                    context.setKernelArg(kernel, 1, samples);
-
-                    // Execute kernel
-                    PointerBuffer workSize = PointerBuffer.allocateDirect(1);
-                    workSize.put(0, samples);
-                    workSize.rewind();
-                    context.enqueueNDRangeKernel(kernel, 1, workSize);
-                    context.finish();
-
-                    // Read results
-                    ByteBuffer resultBuffer = ByteBuffer.allocateDirect(samples * 4).order(java.nio.ByteOrder.nativeOrder());
-                    context.enqueueReadBuffer(bufferResults, true, 0, (long) samples * 4L, resultBuffer);
-                    resultBuffer.rewind();
-
-                    FloatBuffer floatResults = resultBuffer.asFloatBuffer();
-                    int hits = 0;
-                    for (int i = 0; i < samples; i++) {
-                        if (floatResults.get(i) > 0.5f) {
-                            hits++;
-                        }
-                    }
-
-                    return 4.0 * hits / samples;
-
-                } finally {
-                    context.releaseBuffer(bufferResults);
-                }
-            } finally {
-                context.releaseKernel(kernel);
-            }
+            return context.monteCarloPi(samples);
         }
     }
 }

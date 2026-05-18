@@ -73,6 +73,11 @@ public final class OpenCLManager {
     }
 
     public static void initialize() {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            lastRuntimeStatus = RuntimeStatus.failed("GPU acceleration disabled in configuration");
+            DeveloperOverlayManager.recordApiLog("[OpenCL] Init skipped - GPU acceleration disabled in config");
+            return;
+        }
         if (!initialized.compareAndSet(false, true)) {
             LOGGER.fine("OpenCL acceleration already initialized");
             DeveloperOverlayManager.recordApiLog("[OpenCL] Already initialized");
@@ -143,6 +148,10 @@ public final class OpenCLManager {
     }
 
     public static CompletableFuture<Boolean> forceProbe() {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            lastRuntimeStatus = RuntimeStatus.failed("GPU acceleration disabled in configuration");
+            return CompletableFuture.completedFuture(false);
+        }
         return CompletableFuture.supplyAsync(() -> {
             try {
                 return performProbe(ProbeOptions.standard(), getPreferredDeviceId());
@@ -158,6 +167,10 @@ public final class OpenCLManager {
     }
 
     public static boolean forceProbeSynchronous() {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            lastRuntimeStatus = RuntimeStatus.failed("GPU acceleration disabled in configuration");
+            return false;
+        }
         try {
             return performProbe(ProbeOptions.standard(), getPreferredDeviceId());
         } catch (Throwable t) {
@@ -171,6 +184,10 @@ public final class OpenCLManager {
     }
 
     private static boolean performProbe(ProbeOptions options, String preferredDeviceId) throws Exception {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            lastRuntimeStatus = RuntimeStatus.failed("GPU acceleration disabled in configuration");
+            return false;
+        }
         OpenCLRuntime.AvailabilitySnapshot runtime = OpenCLRuntime.snapshot();
         if (!runtime.available()) {
             String reason = runtime.failureReason() != null ? runtime.failureReason() : "OpenCL runtime unavailable";
@@ -262,6 +279,13 @@ public final class OpenCLManager {
     }
 
     public static void switchDevice(String preferredDeviceId) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            forcedDeviceId.set(null);
+            cleanupAfterFailure();
+            lastRuntimeStatus = RuntimeStatus.failed("GPU acceleration disabled in configuration");
+            DeveloperOverlayManager.recordApiLog("[OpenCL] Switch skipped - GPU acceleration disabled in config");
+            return;
+        }
         CompletableFuture.runAsync(() -> {
             synchronized (probeMutex) {
                 try {
@@ -378,11 +402,14 @@ public final class OpenCLManager {
     public static boolean isInVramPressureCooldown() { return OpenCLTaskManager.isInVramPressureCooldown(); }
 
     public static void updateDeviceName(String name) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            return;
+        }
         if (monitor != null) monitor.updateDeviceName(name);
         if (!isAvailable()) AsyncProbeScheduler.triggerRendererProbe(name);
     }
 
-    public static boolean canAcceptTask(OpenCLTask<?> task) { return OpenCLTaskManager.canAcceptTask(task); }
+    public static boolean canAcceptTask(OpenCLTask<?> task) { return MultithreadingConfig.isGpuAccelerationEnabled() && OpenCLTaskManager.canAcceptTask(task); }
     public static <T> CompletableFuture<T> executeOnGpu(OpenCLTask<T> task) { return OpenCLTaskManager.executeOnGpu(task); }
     public static void evictBufferPool(boolean aggressive) {
         OpenCLContext current = context;

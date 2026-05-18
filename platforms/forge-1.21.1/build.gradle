@@ -39,7 +39,6 @@ minecraft {
             workingDirectory project.file('run')
             property 'forge.logging.markers', 'REGISTRIES'
             property 'forge.logging.console.level', 'debug'
-            jvmArgs '--add-opens', 'quantified/org.admany.quantified.core.common.util=ALL-UNNAMED'
 
             mods {
                 "${mod_id}" {
@@ -131,6 +130,7 @@ dependencies {
 
     vulkanProbeImplementation("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
     vulkanProbeCompileOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+    vulkanProbeRuntimeOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
     vulkanProbeRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${lwjglNatives}") { transitive = false }
 
     shaderCompilerImplementation("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
@@ -233,8 +233,6 @@ shadowJar {
     archiveClassifier.set("")
     from sourceSets.main.output
     dependencies {
-        include(dependency('org.lwjgl:lwjgl-opencl'))
-        include(dependency('org.lwjgl:lwjgl-vulkan'))
         include(dependency('com.github.ben-manes.caffeine:caffeine'))
         include(dependency('org.bouncycastle:bcprov-jdk15on'))
         include(dependency('org.bouncycastle:bcpkix-jdk15on'))
@@ -247,10 +245,11 @@ shadowJar {
     // quantified module.
     exclude 'org/lwjgl/system/**'
     exclude 'org/lwjgl/*.class'
+    exclude 'org/lwjgl/opencl/**'
+    exclude 'org/lwjgl/vulkan/**'
     exclude 'windows/**'
     exclude 'linux/**'
     exclude 'macos/**'
-    exclude 'org/lwjgl/vulkan/video/**'
     relocate 'com.github.benmanes.caffeine', 'org.admany.quantified.shaded.caffeine'
     minimize {
         exclude(dependency('org.lwjgl:lwjgl-opencl:.*'))
@@ -285,6 +284,8 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.named('test', Test).configure {
     useJUnitPlatform()
+    exclude '**/*Benchmark*.class'
+    exclude '**/*Soak*.class'
     testLogging {
         events "passed", "skipped", "failed"
         exceptionFormat "full"
@@ -298,6 +299,7 @@ def gpuBenchmarkProperties = [
     'quantified.benchmarks.gpu.compare.vectorLength',
     'quantified.benchmarks.gpu.compare.matrixSize',
     'quantified.benchmarks.gpu.compare.samples',
+    'quantified.benchmarks.gpu.compare.mixed',
     'quantified.lwjgl.stackSizeKb',
     'org.lwjgl.system.stackSize'
 ]

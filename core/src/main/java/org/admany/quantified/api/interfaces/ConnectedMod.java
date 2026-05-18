@@ -1,34 +1,22 @@
 package org.admany.quantified.api.interfaces;
 
+import org.admany.quantified.api.CacheRequest;
+import org.admany.quantified.api.ComputeRequest;
+import org.admany.quantified.api.ParallelRequest;
 import org.admany.quantified.api.QuantifiedAPI;
-import org.admany.quantified.api.builders.QuantifiedCacheBuilder;
-import org.admany.quantified.api.builders.QuantifiedHybridBuilder;
-import org.admany.quantified.api.builders.QuantifiedNetworkBuilder;
-import org.admany.quantified.api.builders.QuantifiedTaskBuilder;
 import org.admany.quantified.api.compute.GpuBackendPreference;
-import org.admany.quantified.api.compute.QuantifiedCompute;
 import org.admany.quantified.api.graph.QuantifiedTaskGraph;
-import org.admany.quantified.api.vulkan.QuantifiedVulkan;
-
-import java.util.concurrent.ThreadLocalRandom;
 
 public interface ConnectedMod {
     String getModId();
     String getVersion();
     String getDisplayName();
     ModStatistics getStatistics();
-    QuantifiedTaskBuilder task(String name);
-    QuantifiedCacheBuilder cache(Enum<?> cacheType);
-    QuantifiedHybridBuilder hybrid(String name);
-    QuantifiedNetworkBuilder network(String channel);
+    <T> ComputeRequest<T> compute(String name);
+    ParallelRequest parallel(String name);
+    CacheRequest cache(String cacheName);
     default QuantifiedTaskGraph.Builder graph(String name) {
-        return QuantifiedTaskGraph.builder(getModId(), name, ThreadLocalRandom.current().nextLong());
-    }
-    default <T> QuantifiedCompute.Builder<T> compute(String name) {
-        return QuantifiedCompute.builder(getModId(), name, ThreadLocalRandom.current().nextLong());
-    }
-    default <T> QuantifiedVulkan.Builder<T> vulkan(String name) {
-        return QuantifiedVulkan.builder(getModId(), name, ThreadLocalRandom.current().nextLong());
+        return QuantifiedTaskGraph.builder(getModId(), name);
     }
     default void setGpuBackendPreference(GpuBackendPreference preference) {
         QuantifiedAPI.setGpuBackendPreference(getModId(), preference);

@@ -1,91 +1,80 @@
 package org.admany.quantified.api.model;
 
+import org.admany.quantified.api.CacheRequest;
 import org.admany.quantified.api.QuantifiedAPI;
-import org.admany.quantified.api.interfaces.ConnectedMod;
-import org.admany.quantified.api.interfaces.ModConnectionListener;
-import org.admany.quantified.api.interfaces.ModStatistics;
+import org.admany.quantified.core.common.async.core.AsyncManager;
+import org.admany.quantified.core.common.async.core.AsyncManagerBootstrap;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
-import java.time.Instant;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 public class QuantifiedStatsTest {
 
+    private static final String MOD_ID = "tm";
+
+    private ScheduledExecutorService testExecutor;
+
+    @BeforeEach
+    void setUp() {
+        testExecutor = Executors.newScheduledThreadPool(2);
+        AsyncManagerBootstrap bootstrap = AsyncManagerBootstrap.defaults(Runtime.getRuntime().availableProcessors());
+        AsyncManager.initialise(bootstrap, testExecutor);
+    }
+
     @AfterEach
     void cleanup() {
-        QuantifiedAPI.disconnect("tm");
+        QuantifiedAPI.disconnect(MOD_ID);
+        AsyncManager.shutdown();
+        if (testExecutor != null) {
+            testExecutor.shutdownNow();
+        }
     }
 
     @Test
     void modStatsReflectsConnectedMod() {
-        QuantifiedAPI.register("tm", "Test Mod", "1.2");
-        QuantifiedAPI.addConnectionListener(new ModConnectionListener() {
-            @Override
-            public ConnectedMod onModConnecting(String modId, String version, String displayName) {
-                return new ConnectedMod() {
-                    @Override public String getModId() { return "tm"; }
-                    @Override public String getVersion() { return "1.2"; }
-                    @Override public String getDisplayName() { return "Test Mod"; }
-                    @Override public ModStatistics getStatistics() {
-                        return new ModStatistics() {
-                            @Override public String getModId() { return "tm"; }
-                            @Override public String getModVersion() { return "1.2"; }
-                            @Override public Instant getLastActivity() { return Instant.EPOCH; }
-                            @Override public long getTotalTasksSubmitted() { return 10; }
-                            @Override public long getTasksCompleted() { return 7; }
-                            @Override public long getTasksFailed() { return 2; }
-                            @Override public int getCurrentQueueDepth() { return 1; }
-                            @Override public boolean isThrottled() { return false; }
-                            @Override public double getThrottleFactor() { return 0.0; }
-                            @Override public Duration getAverageTaskTime() { return Duration.ZERO; }
-                            @Override public Duration getMaxTaskTime() { return Duration.ZERO; }
-                            @Override public double getTasksPerSecond() { return 0.0; }
-                            @Override public double getCacheHitRate() { return 0.5; }
-                            @Override public long getCacheSize() { return 3; }
-                            @Override public long getCacheMaxSize() { return 10; }
-                            @Override public long getCacheEvictions() { return 0; }
-                            @Override public long getCacheMemoryUsage() { return 0; }
-                            @Override public long getPacketsSent() { return 0; }
-                            @Override public long getPacketsReceived() { return 0; }
-                            @Override public long getNetworkErrors() { return 0; }
-                            @Override public long getNetworkBytesTransferred() { return 0; }
-                            @Override public Duration getTotalGPUTime() { return Duration.ZERO; }
-                            @Override public long getPeakVRAMUsage() { return 0; }
-                            @Override public double getGPUUtilization() { return 0.0; }
-                            @Override public double getCPUFallbackRate() { return 0.0; }
-                        };
-                    }
-                    @Override public org.admany.quantified.api.builders.QuantifiedTaskBuilder task(String name) { return null; }
-                    @Override public org.admany.quantified.api.builders.QuantifiedCacheBuilder cache(Enum<?> cacheType) { return null; }
-                    @Override public org.admany.quantified.api.builders.QuantifiedHybridBuilder hybrid(String name) { return null; }
-                    @Override public org.admany.quantified.api.builders.QuantifiedNetworkBuilder network(String channel) { return null; }
-                    @Override public void disconnect() { /* no-op */ }
-                };
-            }
+        QuantifiedAPI.register(MOD_ID, "Test Mod", "1.2");
 
-            @Override
-            public void onModConnected(ConnectedMod connectedMod) { /* ignore */ }
+        CacheRequest cache = QuantifiedAPI.cache(MOD_ID, "stats-" + System.nanoTime())
+            .ttl(Duration.ofMinutes(1))
+            .maxEntries(16)
+            .memoryOnly();
 
-            @Override
-            public void onModDisconnected(ConnectedMod connectedMod) { /* ignore */ }
-        });
+        int taskResult = QuantifiedAPI.<Integer>compute(MOD_ID, "stats-task")
+            .submit(() -> 7)
+            .join();
+        String first = cache.get("alpha", () -> "value-1");
+        String second = cache.get("alpha", () -> "value-2");
+        String miss = cache.get("beta", () -> "value-3");
 
-        QuantifiedStats.ModStats stats = QuantifiedStats.getModStats("tm");
+        assertThat(taskResult).isEqualTo(7);
+        assertThat(first).isEqualTo("value-1");
+        assertThat(second).isEqualTo("value-1");
+        assertThat(miss).isEqualTo("value-3");
+
+        QuantifiedStats.ModStats stats = QuantifiedStats.getModStats(MOD_ID);
         assertThat(stats).isNotNull();
-        assertThat(stats.modId).isEqualTo("tm");
-        assertThat(stats.tasksSubmitted).isEqualTo(10);
-        assertThat(stats.tasksSucceeded).isEqualTo(7);
-        assertThat(stats.tasksFailed).isEqualTo(2);
+        assertThat(stats.modId).isEqualTo(MOD_ID);
+        assertThat(stats.version).isEqualTo("1.2");
+        assertThat(stats.tasksSubmitted).isGreaterThanOrEqualTo(1);
+        assertThat(stats.tasksSucceeded).isGreaterThanOrEqualTo(1);
+        assertThat(stats.tasksFailed).isEqualTo(0);
         assertThat(stats.cacheHits).isPositive();
         assertThat(stats.cacheMisses).isPositive();
+        assertThat(stats.lastActivityEpochMs).isPositive();
 
         QuantifiedStats.GlobalStats global = QuantifiedStats.getGlobalStats();
-        Map<String, QuantifiedStats.ModStats> m = global.modStats;
-        assertThat(m).containsKey("tm");
-        assertThat(global.totalTasksSubmitted).isGreaterThanOrEqualTo(10);
+        Map<String, QuantifiedStats.ModStats> modStats = global.modStats;
+        assertThat(modStats).containsKey(MOD_ID);
+        assertThat(global.totalTasksSubmitted).isGreaterThanOrEqualTo(stats.tasksSubmitted);
+        assertThat(global.totalTasksSucceeded).isGreaterThanOrEqualTo(stats.tasksSucceeded);
+        assertThat(global.totalCacheHits).isGreaterThanOrEqualTo(stats.cacheHits);
+        assertThat(global.totalCacheMisses).isGreaterThanOrEqualTo(stats.cacheMisses);
     }
 }

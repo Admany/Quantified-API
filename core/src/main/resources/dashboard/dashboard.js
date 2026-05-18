@@ -7,6 +7,7 @@ const html = htm.bind(React.createElement);
 
 const NAV_ITEMS = [
     { id: "overview", label: "Overview" },
+    { id: "modMetrics", label: "Mod Metrics" },
     { id: "resources", label: "Resources" },
     { id: "logs", label: "Logs" },
     { id: "controls", label: "Controls" },
@@ -421,6 +422,8 @@ const NavIcon = ({ id }) => {
             return html`<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12.5 12 4l9 8.5M6.5 11.5V20h11V11.5"/></svg>`;
         case "resources":
             return html`<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="7" rx="2"/><rect x="4" y="13" width="16" height="7" rx="2"/></svg>`;
+        case "modMetrics":
+            return html`<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V5M4 19h16"/><rect x="7" y="11" width="3" height="5" rx="1"/><rect x="12" y="7" width="3" height="9" rx="1"/><rect x="17" y="9" width="3" height="7" rx="1"/></svg>`;
         case "logs":
             return html`<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4h10l3 3v13H7z"/><path d="M14 4v3h3M10 12h7M10 16h7"/></svg>`;
         case "controls":
@@ -524,6 +527,7 @@ const App = () => {
         return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
     });
     const [resourceData, setResourceData] = useState(null);
+    const [modMetrics, setModMetrics] = useState(null);
     const [resourceBusy, setResourceBusy] = useState(false);
     const [selectedFiles, setSelectedFiles] = useState(() => new Set());
     const [configGroups, setConfigGroups] = useState([]);
@@ -825,6 +829,17 @@ const App = () => {
         }
     }, []);
 
+    const fetchModMetrics = useCallback(async () => {
+        try {
+            const payload = await fetchJson("/api/v1/mod-metrics");
+            setModMetrics(payload);
+            setError(null);
+        } catch (err) {
+            console.error(err);
+            setError(err.message || "Failed to load mod metrics");
+        }
+    }, []);
+
     useEffect(() => {
         if (activeView !== "resources") {
             return undefined;
@@ -833,6 +848,15 @@ const App = () => {
         const interval = window.setInterval(fetchResources, RESOURCE_REFRESH_MS);
         return () => window.clearInterval(interval);
     }, [activeView, fetchResources]);
+
+    useEffect(() => {
+        if (activeView !== "modMetrics") {
+            return undefined;
+        }
+        fetchModMetrics();
+        const interval = window.setInterval(fetchModMetrics, REFRESH_INTERVAL_MS);
+        return () => window.clearInterval(interval);
+    }, [activeView, fetchModMetrics]);
 
     useEffect(() => {
         setSelectedFiles(new Set());
@@ -1417,6 +1441,9 @@ const App = () => {
     const diskFiles = resourceData?.diskFiles ?? [];
     const caches = resourceData?.caches ?? [];
     const taskKinds = resourceData?.taskKinds?.entries ?? [];
+    const modMetricSummary = modMetrics?.summary ?? null;
+    const modMetricRows = modMetrics?.mods ?? [];
+    const modMetricTasks = modMetrics?.tasks ?? [];
     const resourceSummary = resourceData?.summary ?? null;
     const selectedCount = selectedFilePayload.length;
     const modColorMap = useMemo(
@@ -1825,6 +1852,112 @@ const App = () => {
                             <span><strong>Dark line:</strong> RAM cache usage (GB)</span>
                             <span><strong>Mid line:</strong> Disk cache usage (GB)</span>
                             <span><strong>Light line:</strong> VRAM usage (GB)</span>
+                        </div>
+                    </${Card}>
+                </div>
+            </div>
+        </section>`;
+    };
+
+    const renderModMetrics = () => {
+        const sortedMods = [...modMetricRows].sort((a, b) => {
+            const aScore = Number(a.taskEvents ?? 0) + Number(a.cacheRequests ?? 0) + Number(a.batchTotal ?? 0);
+            const bScore = Number(b.taskEvents ?? 0) + Number(b.cacheRequests ?? 0) + Number(b.batchTotal ?? 0);
+            return bScore - aScore || String(a.modId || "").localeCompare(String(b.modId || ""));
+        });
+        const topTasks = [...modMetricTasks]
+            .sort((a, b) => Number(b.count ?? 0) - Number(a.count ?? 0))
+            .slice(0, 24);
+        return html`<section className="view mod-metrics-view">
+            <div className="view-head">
+                <h2>Mod Metrics</h2>
+                <p>Live task routing and cache request pressure grouped by the mod calling Quantified.</p>
+            </div>
+            <div className="tab-kpi-row">
+                <div className="tab-kpi"><span>Mods tracked</span><strong>${formatNumber(modMetricSummary?.modsTracked ?? 0)}</strong></div>
+                <div className="tab-kpi"><span>Task events</span><strong>${formatNumber(modMetricSummary?.taskEvents ?? 0)}</strong></div>
+                <div className="tab-kpi"><span>Cache requests</span><strong>${formatNumber(modMetricSummary?.cacheRequests ?? 0)}</strong></div>
+                <div className="tab-kpi"><span>GPU share</span><strong>${formatPercent(modMetricSummary?.gpuShare ?? 0)}</strong></div>
+            </div>
+            <div className="tab-layout mod-metrics-layout">
+                <div className="tab-col">
+                    <${Card}
+                        title="Per-Mod Activity"
+                        actions=${html`<button className="btn btn-ghost" onClick=${fetchModMetrics}>Refresh</button>`}
+                    >
+                        <div className="table-scroll tall">
+                            <table className="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>Mod</th><th>Tasks</th><th>GPU</th><th>Parallel</th><th>Cache</th><th>Hit Rate</th><th>Batch Avg</th><th>Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${sortedMods.length
+                                        ? sortedMods.map((mod) => html`<tr key=${mod.modId}>
+                                            <td><div className="stacked"><strong>${mod.displayName || mod.modId}</strong><span className="text-muted">${mod.modId}</span></div></td>
+                                            <td>${formatNumber(mod.taskEvents ?? 0)}</td>
+                                            <td>${formatNumber(mod.gpuEvents ?? 0)}</td>
+                                            <td>${formatNumber(mod.parallelEvents ?? 0)}</td>
+                                            <td>
+                                                <div className="stacked">
+                                                    <strong>${formatNumber(mod.cacheRequests ?? 0)}</strong>
+                                                    <span className="text-muted">${formatNumber(mod.cacheEntries ?? 0)} entries</span>
+                                                </div>
+                                            </td>
+                                            <td>
+                                                <div className="mini-meter" title=${formatPercent(mod.cacheHitRate ?? 0)}>
+                                                    <span style=${{ width: `${Math.round(Math.max(0, Math.min(1, Number(mod.cacheHitRate ?? 0))) * 100)}%` }}></span>
+                                                </div>
+                                                <span className="text-muted">${formatPercent(mod.cacheHitRate ?? 0)}</span>
+                                            </td>
+                                            <td>${formatDecimal(mod.batchAvg ?? 0, 1)} <span className="text-muted">max ${formatNumber(mod.batchMax ?? 0)}</span></td>
+                                            <td><${StatusPill} label=${mod.online ? (mod.active ? "Active" : "Idle") : "Offline"} variant=${mod.online ? (mod.active ? "ok" : "warn") : "error"} /></td>
+                                        </tr>`)
+                                        : html`<tr><td colspan="8"><p className="text-muted">No mod task or cache telemetry yet.</p></td></tr>`}
+                                </tbody>
+                            </table>
+                        </div>
+                    </${Card}>
+                </div>
+                <div className="tab-col">
+                    <${Card} title="Hot Task Routes">
+                        <div className="table-scroll tall">
+                            <table className="data-table">
+                                <thead>
+                                    <tr><th>Mod</th><th>Task</th><th>Route</th><th>Events</th><th>Batch</th><th>Last Seen</th></tr>
+                                </thead>
+                                <tbody>
+                                    ${topTasks.length
+                                        ? topTasks.map((task, idx) => html`<tr key=${idx}>
+                                            <td><div className="stacked"><strong>${task.displayName || task.modId}</strong><span className="text-muted">${task.modId}</span></div></td>
+                                            <td>${task.taskName}</td>
+                                            <td><${StatusPill} label=${task.route || "Unknown"} variant=${String(task.route || "").includes("GPU") ? "vulkan" : "ok"} /></td>
+                                            <td>${formatNumber(task.count ?? 0)}</td>
+                                            <td>${formatDecimal(task.batchAvg ?? 0, 1)} <span className="text-muted">max ${formatNumber(task.batchMax ?? 0)}</span></td>
+                                            <td>${formatTime(task.lastSeenMs)}</td>
+                                        </tr>`)
+                                        : html`<tr><td colspan="6"><p className="text-muted">No task route telemetry in the current window.</p></td></tr>`}
+                                </tbody>
+                            </table>
+                        </div>
+                    </${Card}>
+                    <${Card} title="Cache Pressure">
+                        <div className="cache-pressure-list">
+                            ${sortedMods.slice(0, 10).map((mod) => {
+                                const requests = Number(mod.cacheRequests ?? 0);
+                                const maxRequests = Math.max(1, ...sortedMods.map((row) => Number(row.cacheRequests ?? 0)));
+                                return html`<div className="capacity-item" key=${mod.modId}>
+                                    <div className="capacity-head">
+                                        <strong>${mod.displayName || mod.modId}</strong>
+                                        <span className="text-muted">${formatNumber(requests)} req / ${formatPercent(mod.cacheHitRate ?? 0)} hit</span>
+                                    </div>
+                                    <div className="capacity-track">
+                                        <span className="capacity-fill" style=${{ width: `${Math.round((requests / maxRequests) * 100)}%` }}></span>
+                                    </div>
+                                </div>`;
+                            })}
+                            ${!sortedMods.length ? html`<p className="text-muted">No cache traffic yet.</p>` : null}
                         </div>
                     </${Card}>
                 </div>
@@ -2265,6 +2398,8 @@ const App = () => {
 
     const renderActiveView = () => {
         switch (activeView) {
+            case "modMetrics":
+                return renderModMetrics();
             case "resources":
                 return renderResources();
             case "logs":
@@ -2328,6 +2463,14 @@ const App = () => {
     };
 
     return html`<div className="dashboard-shell">
+        <div className="dashboard-bg-stage" aria-hidden="true">
+            <div className="dashboard-bg-grid"></div>
+            <div className="dashboard-bg-glow dashboard-bg-glow-a"></div>
+            <div className="dashboard-bg-glow dashboard-bg-glow-b"></div>
+            <div className="dashboard-bg-sweep"></div>
+            <div className="dashboard-bg-aurora"></div>
+            <div className="dashboard-bg-noise"></div>
+        </div>
         <div className="theme-toggle">
             <button
                 className=${`theme-toggle__btn ${theme === "light" ? "active" : ""}`}

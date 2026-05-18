@@ -1,18 +1,15 @@
 package org.admany.quantified.api;
 
 import org.admany.quantified.api.compute.GpuBackendPreference;
-import org.admany.quantified.api.compute.QuantifiedCompute;
 import org.admany.quantified.api.interfaces.ConnectedMod;
 import org.admany.quantified.api.interfaces.ModCacheManager;
 import org.admany.quantified.api.interfaces.ModConnectionListener;
 import org.admany.quantified.api.interfaces.ModStatistics;
 import org.admany.quantified.api.graph.QuantifiedTaskGraph;
-import org.admany.quantified.api.model.QuantifiedHybrid;
 import org.admany.quantified.api.model.QuantifiedPacket;
 import org.admany.quantified.api.model.QuantifiedTask;
-import org.admany.quantified.api.parallel.ParallelCompute;
 import org.admany.quantified.api.util.ForgeMetadataUtil;
-import org.admany.quantified.api.vulkan.QuantifiedVulkan;
+import org.admany.quantified.api.util.ModMetadataResolver;
 import org.admany.quantified.core.common.gpu.backend.GpuBackendRouter;
 import org.admany.quantified.core.common.platform.QuantifiedCoreRuntime;
 import org.admany.quantified.core.common.util.ConnectedModImpl;
@@ -25,8 +22,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.Objects;
+import java.util.function.Function;
+import java.util.function.IntFunction;
 import java.util.function.Supplier;
-import java.util.concurrent.ThreadLocalRandom;
 
 public final class QuantifiedAPI {
 
@@ -38,15 +36,33 @@ public final class QuantifiedAPI {
     private static final List<ModConnectionListener> connectionListeners = new CopyOnWriteArrayList<>();
 
     public static boolean register(String modId) {
+        ModMetadataResolver.ResolvedMod resolved = ModMetadataResolver.resolveByModId(modId);
+        if (resolved != null) {
+            return register(resolved.modId(), resolved.displayName(), resolved.version());
+        }
         String displayName = ForgeMetadataUtil.getModDisplayNameFromForge(modId);
         String version = ForgeMetadataUtil.getModVersionFromForge(modId);
         return register(modId, displayName, version);
     }
 
     public static boolean register(String modId, String displayName, String version) {
+        if (modId == null || modId.isBlank()) {
+            throw new IllegalArgumentException("modId must not be blank");
+        }
+        String resolvedDisplayName = displayName;
         String resolvedVersion = version;
+        ModMetadataResolver.ResolvedMod metadata = ModMetadataResolver.resolveByModId(modId);
+        if ((resolvedDisplayName == null || resolvedDisplayName.trim().isEmpty()) && metadata != null) {
+            resolvedDisplayName = metadata.displayName();
+        }
         if (resolvedVersion == null || resolvedVersion.trim().isEmpty()) {
-            resolvedVersion = ForgeMetadataUtil.getModVersionFromForge(modId);
+            resolvedVersion = metadata != null ? metadata.version() : ForgeMetadataUtil.getModVersionFromForge(modId);
+        }
+        if (resolvedDisplayName == null || resolvedDisplayName.trim().isEmpty()) {
+            resolvedDisplayName = ForgeMetadataUtil.getModDisplayNameFromForge(modId);
+        }
+        if (resolvedVersion == null || resolvedVersion.trim().isEmpty()) {
+            resolvedVersion = "unknown";
         }
 
         final String versionForHandle = resolvedVersion;
@@ -63,13 +79,17 @@ public final class QuantifiedAPI {
 
         ConnectedMod existingMod = connectedMods.get(modId);
         if (existingMod != null) {
+            if (existingMod instanceof ConnectedModImpl impl) {
+                impl.updateDisplayName(resolvedDisplayName);
+                impl.updateVersion(versionForHandle);
+            }
             return true;
         }
 
         ConnectedMod newMod = null;
         for (ModConnectionListener listener : connectionListeners) {
             try {
-                newMod = listener.onModConnecting(modId, versionForHandle, displayName);
+                newMod = listener.onModConnecting(modId, versionForHandle, resolvedDisplayName);
                 if (newMod != null) {
                     break;
                 }
@@ -79,7 +99,7 @@ public final class QuantifiedAPI {
         }
 
         if (newMod == null) {
-            return true;
+            newMod = new ConnectedModImpl(modId, versionForHandle, resolvedDisplayName);
         }
 
         connectedMods.put(modId, newMod);
@@ -100,107 +120,9 @@ public final class QuantifiedAPI {
         register(modId, modId, version);
     }
 
-    public static <T> CompletableFuture<T> submit(String taskName, Supplier<T> work) {
-        QuantifiedHandle handle = getHandle();
-        return handle.submitTask(QuantifiedTask.builder(handle.modId(), taskName, work).build());
-    }
-
-    public static <T> CompletableFuture<T> submit(QuantifiedTask.Builder<T> builder) {
-        QuantifiedHandle handle = resolveHandle(builder.modId());
-        return handle.submitTask(builder.build());
-    }
-
-    public static <S, R, O> CompletableFuture<O> submitParallel(ParallelCompute.Builder<S, R, O> builder) {
-        return Objects.requireNonNull(builder, "builder").submit();
-    }
-
-    public static <T> T getCached(String cacheName, String key, Supplier<T> loader) {
-        QuantifiedHandle handle = getHandle();
-        return handle.cacheGet(cacheName, key, loader, null, DEFAULT_CACHE_MAX_SIZE, false);
-    }
-
-    public static <T> T getCached(String cacheName, String key, Supplier<T> loader, Duration ttl, long maxSize, boolean persistence) {
-        QuantifiedHandle handle = getHandle();
-        return handle.cacheGet(cacheName, key, loader, ttl, maxSize, persistence);
-    }
-
-    public static <T> CompletableFuture<T> getCachedAsync(String cacheName, String key, Supplier<T> loader) {
-        QuantifiedHandle handle = getHandle();
-        return handle.cacheGetAsync(cacheName, key, loader, null, DEFAULT_CACHE_MAX_SIZE, false);
-    }
-
-    public static <T> CompletableFuture<T> getCachedAsync(String cacheName, String key, Supplier<T> loader, Duration ttl, long maxSize, boolean persistence) {
-        QuantifiedHandle handle = getHandle();
-        return handle.cacheGetAsync(cacheName, key, loader, ttl, maxSize, persistence);
-    }
-
-    public static <T> CompletableFuture<T> hybrid(String operationName, Supplier<T> work) {
-        QuantifiedHandle handle = getHandle();
-        QuantifiedHybrid<T> hybrid = QuantifiedHybrid.builder(handle.modId(), operationName, work)
-            .cacheKey(operationName)
-            .build();
-        return handle.submitHybrid(hybrid);
-    }
-
-    public static <T> CompletableFuture<T> hybrid(QuantifiedHybrid.Builder<T> builder) {
-        QuantifiedHandle handle = getHandle();
-        return handle.submitHybrid(builder.build());
-    }
-
     public static CompletableFuture<Void> sendPacket(String channelName, QuantifiedPacket packet) {
         QuantifiedHandle handle = getHandle();
         return handle.sendPacket(channelName, packet);
-    }
-
-    public static <T> void putCached(String cacheName, String key, T value) {
-        if (value == null) {
-            return;
-        }
-        QuantifiedHandle handle = getHandle();
-        handle.cacheGet(cacheName, key, () -> value, null, DEFAULT_CACHE_MAX_SIZE, false);
-    }
-
-    public static <T> void putCached(String cacheName, String key, T value, Duration ttl, long maxSize, boolean persistence) {
-        if (value == null) {
-            return;
-        }
-        QuantifiedHandle handle = getHandle();
-        handle.cacheGet(cacheName, key, () -> value, ttl, maxSize, persistence);
-    }
-
-    public static <T> QuantifiedTask.Builder<T> task(String taskName, Supplier<T> work) {
-        QuantifiedHandle handle = getHandle();
-        return QuantifiedTask.builder(handle.modId(), taskName, work);
-    }
-
-    public static QuantifiedTaskGraph.Builder graph(String graphName) {
-        QuantifiedHandle handle = getHandle();
-        return QuantifiedTaskGraph.builder(handle.modId(), graphName, ThreadLocalRandom.current().nextLong());
-    }
-
-    public static QuantifiedTaskGraph.Builder graph(String modId, String graphName) {
-        QuantifiedHandle handle = resolveHandle(modId);
-        return QuantifiedTaskGraph.builder(handle.modId(), graphName, ThreadLocalRandom.current().nextLong());
-    }
-
-    public static <T> QuantifiedCompute.Builder<T> compute(String taskName) {
-        QuantifiedHandle handle = getHandle();
-        return QuantifiedCompute.builder(handle.modId(), taskName, ThreadLocalRandom.current().nextLong());
-    }
-
-    public static <T> QuantifiedCompute.Builder<T> compute(String modId, String taskName) {
-        QuantifiedHandle handle = resolveHandle(modId);
-        return QuantifiedCompute.builder(handle.modId(), taskName, ThreadLocalRandom.current().nextLong());
-    }
-
-    public static <T> QuantifiedVulkan.Builder<T> vulkan(String taskName) {
-        QuantifiedHandle handle = getHandle();
-        return QuantifiedVulkan.builder(handle.modId(), taskName, ThreadLocalRandom.current().nextLong());
-    }
-
-    public static <T> QuantifiedVulkan.Builder<T> vulkan(String modId, String taskName) {
-        QuantifiedHandle handle = resolveHandle(modId);
-        return QuantifiedVulkan.builder(handle.modId(), taskName, ThreadLocalRandom.current().nextLong());
     }
 
     public static <T> CompletableFuture<T> submitGraph(QuantifiedTaskGraph.Builder builder,
@@ -217,9 +139,70 @@ public final class QuantifiedAPI {
         return handle.submitGraphAll(builder);
     }
 
-    public static <T> QuantifiedHybrid.Builder<T> hybridBuilder(String operationName, Supplier<T> work) {
+    public static <T> ComputeRequest<T> compute(String taskName) {
         QuantifiedHandle handle = getHandle();
-        return QuantifiedHybrid.builder(handle.modId(), operationName, work);
+        return new ComputeRequest<>(handle.modId(), taskName);
+    }
+
+    public static <T> ComputeRequest<T> compute(String modId, String taskName) {
+        QuantifiedHandle handle = resolveHandle(modId);
+        return new ComputeRequest<>(handle.modId(), taskName);
+    }
+
+    public static ParallelRequest parallel(String taskName) {
+        QuantifiedHandle handle = getHandle();
+        return new ParallelRequest(handle.modId(), taskName);
+    }
+
+    public static ParallelRequest parallel(String modId, String taskName) {
+        QuantifiedHandle handle = resolveHandle(modId);
+        return new ParallelRequest(handle.modId(), taskName);
+    }
+
+    public static QuantifiedTaskGraph.Builder graph(String graphName) {
+        QuantifiedHandle handle = getHandle();
+        return QuantifiedTaskGraph.builder(handle.modId(), graphName);
+    }
+
+    public static QuantifiedTaskGraph.Builder graph(String modId, String graphName) {
+        QuantifiedHandle handle = resolveHandle(modId);
+        return QuantifiedTaskGraph.builder(handle.modId(), graphName);
+    }
+
+    public static CacheRequest cache(String cacheName) {
+        QuantifiedHandle handle = getHandle();
+        return new CacheRequest(handle.modId(), cacheName);
+    }
+
+    public static CacheRequest cache(String modId, String cacheName) {
+        QuantifiedHandle handle = resolveHandle(modId);
+        return new CacheRequest(handle.modId(), cacheName);
+    }
+
+    public static CompletableFuture<Void> runAsync(String taskName, Runnable work) {
+        Objects.requireNonNull(work, "work");
+        return QuantifiedAPI.<Void>compute(taskName)
+            .submit(() -> {
+                work.run();
+                return null;
+            });
+    }
+
+    public static <T> void forEach(String taskName, java.util.Collection<T> values, java.util.function.Consumer<T> consumer) {
+        Objects.requireNonNull(values, "values");
+        Objects.requireNonNull(consumer, "consumer");
+        parallel(taskName).items(values).forEach(consumer).join();
+    }
+
+    public static <T, R> List<R> mapOrdered(String taskName, java.util.Collection<T> values, Function<T, R> mapper) {
+        Objects.requireNonNull(values, "values");
+        Objects.requireNonNull(mapper, "mapper");
+        return parallel(taskName).items(values).map(mapper).submit().join();
+    }
+
+    public static <R> List<R> mapRange(String taskName, int startInclusive, int endExclusive, IntFunction<R> mapper) {
+        Objects.requireNonNull(mapper, "mapper");
+        return parallel(taskName).range(startInclusive, endExclusive).map(mapper).submit().join();
     }
 
     public static boolean isPrintDebugLogs() {
@@ -331,6 +314,15 @@ public final class QuantifiedAPI {
         return null;
     }
 
+    static QuantifiedHandle resolveHandleForApi(String modId) {
+        return resolveHandle(modId);
+    }
+
+    static <T> CompletableFuture<T> submitTaskInternal(QuantifiedTask<T> task) {
+        Objects.requireNonNull(task, "task");
+        return resolveHandle(task.modId()).submitTask(task);
+    }
+
     private static QuantifiedHandle resolveHandle(String modId) {
         QuantifiedHandle current = currentHandle.get();
         if (current != null && (modId == null || modId.isBlank() || current.modId().equals(modId))) {
@@ -372,12 +364,16 @@ public final class QuantifiedAPI {
     private static QuantifiedHandle getHandle() {
         QuantifiedHandle handle = currentHandle.get();
         if (handle == null) {
+            QuantifiedHandle autoDetected = autoRegisterCallerHandle();
+            if (autoDetected != null) {
+                return autoDetected;
+            }
             if (handlesByMod.size() == 1) {
                 QuantifiedHandle single = handlesByMod.values().iterator().next();
                 currentHandle.set(single);
                 return single;
             }
-            throw new IllegalStateException("QuantifiedAPI not initialized. Call QuantifiedAPI.register(modId, displayName, version) first.");
+            throw new IllegalStateException("QuantifiedAPI could not auto-detect the active mod. Use the explicit modId overloads like compute(modId, taskName) or call QuantifiedAPI.register(modId) as an override.");
         }
 
         if (!handlesByMod.containsKey(handle.modId())) {
@@ -401,6 +397,23 @@ public final class QuantifiedAPI {
             return mapped;
         }
 
+        return handle;
+    }
+
+    private static QuantifiedHandle autoRegisterCallerHandle() {
+        ModMetadataResolver.ResolvedMod resolved = null;
+        try {
+            resolved = ModMetadataResolver.resolveCallerMod();
+        } catch (Throwable ignored) {
+        }
+        if (resolved == null || resolved.modId() == null || resolved.modId().isBlank()) {
+            return null;
+        }
+        register(resolved.modId(), resolved.displayName(), resolved.version());
+        QuantifiedHandle handle = handlesByMod.get(resolved.modId());
+        if (handle != null) {
+            currentHandle.set(handle);
+        }
         return handle;
     }
 }

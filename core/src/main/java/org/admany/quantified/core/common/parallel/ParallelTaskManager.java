@@ -2,6 +2,9 @@ package org.admany.quantified.core.common.parallel;
 
 import org.admany.quantified.api.model.ParallelTaskSpec;
 import org.admany.quantified.api.parallel.ParallelSliceCachePolicy;
+import org.admany.quantified.core.common.async.core.AsyncManager;
+import org.admany.quantified.core.common.async.task.PriorityTaskType;
+import org.admany.quantified.core.common.async.task.TaskMetadata;
 import org.admany.quantified.core.common.parallel.cache.ParallelResultCache;
 import org.admany.quantified.core.common.parallel.config.ParallelConfig;
 import org.admany.quantified.core.common.parallel.executor.ParallelScheduler;
@@ -21,12 +24,153 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.concurrent.locks.LockSupport;
 
 public final class ParallelTaskManager {
+    private static final int INLINE_SYNC_THRESHOLD = Math.max(256,
+        Integer.getInteger("quantified.parallel.inlineThreshold", 8192));
+
     private ParallelTaskManager() {
     }
 
     public static <S, R, O> CompletableFuture<O> submit(ParallelTaskSpec<S, R, O> spec) {
+        if (spec.hasDirectSliceExecutor()) {
+            return submitUnifiedSync(spec);
+        }
+        return submitLegacy(spec);
+    }
+
+    private static <S, R, O> CompletableFuture<O> submitUnifiedSync(ParallelTaskSpec<S, R, O> spec) {
+        List<S> slices = spec.sliceSupplier().get();
+        if (slices.isEmpty()) {
+            O value = spec.reducer().apply(List.of());
+            return CompletableFuture.completedFuture(value);
+        }
+        if (!TaskKindTelemetry.isInternalBatchName(spec.taskName())) {
+            TaskKindTelemetry.recordParallel(spec.modId(), spec.taskName());
+        }
+        ParallelMetrics.recordSubmission(spec.modId(), slices.size());
+        int jobParallelism = Math.max(1, Math.min(spec.maxParallelism(), ParallelConfig.maxThreads()));
+        int workerCount = Math.min(jobParallelism, slices.size());
+        if (slices.size() <= INLINE_SYNC_THRESHOLD || workerCount <= 1) {
+            return submitUnifiedInline(spec, slices);
+        }
+        Object[] results = new Object[slices.size()];
+        AtomicBoolean failFast = new AtomicBoolean(false);
+        AtomicReference<Throwable> firstFailure = new AtomicReference<>();
+        AtomicBoolean resultCompleted = new AtomicBoolean(false);
+        AtomicInteger cursor = new AtomicInteger(0);
+        final Semaphore modSemaphore = ParallelModTracker.semaphore(spec.modId());
+        CompletableFuture<O> result = new CompletableFuture<>();
+        AtomicInteger activeWorkers = new AtomicInteger(workerCount);
+        BatchSizing sizing = resolveBatchSizing(slices.size(), workerCount);
+        Function<S, R> directExecutor = spec.directSliceExecutor();
+        ParallelSliceCachePolicy<S, R> cachePolicy = spec.cachePolicy();
+        Consumer<R> listener = spec.sliceListener();
+        ParallelFailurePolicy failurePolicy = spec.failurePolicy();
+        String affinityPrefix = taskAffinity(spec.taskName());
+
+        Runnable tryFinish = () -> {
+            if (activeWorkers.get() != 0 || !resultCompleted.compareAndSet(false, true)) {
+                return;
+            }
+            if (failFast.get()) {
+                Throwable failure = firstFailure.get();
+                result.completeExceptionally(failure != null ? failure : new IllegalStateException("Parallel batch failed"));
+                return;
+            }
+            try {
+                List<R> collected = new ArrayList<>(results.length);
+                for (Object entry : results) {
+                    @SuppressWarnings("unchecked")
+                    R cast = (R) entry;
+                    collected.add(cast);
+                }
+                result.complete(spec.reducer().apply(collected));
+            } catch (Throwable t) {
+                result.completeExceptionally(t);
+            }
+        };
+
+        for (int workerIndex = 0; workerIndex < workerCount; workerIndex++) {
+            final int shard = workerIndex;
+            TaskMetadata metadata = TaskMetadata.builder()
+                .batchable(false)
+                .affinityKey(affinityPrefix + "|w" + shard)
+                .build();
+            AsyncManager.submitDirect(
+                spec.taskKey() ^ (0x9E3779B97F4A7C15L + workerIndex),
+                PriorityTaskType.BUILDING,
+                PriorityTaskType.BUILDING.defaultScore(),
+                () -> {
+                    runUnifiedWorker(spec, slices, results, cursor, modSemaphore, failFast, firstFailure, directExecutor,
+                        cachePolicy, listener, failurePolicy, sizing.max());
+                    if (activeWorkers.decrementAndGet() == 0) {
+                        tryFinish.run();
+                    }
+                    return null;
+                },
+                true,
+                spec.modId(),
+                metadata
+            );
+        }
+
+        return result;
+    }
+
+    private static <S, R, O> CompletableFuture<O> submitUnifiedInline(ParallelTaskSpec<S, R, O> spec, List<S> slices) {
+        Object[] results = new Object[slices.size()];
+        ParallelSliceCachePolicy<S, R> cachePolicy = spec.cachePolicy();
+        Consumer<R> listener = spec.sliceListener();
+        Function<S, R> directExecutor = spec.directSliceExecutor();
+
+        int successes = 0;
+        for (int index = 0; index < slices.size(); index++) {
+            S slice = slices.get(index);
+            try {
+                R value = cachePolicy != null ? ParallelResultCache.tryLoad(spec, cachePolicy, slice) : null;
+                if (value == null) {
+                    value = directExecutor.apply(slice);
+                    if (cachePolicy != null) {
+                        ParallelResultCache.store(spec, cachePolicy, slice, value);
+                    }
+                }
+                results[index] = value;
+                if (listener != null) {
+                    try {
+                        listener.accept(value);
+                    } catch (Throwable ignored) {
+                    }
+                }
+                successes++;
+            } catch (Throwable throwable) {
+                if (spec.failurePolicy() == ParallelFailurePolicy.FAIL_FAST) {
+                    CompletableFuture<O> failed = new CompletableFuture<>();
+                    failed.completeExceptionally(throwable);
+                    return failed;
+                }
+            }
+        }
+        ParallelMetrics.recordDispatch(spec.modId(), slices.size());
+        ParallelMetrics.recordCompletion(spec.modId(), successes, Math.max(0, slices.size() - successes));
+        try {
+            List<R> collected = new ArrayList<>(results.length);
+            for (Object entry : results) {
+                @SuppressWarnings("unchecked")
+                R cast = (R) entry;
+                collected.add(cast);
+            }
+            return CompletableFuture.completedFuture(spec.reducer().apply(collected));
+        } catch (Throwable throwable) {
+            CompletableFuture<O> failed = new CompletableFuture<>();
+            failed.completeExceptionally(throwable);
+            return failed;
+        }
+    }
+
+    static <S, R, O> CompletableFuture<O> submitLegacy(ParallelTaskSpec<S, R, O> spec) {
         List<S> slices = spec.sliceSupplier().get();
         if (slices.isEmpty()) {
             O value = spec.reducer().apply(List.of());
@@ -323,6 +467,100 @@ public final class ParallelTaskManager {
         }
 
         return result;
+    }
+
+    private static <S, R, O> void runUnifiedWorker(ParallelTaskSpec<S, R, O> spec,
+                                                   List<S> slices,
+                                                   Object[] results,
+                                                   AtomicInteger cursor,
+                                                   Semaphore modSemaphore,
+                                                   AtomicBoolean failFast,
+                                                   AtomicReference<Throwable> firstFailure,
+                                                   Function<S, R> directExecutor,
+                                                   ParallelSliceCachePolicy<S, R> cachePolicy,
+                                                   Consumer<R> listener,
+                                                   ParallelFailurePolicy failurePolicy,
+                                                   int maxBatchSize) {
+        int batchSize = Math.max(1, maxBatchSize);
+        while (!failFast.get()) {
+            int permits = acquirePermits(modSemaphore, batchSize);
+            if (permits <= 0) {
+                break;
+            }
+            int start = cursor.getAndAdd(permits);
+            if (start >= slices.size()) {
+                releasePermits(modSemaphore, permits);
+                break;
+            }
+            int end = Math.min(slices.size(), start + permits);
+            int actualPermits = end - start;
+            if (actualPermits <= 0) {
+                releasePermits(modSemaphore, permits);
+                break;
+            }
+            if (actualPermits < permits) {
+                releasePermits(modSemaphore, permits - actualPermits);
+            }
+
+            int successes = 0;
+            int failures = 0;
+            for (int index = start; index < end; index++) {
+                if (failFast.get()) {
+                    failures += end - index;
+                    break;
+                }
+                S slice = slices.get(index);
+                try {
+                    R value = cachePolicy != null ? ParallelResultCache.tryLoad(spec, cachePolicy, slice) : null;
+                    if (value == null) {
+                        value = directExecutor.apply(slice);
+                        if (cachePolicy != null) {
+                            ParallelResultCache.store(spec, cachePolicy, slice, value);
+                        }
+                    }
+                    results[index] = value;
+                    if (listener != null) {
+                        try {
+                            listener.accept(value);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    successes++;
+                } catch (Throwable throwable) {
+                    results[index] = null;
+                    failures++;
+                    if (failurePolicy == ParallelFailurePolicy.FAIL_FAST) {
+                        firstFailure.compareAndSet(null, throwable);
+                        failFast.set(true);
+                    }
+                }
+            }
+            ParallelMetrics.recordDispatch(spec.modId(), actualPermits);
+            ParallelMetrics.recordCompletion(spec.modId(), successes, failures);
+            modSemaphore.release(actualPermits);
+            ParallelBackpressure.release(actualPermits);
+        }
+    }
+
+    private static int acquirePermits(Semaphore modSemaphore, int desired) {
+        int attempts = 0;
+        int target = Math.max(1, desired);
+        while (attempts++ < 32) {
+            int allowed = resolvePermittedBatchSize(target, modSemaphore);
+            if (allowed > 0 && tryAcquirePermits(modSemaphore, allowed)) {
+                return allowed;
+            }
+            ParallelMetrics.recordRejection();
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(Math.min(8, attempts)));
+        }
+        return 0;
+    }
+
+    private static String taskAffinity(String taskName) {
+        if (taskName == null || taskName.isBlank()) {
+            return "parallel|default";
+        }
+        return "parallel|" + taskName.trim().toLowerCase().replace(' ', '_');
     }
 
     private static int resolveBatchSize(int sliceCount, int workers) {

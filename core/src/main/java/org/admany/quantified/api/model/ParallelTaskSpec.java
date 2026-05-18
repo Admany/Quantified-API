@@ -17,6 +17,7 @@ public final class ParallelTaskSpec<S, R, O> {
     private final long taskKey;
     private final Supplier<List<S>> sliceSupplier;
     private final Function<S, CompletableFuture<R>> sliceExecutor;
+    private final Function<S, R> directSliceExecutor;
     private final Function<List<R>, O> reducer;
     private final Consumer<R> sliceListener;
     private final ParallelFailurePolicy failurePolicy;
@@ -33,11 +34,27 @@ public final class ParallelTaskSpec<S, R, O> {
                             ParallelFailurePolicy failurePolicy,
                             int maxParallelism,
                             ParallelSliceCachePolicy<S, R> cachePolicy) {
+        this(modId, taskName, taskKey, sliceSupplier, sliceExecutor, null, reducer, sliceListener, failurePolicy,
+            maxParallelism, cachePolicy);
+    }
+
+    public ParallelTaskSpec(String modId,
+                            String taskName,
+                            long taskKey,
+                            Supplier<List<S>> sliceSupplier,
+                            Function<S, CompletableFuture<R>> sliceExecutor,
+                            Function<S, R> directSliceExecutor,
+                            Function<List<R>, O> reducer,
+                            Consumer<R> sliceListener,
+                            ParallelFailurePolicy failurePolicy,
+                            int maxParallelism,
+                            ParallelSliceCachePolicy<S, R> cachePolicy) {
         this.modId = Objects.requireNonNull(modId, "modId");
         this.taskName = Objects.requireNonNull(taskName, "taskName");
         this.taskKey = taskKey;
         this.sliceSupplier = Objects.requireNonNull(sliceSupplier, "sliceSupplier");
         this.sliceExecutor = Objects.requireNonNull(sliceExecutor, "sliceExecutor");
+        this.directSliceExecutor = directSliceExecutor;
         this.reducer = Objects.requireNonNull(reducer, "reducer");
         this.sliceListener = sliceListener;
         this.failurePolicy = failurePolicy == null ? ParallelConfig.defaultFailurePolicy() : failurePolicy;
@@ -65,6 +82,10 @@ public final class ParallelTaskSpec<S, R, O> {
         return sliceExecutor;
     }
 
+    public Function<S, R> directSliceExecutor() {
+        return directSliceExecutor;
+    }
+
     public Function<List<R>, O> reducer() {
         return reducer;
     }
@@ -83,5 +104,9 @@ public final class ParallelTaskSpec<S, R, O> {
 
     public ParallelSliceCachePolicy<S, R> cachePolicy() {
         return cachePolicy;
+    }
+
+    public boolean hasDirectSliceExecutor() {
+        return directSliceExecutor != null;
     }
 }

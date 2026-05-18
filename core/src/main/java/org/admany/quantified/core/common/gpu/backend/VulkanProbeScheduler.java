@@ -1,5 +1,6 @@
 package org.admany.quantified.core.common.gpu.backend;
 
+import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
 import org.admany.quantified.core.common.util.LwjglRuntimeTuning;
 import org.admany.quantified.core.common.vulkan.core.VulkanManager;
@@ -39,6 +40,11 @@ public final class VulkanProbeScheduler {
     }
 
     public static synchronized void scheduleBackgroundProbe() {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            markDisabled();
+            reset();
+            return;
+        }
         if (!VulkanRuntime.hasBindings()) {
             logBindingsUnavailable();
             return;
@@ -79,6 +85,11 @@ public final class VulkanProbeScheduler {
     }
 
     public static void triggerInlineProbe(String reason) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            markDisabled();
+            reset();
+            return;
+        }
         if (!VulkanRuntime.hasBindings()) {
             logBindingsUnavailable();
             return;
@@ -94,7 +105,7 @@ public final class VulkanProbeScheduler {
             LOGGER.debug("Skipping inline Vulkan probe; one is already running");
             return;
         }
-        // Do NOT call forceProbeSynchronous() on the calling thread — vkCreateInstance in some
+        // Do NOT call forceProbeSynchronous() on the calling thread. VkCreateInstance in some
         // drivers (especially NVIDIA) consumes several MB of stack, which overflows the render
         // thread's default ~1 MB stack. Dispatch to PROBE_EXECUTOR which has a large stack
         // (gpuThreadStackSizeKb = 64 MB by default) and handle the result asynchronously.
@@ -123,6 +134,11 @@ public final class VulkanProbeScheduler {
     }
 
     public static void triggerProbe(String reason) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            markDisabled();
+            reset();
+            return;
+        }
         if (!VulkanRuntime.hasBindings()) {
             logBindingsUnavailable();
             return;
@@ -150,6 +166,10 @@ public final class VulkanProbeScheduler {
     }
 
     private static void scheduleProbe(Duration delay, String trigger) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            markDisabled();
+            return;
+        }
         if (succeeded) {
             return;
         }
@@ -176,6 +196,10 @@ public final class VulkanProbeScheduler {
     }
 
     private static void runProbe(String trigger, int attemptNo) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            markDisabled();
+            return;
+        }
         if (succeeded) {
             return;
         }
@@ -210,12 +234,22 @@ public final class VulkanProbeScheduler {
     }
 
     private static void scheduleRetry(String reason) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            markDisabled();
+            return;
+        }
         if (succeeded) {
             return;
         }
         scheduleProbe(RETRY_DELAY, "retry:" + reason);
     }
 
+    private static void markDisabled() {
+        String message = "Vulkan probe skipped because enableGpuAcceleration=false";
+        LOGGER.info(message);
+        VulkanManager.notePending("GPU acceleration disabled in config");
+        DeveloperOverlayManager.recordApiLog("[Vulkan] Probe skipped - GPU acceleration disabled in config");
+    }
     private static void logBindingsUnavailable() {
         if (unavailableLogged) {
             return;

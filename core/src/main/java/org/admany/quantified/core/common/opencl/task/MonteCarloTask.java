@@ -42,7 +42,7 @@ public final class MonteCarloTask extends OpenCLTask<Double> {
 
             // Set kernel arguments
             context.setKernelArgBuffer(kernel, 0, resultsBuffer);
-            context.setKernelArg(kernel, 1, samples);
+            context.setKernelArgInt(kernel, 1, samples);
 
             // Execute kernel
             PointerBuffer globalWorkSize = stack.pointers(samples);

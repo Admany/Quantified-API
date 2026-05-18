@@ -10,6 +10,8 @@ public final class PriorityTask implements Comparable<PriorityTask> {
     private final TaskMetadata metadata;
     private final String modId;
     private volatile double score;
+    private final java.util.concurrent.atomic.AtomicBoolean superseded = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final Runnable onDrop;
 
     public PriorityTask(long taskKey, PriorityTaskType type, double score, Runnable payload) {
         this(taskKey, type, score, payload, TaskMetadata.DEFAULT, "");
@@ -29,6 +31,16 @@ public final class PriorityTask implements Comparable<PriorityTask> {
                         Runnable payload,
                         TaskMetadata metadata,
                         String modId) {
+        this(taskKey, type, score, payload, metadata, modId, null);
+    }
+
+    public PriorityTask(long taskKey,
+                        PriorityTaskType type,
+                        double score,
+                        Runnable payload,
+                        TaskMetadata metadata,
+                        String modId,
+                        Runnable onDrop) {
         this.taskKey = taskKey;
         this.type = Objects.requireNonNull(type, "type");
         this.payload = Objects.requireNonNull(payload, "payload");
@@ -36,6 +48,16 @@ public final class PriorityTask implements Comparable<PriorityTask> {
         this.modId = Objects.requireNonNullElse(modId, "");
         this.score = score;
         this.enqueuedAtNanos = System.nanoTime();
+        this.onDrop = onDrop;
+    }
+
+   public void notifyDrop() {
+        if (onDrop != null) {
+            try {
+                onDrop.run();
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     public long taskKey() {
@@ -64,6 +86,14 @@ public final class PriorityTask implements Comparable<PriorityTask> {
 
     public void adjustScore(double delta) {
         this.score += delta;
+    }
+
+    public void markSuperseded() {
+        superseded.set(true);
+    }
+
+    public boolean isSuperseded() {
+        return superseded.get();
     }
 
     public long enqueuedAtNanos() {

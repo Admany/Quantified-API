@@ -1,6 +1,9 @@
 package org.admany.quantified.core.common.util;
 
 import org.admany.quantified.api.QuantifiedAPI;
+import org.admany.quantified.api.CacheRequest;
+import org.admany.quantified.api.ComputeRequest;
+import org.admany.quantified.api.ParallelRequest;
 import org.admany.quantified.api.builders.QuantifiedCacheBuilder;
 import org.admany.quantified.api.builders.QuantifiedHybridBuilder;
 import org.admany.quantified.api.builders.QuantifiedNetworkBuilder;
@@ -53,23 +56,18 @@ public class ConnectedModImpl implements ConnectedMod {
     public ModStatistics getStatistics() { return statistics; }
 
     @Override
-    public QuantifiedTaskBuilder task(String name) {
-        return new TaskBuilderImpl(name);
+    public <T> ComputeRequest<T> compute(String name) {
+        return QuantifiedAPI.compute(modId, name);
     }
 
     @Override
-    public QuantifiedCacheBuilder cache(Enum<?> cacheType) {
-        return new CacheBuilderImpl(cacheType.name().toLowerCase());
+    public ParallelRequest parallel(String name) {
+        return QuantifiedAPI.parallel(modId, name);
     }
 
     @Override
-    public QuantifiedHybridBuilder hybrid(String name) {
-        return new HybridBuilderImpl(name);
-    }
-
-    @Override
-    public QuantifiedNetworkBuilder network(String channel) {
-        return new NetworkBuilderImpl(channel);
+    public CacheRequest cache(String cacheName) {
+        return QuantifiedAPI.cache(modId, cacheName);
     }
 
     /**

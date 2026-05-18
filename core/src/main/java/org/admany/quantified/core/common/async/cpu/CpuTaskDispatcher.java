@@ -60,6 +60,7 @@ public final class CpuTaskDispatcher {
             bucket.metadata = TaskMetadata.merge(bucket.metadata, metadata);
             bucket.tasks.addLast(task);
             bucket.size++;
+            bucket.maxScore = Math.max(bucket.maxScore, task.score());
             if (bucket.size == 1) {
                 bucket.firstEnqueueNanos = System.nanoTime();
             }
@@ -160,6 +161,7 @@ public final class CpuTaskDispatcher {
         TaskMetadata metadataSnapshot;
         PriorityTaskType type;
         String modId;
+        double scoreSnapshot;
         synchronized (bucket) {
             if (bucket.tasks.isEmpty()) {
                 cancelFlush(bucket);
@@ -171,7 +173,9 @@ public final class CpuTaskDispatcher {
             metadataSnapshot = bucket.metadata;
             type = bucket.type;
             modId = bucket.modId;
+            scoreSnapshot = bucket.maxScore;
             bucket.size = 0;
+            bucket.maxScore = 0.0;
             bucket.metadata = TaskMetadata.DEFAULT;
             bucket.firstEnqueueNanos = 0L;
             cancelFlush(bucket);
@@ -180,12 +184,7 @@ public final class CpuTaskDispatcher {
         if (drained.isEmpty()) {
             return;
         }
-        TaskMetadata combinedMetadata = metadataSnapshot;
-        for (PriorityTask task : drained) {
-            combinedMetadata = TaskMetadata.merge(combinedMetadata, task.metadata());
-        }
-        TaskMetadata finalMetadata = combinedMetadata;
-        double score = drained.stream().mapToDouble(PriorityTask::score).max().orElse(0.0);
+        TaskMetadata finalMetadata = metadataSnapshot;
         long batchKey = BATCH_SEQUENCE.getAndIncrement();
         List<PriorityTask> batchTasks = List.copyOf(drained);
         String batchModId = modId;
@@ -198,7 +197,7 @@ public final class CpuTaskDispatcher {
             .affinityKey(internalAffinity)
             .build();
         Runnable payload = () -> executeBatch(batchModId, batchTasks, batchMetadata, batchKey);
-        PriorityTask batchTask = new PriorityTask(batchKey, type, score, payload,
+        PriorityTask batchTask = new PriorityTask(batchKey, type, scoreSnapshot, payload,
             batchMetadata,
             modId);
         scheduler.submit(batchTask);
@@ -260,6 +259,7 @@ public final class CpuTaskDispatcher {
         PriorityTaskType type = PriorityTaskType.BACKGROUND;
         String modId = "";
         int size;
+        double maxScore;
         long firstEnqueueNanos;
         ScheduledFuture<?> flushFuture;
 

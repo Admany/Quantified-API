@@ -62,32 +62,29 @@ public final class DeveloperFeatures {
     }
 
     public static boolean isDashboardEnabled() {
-        return developerMode.get() && dashboardEnabled.get();
+        return dashboardEnabled.get();
     }
 
     public static boolean isOverlaySamplingActive() {
-        return developerMode.get()
-            && (dashboardEnabled.get() || timelineEnabled.get() || replayEnabled.get() || modSpotlightEnabled.get());
+        return dashboardEnabled.get()
+            || (developerMode.get() && (timelineEnabled.get() || replayEnabled.get() || modSpotlightEnabled.get()));
     }
 
     public static void setDeveloperMode(boolean enabled, boolean persist) {
         boolean changed = developerMode.getAndSet(enabled) != enabled;
         if (!enabled) {
-            // Turning developer mode off automatically disables every experimental path.
+            // Turning developer mode off disables experimental paths, but the webpanel can stay up
+            // because it is also used as a normal runtime monitor during world load.
             timelineEnabled.set(false);
             replayEnabled.set(false);
             stressTestEnabled.set(false);
             modSpotlightEnabled.set(false);
-            dashboardEnabled.set(false);
             DeveloperOverlayManager.enableOverlay(false);
             DeveloperOverlayManager.setTimelineEnabled(false);
             DeveloperOverlayManager.setReplayEnabled(false);
             DeveloperOverlayManager.setAutoHintsEnabled(false);
             DeveloperOverlayManager.setModSpotlightEnabled(false);
             StressTestController.setEnabled(false);
-            DeveloperDashboardServer.applyConfiguration(false, MultithreadingConfig.CONFIG.developerDashboardPort,
-                MultithreadingConfig.CONFIG.developerDashboardHost, MultithreadingConfig.CONFIG.developerDashboardHttps,
-                MultithreadingConfig.CONFIG.developerDashboardAuth);
             if (changed) {
                 LOGGER.info("Developer mode disabled; experimental telemetry sampling is offline.");
             }
@@ -183,10 +180,6 @@ public final class DeveloperFeatures {
             MultithreadingConfig.CONFIG.developerDashboard = enabled;
             MultithreadingConfig.writePrettyJsonConfig(MultithreadingConfig.CONFIG);
         }
-        if (enabled) {
-            // Ensure developer mode is enabled when dashboard is enabled
-            setDeveloperMode(true, persist);
-        }
         applyDashboardState();
     }
 
@@ -217,7 +210,7 @@ public final class DeveloperFeatures {
         try {
             return StressTestController.StressTestProfile.fromConfigKey(raw);
         } catch (IllegalArgumentException ex) {
-            LOGGER.log(Level.WARNING, "Invalid developer stress profile '{0}', defaulting to CPU_HEAVY", raw);
+            LOGGER.log(Level.WARNING, "Invalid developer stress profile {0}, defaulting to CPU_HEAVY", raw);
             return StressTestController.StressTestProfile.CPU_HEAVY;
         }
     }

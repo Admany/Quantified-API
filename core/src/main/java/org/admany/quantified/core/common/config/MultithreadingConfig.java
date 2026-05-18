@@ -122,6 +122,9 @@ public class MultithreadingConfig {
         public boolean experimentalPredictiveScaling = false; // Experimental predictive thread scaling
     }
 
+    public static boolean isGpuAccelerationEnabled() {
+        return CONFIG == null || CONFIG.enableGpuAcceleration;
+    }
     /**
      * Handles loading or creating the configuration file.
      * If a config file already exists, it attempts to load and parse it.
@@ -224,19 +227,17 @@ public class MultithreadingConfig {
                     // Parse the JSON content
                     com.google.gson.JsonObject jsonData = GSON.fromJson(contentStr, com.google.gson.JsonObject.class);
                     if (jsonData != null) {
-                        // Try ADM-style flat config first
-                        CONFIG = parseFlatConfig(jsonData);
+                        boolean boxedFirst = looksLikeBoxedConfig(jsonData);
+                        CONFIG = boxedFirst ? parseBoxedConfig(jsonData) : parseFlatConfig(jsonData);
                         if (CONFIG != null) {
-                            // Validate and set defaults for missing fields
                             validateAndSetDefaults(CONFIG, detectedServer);
-                            log.info("Loaded flat configuration from " + path);
+                            log.info("Loaded " + (boxedFirst ? "boxed" : "flat") + " configuration from " + path);
                             return CONFIG;
                         }
-                        CONFIG = parseBoxedConfig(jsonData);
+                        CONFIG = boxedFirst ? parseFlatConfig(jsonData) : parseBoxedConfig(jsonData);
                         if (CONFIG != null) {
-                            // Validate and set defaults for missing fields
                             validateAndSetDefaults(CONFIG, detectedServer);
-                            log.info("Loaded boxed configuration from " + path);
+                            log.info("Loaded " + (boxedFirst ? "flat" : "boxed") + " configuration from " + path);
                             return CONFIG;
                         }
                     }
@@ -302,7 +303,11 @@ public class MultithreadingConfig {
                             if (legacyData.has("developerDashboardUsername")) newConfig.developerDashboardUsername = legacyData.get("developerDashboardUsername").getAsString();
                             if (legacyData.has("developerDashboardPassword")) newConfig.developerDashboardPassword = legacyData.get("developerDashboardPassword").getAsString();
                             if (legacyData.has("developerStressProfile")) newConfig.developerStressProfile = legacyData.get("developerStressProfile").getAsString();
+                            if (legacyData.has("enableGpuAcceleration")) newConfig.enableGpuAcceleration = legacyData.get("enableGpuAcceleration").getAsBoolean();
+                            if (legacyData.has("preferredGpuBackend")) newConfig.preferredGpuBackend = legacyData.get("preferredGpuBackend").getAsString();
                             if (legacyData.has("openclForced")) newConfig.openclForced = legacyData.get("openclForced").getAsBoolean();
+                            if (legacyData.has("vulkanDeviceId")) newConfig.vulkanDeviceId = legacyData.get("vulkanDeviceId").getAsString();
+                            if (legacyData.has("openclDeviceId")) newConfig.openclDeviceId = legacyData.get("openclDeviceId").getAsString();
                         } else {
                             // Nested format migration (from older nested versions)
                             if (legacyData.has("networking") && legacyData.get("networking").isJsonObject()) {
@@ -329,7 +334,11 @@ public class MultithreadingConfig {
                             }
                             if (legacyData.has("gpu") && legacyData.get("gpu").isJsonObject()) {
                                 com.google.gson.JsonObject gpu = legacyData.get("gpu").getAsJsonObject();
+                                if (gpu.has("enableGpuAcceleration")) newConfig.enableGpuAcceleration = gpu.get("enableGpuAcceleration").getAsBoolean();
+                                if (gpu.has("preferredGpuBackend")) newConfig.preferredGpuBackend = gpu.get("preferredGpuBackend").getAsString();
                                 if (gpu.has("openclForced")) newConfig.openclForced = gpu.get("openclForced").getAsBoolean();
+                                if (gpu.has("vulkanDeviceId")) newConfig.vulkanDeviceId = gpu.get("vulkanDeviceId").getAsString();
+                                if (gpu.has("openclDeviceId")) newConfig.openclDeviceId = gpu.get("openclDeviceId").getAsString();
                             }
                         }
 
@@ -479,6 +488,22 @@ public class MultithreadingConfig {
         CONFIG = loadOrCreateConfig(logger);
     }
 
+    private static boolean looksLikeBoxedConfig(com.google.gson.JsonObject jsonData) {
+        if (jsonData == null) {
+            return false;
+        }
+        String[] groupKeys = {
+            "general", "networking", "gpu", "taskProcessing", "developerFeatures",
+            "developerDashboard", "stressTesting", "monitoring", "security", "debug",
+            "fixes", "experimental"
+        };
+        for (String key : groupKeys) {
+            if (jsonData.has(key) && jsonData.get(key).isJsonObject()) {
+                return true;
+            }
+        }
+        return false;
+    }
     private static Config parseFlatConfig(com.google.gson.JsonObject jsonData) {
         Config config = new Config();
 

@@ -53,11 +53,9 @@ tasks.register('buildNeoForge1211', GradleBuild) {
     tasks = ['build']
 }
 
-tasks.register('universalJar1201', Zip) {
-    group = 'build'
-    description = 'Builds a Forge/Fabric universal jar for Minecraft 1.20.1.'
+tasks.register('_omniStage1201', Zip) {
 
-    dependsOn ':forge-1.20.1:reobfJar'
+    dependsOn ':forge-1.20.1:shadowJar'
     dependsOn 'buildFabric1201'
 
     archiveBaseName.set("${mod_name}-universal-1.20.1".toLowerCase())
@@ -79,9 +77,7 @@ tasks.register('universalJar1201', Zip) {
     }
 }
 
-tasks.register('universalJar1211', Zip) {
-    group = 'build'
-    description = 'Builds a Forge/Fabric/NeoForge universal jar for Minecraft 1.21.1.'
+tasks.register('_omniStage1211', Zip) {
 
     dependsOn ':forge-1.21.1:shadowJar'
     dependsOn 'buildFabric1211'
@@ -111,15 +107,7 @@ tasks.register('universalJar1211', Zip) {
     }
 }
 
-tasks.register('buildUniversal') {
-    group = 'build'
-    description = 'Builds every configured universal jar.'
-    dependsOn 'universalJar1201'
-    dependsOn 'universalJar1211'
-    dependsOn 'omniversalJar'
-}
-
-// ── Omni jar (all loaders, all versions) ─────────────────────────────────────
+// -- Omni jar (all loaders, all versions) ─────────────────────────────────────
 
 def omniResourcesDir = layout.buildDirectory.dir('generated/omniResources')
 
@@ -147,7 +135,7 @@ tasks.register('generateOmniResources') {
         def modDesc        = project.property('mod_description')
         def fabricLoader   = project.property('fabric_loader_version')
 
-        // Merged mods.toml — covers Forge 47.x (1.20.1) and 52.x (1.21.1)
+        // Merged mods.toml - covers Forge 47.x (1.20.1) and 52.x (1.21.1)
         new File(metaInf, 'mods.toml').text = """\
 modLoader="javafml"
 loaderVersion="[47,)"
@@ -175,7 +163,7 @@ description=\'\'\'${modDesc}\'\'\'
     side="BOTH"
 """
 
-        // Merged fabric.mod.json — covers Fabric 1.20.1 and 1.21.1
+        // Merged fabric.mod.json - covers Fabric 1.20.1 and 1.21.1
         new File(outDir, 'fabric.mod.json').text = """\
 {
   "schemaVersion": 1,
@@ -211,8 +199,8 @@ tasks.register('omniversalJar', Zip) {
     group = 'build'
     description = 'Builds a single jar for all loaders across both MC 1.20.1 and 1.21.1.'
 
-    dependsOn 'universalJar1201'
-    dependsOn 'universalJar1211'
+    dependsOn '_omniStage1201'
+    dependsOn '_omniStage1211'
     dependsOn 'generateOmniResources'
 
     archiveBaseName.set("${mod_name}-omni".toLowerCase())
@@ -229,7 +217,7 @@ tasks.register('omniversalJar', Zip) {
     // 1) Merged metadata wins (listed first → EXCLUDE keeps these)
     from(omniResourcesDir)
 
-    // 2) 1.20.1 as the class base (Java 17 bytecode — runs on both Java 17 and 21)
+    // 2) 1.20.1 as the class base (Java 17 bytecode - runs on both Java 17 and 21)
     //    Skip the per-version metadata files that are replaced by the merged ones above.
     from(provider { zipTree(jar1201.get().asFile) }) {
         exclude 'META-INF/mods.toml'

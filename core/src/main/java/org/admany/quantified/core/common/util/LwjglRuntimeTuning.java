@@ -1,5 +1,6 @@
 package org.admany.quantified.core.common.util;
 
+import org.admany.quantified.core.common.threading.core.WorkerClassLoaderContext;
 import org.lwjgl.system.Configuration;
 
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -65,6 +66,10 @@ public final class LwjglRuntimeTuning {
             + (resolvedStackSizeBytes / MIB) + " MiB");
         Thread thread = new Thread(null, runnable, name, resolvedStackSizeBytes);
         thread.setDaemon(true);
+        ClassLoader classLoader = WorkerClassLoaderContext.get();
+        if (classLoader != null) {
+            thread.setContextClassLoader(classLoader);
+        }
         return thread;
     }
 

@@ -222,7 +222,14 @@ final class VulkanSubprocessProbe {
             return null;
         }
         if (location.startsWith("file:")) {
-            return Path.of(URI.create(location)).normalize();
+            String filePath = location.substring("file:".length()).replace('/', File.separatorChar);
+            if (filePath.length() >= 3
+                && filePath.charAt(0) == File.separatorChar
+                && Character.isLetter(filePath.charAt(1))
+                && filePath.charAt(2) == ':') {
+                filePath = filePath.substring(1);
+            }
+            return Path.of(filePath).normalize();
         }
         String normalized = location.replace('/', File.separatorChar);
         if (normalized.length() >= 3

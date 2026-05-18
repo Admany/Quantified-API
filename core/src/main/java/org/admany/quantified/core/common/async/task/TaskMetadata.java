@@ -9,6 +9,7 @@ import java.util.concurrent.CompletableFuture;
 public final class TaskMetadata {
 
     public static final TaskMetadata DEFAULT = builder().build();
+    public static final TaskMetadata NON_BATCHABLE = builder().batchable(false).build();
 
     private final double estimatedCost;
     private final boolean batchable;
@@ -75,6 +76,15 @@ public final class TaskMetadata {
 
     public static Builder builder() {
         return new Builder();
+    }
+
+    public static TaskMetadata batchableAffinity(String affinityKey, int preferredBatchSize, int maximumBatchSize) {
+        Builder builder = new Builder();
+        builder.affinityKey(affinityKey);
+        builder.batchable(true);
+        builder.preferredBatchSize(preferredBatchSize);
+        builder.maximumBatchSize(maximumBatchSize);
+        return new TaskMetadata(builder);
     }
 
     public static TaskMetadata merge(TaskMetadata current, TaskMetadata incoming) {

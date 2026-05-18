@@ -59,6 +59,7 @@ public final class GpuTaskDispatcher {
             bucket.metadata = TaskMetadata.merge(bucket.metadata, metadata);
             bucket.tasks.addLast(task);
             bucket.size++;
+            bucket.maxScore = Math.max(bucket.maxScore, task.score());
             long now = System.nanoTime();
             if (bucket.size == 1) {
                 bucket.firstEnqueueNanos = now;
@@ -152,6 +153,7 @@ public final class GpuTaskDispatcher {
         TaskMetadata metadataSnapshot;
         PriorityTaskType type;
         String modId;
+        double scoreSnapshot;
         synchronized (bucket) {
             if (bucket.tasks.isEmpty()) {
                 cancelFlush(bucket);
@@ -163,7 +165,9 @@ public final class GpuTaskDispatcher {
             metadataSnapshot = bucket.metadata;
             type = bucket.type;
             modId = bucket.modId;
+            scoreSnapshot = bucket.maxScore;
             bucket.size = 0;
+            bucket.maxScore = 0.0;
             bucket.metadata = TaskMetadata.DEFAULT;
             bucket.firstEnqueueNanos = 0L;
             cancelFlush(bucket);
@@ -172,17 +176,12 @@ public final class GpuTaskDispatcher {
         if (drained.isEmpty()) {
             return;
         }
-        TaskMetadata combinedMetadata = metadataSnapshot;
-        for (PriorityTask task : drained) {
-            combinedMetadata = TaskMetadata.merge(combinedMetadata, task.metadata());
-        }
-        TaskMetadata finalMetadata = combinedMetadata;
-        double score = drained.stream().mapToDouble(PriorityTask::score).max().orElse(0.0);
+        TaskMetadata finalMetadata = metadataSnapshot;
         long batchKey = BATCH_SEQUENCE.getAndIncrement();
         List<PriorityTask> batchTasks = List.copyOf(drained);
         String batchModId = modId;
         Runnable payload = () -> executeBatch(batchModId, batchTasks, finalMetadata);
-        PriorityTask batchTask = new PriorityTask(batchKey, type, score, payload,
+        PriorityTask batchTask = new PriorityTask(batchKey, type, scoreSnapshot, payload,
             finalMetadata == null ? TaskMetadata.DEFAULT : finalMetadata,
             modId);
         scheduler.submit(batchTask);
@@ -219,9 +218,8 @@ public final class GpuTaskDispatcher {
     }
 
     private void runGpuBatch(String modId, List<PriorityTask> tasks, TaskMetadata metadata) {
-        boolean gpuExecuted = false;
         GpuBatchTelemetry.recordAttempt();
-        gpuExecuted = tryExecuteGpuWorkload(modId, tasks, metadata);
+        boolean gpuExecuted = tryExecuteGpuWorkload(modId, tasks, metadata);
         if (gpuExecuted) {
             GpuBatchTelemetry.recordSuccess();
             GpuBatchTelemetry.recordGpuTasksCompleted(tasks.size());
@@ -300,6 +298,7 @@ public final class GpuTaskDispatcher {
         PriorityTaskType type = PriorityTaskType.BACKGROUND;
         String modId = "";
         int size;
+        double maxScore;
         long firstEnqueueNanos;
         ScheduledFuture<?> flushFuture;
 

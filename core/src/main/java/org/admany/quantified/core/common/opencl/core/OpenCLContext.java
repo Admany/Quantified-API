@@ -7,9 +7,14 @@ import org.lwjgl.opencl.CL20;
 import org.lwjgl.system.MemoryStack;
 
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.LongBuffer;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -25,6 +30,9 @@ public final class OpenCLContext implements AutoCloseable {
     @SuppressWarnings("unused")
     private volatile long deviceId = 0;
     private final BufferPool bufferPool = new BufferPool();
+    private final ThreadLocal<Map<String, Long>> kernelCache = ThreadLocal.withInitial(HashMap::new);
+    private final ConcurrentHashMap<Long, Boolean> cachedKernelHandles = new ConcurrentHashMap<>();
+    private final ThreadLocal<Map<Integer, ByteBuffer>> hostBufferCache = ThreadLocal.withInitial(HashMap::new);
 
     private OpenCLContext() {}
 
@@ -118,10 +126,17 @@ public final class OpenCLContext implements AutoCloseable {
     }
 
     public long createKernel(String kernelName) {
+        Map<String, Long> cache = kernelCache.get();
+        Long cached = cache.get(kernelName);
+        if (cached != null && cached.longValue() != 0L) {
+            return cached.longValue();
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             IntBuffer errcode = stack.mallocInt(1);
             long kernel = CL10.clCreateKernel(programHandle, kernelName, errcode);
             checkCleError(errcode.get(0), "clCreateKernel(" + kernelName + ")");
+            cache.put(kernelName, kernel);
+            cachedKernelHandles.put(kernel, Boolean.TRUE);
             return kernel;
         }
     }
@@ -190,7 +205,144 @@ public final class OpenCLContext implements AutoCloseable {
     }
 
     public void releaseKernel(long kernel) {
+        if (kernel == 0L || cachedKernelHandles.containsKey(kernel)) {
+            return;
+        }
         CL10.clReleaseKernel(kernel);
+    }
+
+    public float[] vectorAdd(float[] a, float[] b) {
+        if (a.length != b.length) {
+            throw new IllegalArgumentException("Vector lengths must match");
+        }
+        long bufferA = 0L;
+        long bufferB = 0L;
+        long bufferC = 0L;
+        long kernel = createKernel("vector_add");
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            int byteCount = a.length * Float.BYTES;
+            bufferA = createBuffer(CL10.CL_MEM_READ_ONLY, byteCount);
+            bufferB = createBuffer(CL10.CL_MEM_READ_ONLY, byteCount);
+            bufferC = createBuffer(CL10.CL_MEM_WRITE_ONLY, byteCount);
+
+            enqueueWriteBuffer(bufferA, true, 0, byteCount, asFloatBytes(a));
+            enqueueWriteBuffer(bufferB, true, 0, byteCount, asFloatBytes(b));
+
+            setKernelArgBuffer(kernel, 0, bufferA);
+            setKernelArgBuffer(kernel, 1, bufferB);
+            setKernelArgBuffer(kernel, 2, bufferC);
+
+            PointerBuffer workSize = stack.mallocPointer(1);
+            workSize.put(0, a.length);
+            enqueueNDRangeKernel(kernel, 1, workSize);
+            finish();
+
+            ByteBuffer resultBuffer = hostBuffer(byteCount);
+            enqueueReadBuffer(bufferC, true, 0, byteCount, resultBuffer);
+            float[] result = new float[a.length];
+            resultBuffer.asFloatBuffer().get(result);
+            return result;
+        } finally {
+            if (bufferA != 0L) {
+                releaseBuffer(bufferA);
+            }
+            if (bufferB != 0L) {
+                releaseBuffer(bufferB);
+            }
+            if (bufferC != 0L) {
+                releaseBuffer(bufferC);
+            }
+        }
+    }
+
+    public float[][] matrixMultiply(float[][] a, float[][] b) {
+        if (a.length == 0 || b.length == 0 || a[0].length != b.length) {
+            throw new IllegalArgumentException("Invalid matrix dimensions for multiplication");
+        }
+        int rows = a.length;
+        int inner = a[0].length;
+        int cols = b[0].length;
+        float[] flatA = flattenMatrix(a);
+        float[] flatB = flattenMatrix(b);
+        int outputCount = rows * cols;
+        long bufferA = 0L;
+        long bufferB = 0L;
+        long bufferC = 0L;
+        long kernel = createKernel("matrix_multiply");
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            int bytesA = flatA.length * Float.BYTES;
+            int bytesB = flatB.length * Float.BYTES;
+            int bytesC = outputCount * Float.BYTES;
+            bufferA = createBuffer(CL10.CL_MEM_READ_ONLY, bytesA);
+            bufferB = createBuffer(CL10.CL_MEM_READ_ONLY, bytesB);
+            bufferC = createBuffer(CL10.CL_MEM_WRITE_ONLY, bytesC);
+
+            enqueueWriteBuffer(bufferA, true, 0, bytesA, asFloatBytes(flatA));
+            enqueueWriteBuffer(bufferB, true, 0, bytesB, asFloatBytes(flatB));
+
+            setKernelArgBuffer(kernel, 0, bufferA);
+            setKernelArgBuffer(kernel, 1, bufferB);
+            setKernelArgBuffer(kernel, 2, bufferC);
+            setKernelArgInt(kernel, 3, rows);
+            setKernelArgInt(kernel, 4, cols);
+            setKernelArgInt(kernel, 5, inner);
+
+            PointerBuffer workSize = stack.mallocPointer(2);
+            workSize.put(0, rows);
+            workSize.put(1, cols);
+            enqueueNDRangeKernel(kernel, 2, workSize);
+            finish();
+
+            ByteBuffer resultBuffer = hostBuffer(bytesC);
+            enqueueReadBuffer(bufferC, true, 0, bytesC, resultBuffer);
+            float[] flatResult = new float[outputCount];
+            resultBuffer.asFloatBuffer().get(flatResult);
+            return expandMatrix(flatResult, rows, cols);
+        } finally {
+            if (bufferA != 0L) {
+                releaseBuffer(bufferA);
+            }
+            if (bufferB != 0L) {
+                releaseBuffer(bufferB);
+            }
+            if (bufferC != 0L) {
+                releaseBuffer(bufferC);
+            }
+        }
+    }
+
+    public double monteCarloPi(int samples) {
+        if (samples <= 0) {
+            throw new IllegalArgumentException("Samples must be positive");
+        }
+        long resultsBuffer = 0L;
+        long kernel = createKernel("monte_carlo_pi");
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            int bytes = samples * Float.BYTES;
+            resultsBuffer = createBuffer(CL10.CL_MEM_WRITE_ONLY, bytes);
+            setKernelArgBuffer(kernel, 0, resultsBuffer);
+            setKernelArgInt(kernel, 1, samples);
+
+            PointerBuffer workSize = stack.mallocPointer(1);
+            workSize.put(0, samples);
+            enqueueNDRangeKernel(kernel, 1, workSize);
+            finish();
+
+            ByteBuffer resultBuffer = hostBuffer(bytes);
+            enqueueReadBuffer(resultsBuffer, true, 0, bytes, resultBuffer);
+            FloatBuffer floatBuffer = resultBuffer.asFloatBuffer();
+            int hits = 0;
+            for (int i = 0; i < samples; i++) {
+                if (floatBuffer.get(i) > 0.5f) {
+                    hits++;
+                }
+            }
+            return 4.0d * hits / samples;
+        } finally {
+            if (resultsBuffer != 0L) {
+                releaseBuffer(resultsBuffer);
+            }
+        }
     }
 
     @Override
@@ -204,6 +356,7 @@ public final class OpenCLContext implements AutoCloseable {
         }
 
         try {
+            releaseCachedKernels();
             if (programHandle != 0) {
                 releaseProgram(programHandle);
                 programHandle = 0;
@@ -250,6 +403,52 @@ public final class OpenCLContext implements AutoCloseable {
 
     public void trimBufferPool(boolean aggressive) {
         bufferPool.trim(aggressive);
+    }
+
+    private void releaseCachedKernels() {
+        for (Long kernel : cachedKernelHandles.keySet()) {
+            try {
+                CL10.clReleaseKernel(kernel.longValue());
+            } catch (Throwable ignored) {
+            }
+        }
+        cachedKernelHandles.clear();
+    }
+
+    private ByteBuffer asFloatBytes(float[] values) {
+        ByteBuffer buffer = hostBuffer(values.length * Float.BYTES);
+        buffer.asFloatBuffer().put(values);
+        return buffer;
+    }
+
+    private ByteBuffer hostBuffer(int byteCount) {
+        Map<Integer, ByteBuffer> cache = hostBufferCache.get();
+        ByteBuffer buffer = cache.get(byteCount);
+        if (buffer == null) {
+            buffer = ByteBuffer.allocateDirect(byteCount).order(ByteOrder.nativeOrder());
+            cache.put(byteCount, buffer);
+        }
+        buffer.clear();
+        buffer.limit(byteCount);
+        return buffer;
+    }
+
+    private static float[] flattenMatrix(float[][] matrix) {
+        int rows = matrix.length;
+        int cols = matrix[0].length;
+        float[] flat = new float[rows * cols];
+        for (int row = 0; row < rows; row++) {
+            System.arraycopy(matrix[row], 0, flat, row * cols, cols);
+        }
+        return flat;
+    }
+
+    private static float[][] expandMatrix(float[] flat, int rows, int cols) {
+        float[][] matrix = new float[rows][cols];
+        for (int row = 0; row < rows; row++) {
+            System.arraycopy(flat, row * cols, matrix[row], 0, cols);
+        }
+        return matrix;
     }
 
     private long createContext(GPUDetector.OpenCLDevice device) {

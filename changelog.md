@@ -1,6 +1,150 @@
 # Quantified API Update Changelogs 
 
-## Existing mods don't need changes, but v1.4.0 adds new APIs endpoints and some backend controls.
+## V2 is here, with large changes, and FINALLY Official Documentation at `https://admany.dev` :]
+
+## v2.0.0 - Released on 2026-05-18
+
+### Quick summary :]
+
+- Quantified API V2 is a large release. The CPU runtime internals were heavily reworked so tiny tasks, duplicate bursts, parallel work, and DAG execution tasks are way cheaper to compute.
+- The public API was cleaned up around the new V2 builder first style, so compute, parallel, graph, and cache flows are more obvious and cleaner then V1.
+- Auto-register support is now built in for Fabric, Forge, and NeoForge through loader metadata detection (Manual registering was kept as a Legacy option).
+- The caching system was upgraded.
+- GPU routing is now cleaner, Vulkan junk that was no longer useful got removed, and backend preference API options are easier to use.
+- Official Quantified API docs are here! Can be found at `https://admany.dev` and it includes API docs, examples, migration info, and LC2H code examples.
+- Benchmark tool was added to compare V2 VS `v1.4.4`. V2 wins by a BIG margin. 
+
+---
+
+### Added
+
+- New V2 public API lanes:
+  - `QuantifiedAPI.compute(...)`
+  - `QuantifiedAPI.parallel(...)`
+  - `QuantifiedAPI.graph(...)`
+  - `QuantifiedAPI.cache(...)`
+- New/improved compute controls:
+  - `key(String)`
+  - `key(long)`
+  - `affinity(String)`
+  - `threadSafe()`
+  - `notThreadSafe()`
+  - `fallback(...)`
+  - `dataSizeBytes(...)`
+  - `parallelUnits(...)`
+  - `complexity(...)`
+  - `kind(...)`
+  - `allowMainThreadRerouting(...)`
+- New/improved backend routing controls:
+  - `preferGpu()`
+  - `preferVulkan()`
+  - `preferOpenCL()`
+  - `requireVulkan()`
+  - `requireOpenCL()`
+  - `cpuOnly()`
+- New/improved cache builder surface:
+  - `get(...)`
+  - `getAsync(...)`
+  - `prefetch(...)`
+  - `refresh(...)`
+  - `refreshAsync(...)`
+  - `put(...)`
+  - `contains(...)`
+  - `remove(...)`
+  - `clear()`
+  - `ttl(...)`
+  - `maxEntries(...)`
+  - `persistent()`
+  - `diskPreferred()`
+  - `ephemeral()`
+  - `memoryOnly()`
+  - `compression(...)`
+  - `compressed()`
+  - `refreshOnAccess()`
+  - `fixedTtl()`
+- New/improved loader metadata support:
+  - Fabric auto-register support
+  - Forge metadata resolution
+  - NeoForge metadata resolution
+  - caller-based auto-detection on first API call
+
+---
+
+### What changed
+
+- CPU runtime internals were heavily redesigned:
+  - lower submission overhead on tiny unique tasks
+  - much better duplicate burst suppression
+  - lower orchestration cost for parallel work
+  - dramatically cheaper tiny DAG execution cost
+- The unique task path now has a real fast path internally instead of being taxed by duplicate/coalescing machinery it doesn't even need xd.
+- Duplicate burst handling was fixed and tightened so explicit duplicate storms can collapse into a single real execution instead of exploding into a whole big puddle.
+- Task graph execution was redone and made much cheaper for small-node and wavefront-style graphs (2952x better performance then V1.4.4).
+- Parallel execution internals were cleaned up so scheduler overhead hurts less on micro and medium tasks.
+- Caching internals were improved and hardened:
+  - better persistent cache disk behavior
+  - cleaner save/load handling
+  - better async/persistent lifecycle handling
+- GPU routing was cleaned up more:
+  - clearer backend prefferencing
+  - better Vulkan/OpenCL preference API
+  - removed the Vulkan MC density path fully (useless)
+- Auto-registration now resolves:
+  - mod id
+  - display name
+  - version
+  - all from loader metadata when possible (worst case depends on manual LEGACY registration)
+
+---
+
+### Benchie results
+
+Jar-vs-jar runtime comparison against `quantified api-omni-1.4.4.jar`:
+
+- Tiny unique burst:
+  - `247.848 ms -> 62.665 ms`
+  - roughly `3.95x` faster
+- Duplicate burst:
+  - `173.335 ms -> 3.815 ms`
+  - roughly `45.4x` faster
+- Parallel micro:
+  - `3.103 ms -> 0.560 ms`
+  - roughly `5.54x` faster
+- Parallel medium:
+  - `10.623 ms -> 1.160 ms`
+  - roughly `9.16x` faster
+- DAG micro:
+  - `2958.849 ms -> 1.002 ms`
+  - roughly `2952x` faster on the tested micrograph setup
+
+Duplicate execution suppression also improved hard:
+
+- `v1.4.4`: `2048` real executions
+- earlier `V2` pass: `3`
+- latest `V2` pass: `1`
+
+V2 reduces the amount of real work time, latency, and how long it takes to process a task by a LOT.
+
+---
+
+### Docs / site release
+
+- Official Quantified API docs are now live at:
+  - `https://admany.dev`
+- The docs now include:
+  - getting started
+  - full V2 API docs
+  - compute docs
+  - parallel docs
+  - graph / DAG docs
+  - caching docs
+  - keys / affinity docs
+  - troubleshooting
+  - examples
+  - LC2H V2 examples
+  - migration info from V1 API
+
+---
 
 ## v1.4.0 - Released on 2026-04-02
 

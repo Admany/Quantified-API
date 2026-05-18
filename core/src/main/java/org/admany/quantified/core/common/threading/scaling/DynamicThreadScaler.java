@@ -15,16 +15,16 @@ public final class DynamicThreadScaler {
     public DynamicThreadScaler(int maxForeground, int maxBackground, boolean smt) {
         this.maxForeground = Math.max(1, maxForeground);
         this.maxBackground = Math.max(1, maxBackground);
-        smoothedForeground.set(this.maxForeground);
-        smoothedBackground.set(this.maxBackground);
+        smoothedForeground.set(1);
+        smoothedBackground.set(1);
     }
 
     public ScalingProfile scale(int foregroundQueue,
                                 int backgroundQueue,
                                 double throttleLevel,
                                 double systemLoad) {
-        int minForeground = Math.max(1, maxForeground / 2);
-        int minBackground = Math.max(1, maxBackground / 2);
+        int minForeground = 1;
+        int minBackground = 1;
 
         int desiredForeground = scaleWorkers(maxForeground, minForeground, foregroundQueue, throttleLevel, systemLoad, true);
         int desiredBackground = scaleWorkers(maxBackground, minBackground, backgroundQueue, throttleLevel, systemLoad, false);

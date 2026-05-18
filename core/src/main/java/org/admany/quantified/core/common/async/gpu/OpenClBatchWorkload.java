@@ -28,7 +28,7 @@ public final class OpenClBatchWorkload implements TaskMetadata.GpuBatchWorkload 
         if (!OpenCLManager.isAvailable()) {
             return null;
         }
-        List<OpenCLTask<?>> gpuTasks = GpuWorkloadRegistry.collect(tasks);
+        List<OpenCLTask<?>> gpuTasks = GpuWorkloadRegistry.peekOpenCl(tasks);
         if (gpuTasks.isEmpty()) {
             return null;
         }
@@ -39,9 +39,17 @@ public final class OpenClBatchWorkload implements TaskMetadata.GpuBatchWorkload 
         if (OpenCLManager.isInVramPressureCooldown() || !OpenCLManager.canAcceptTask(batchTask)) {
             return null;
         }
+        gpuTasks = GpuWorkloadRegistry.claimOpenCl(tasks);
+        if (gpuTasks.isEmpty()) {
+            return null;
+        }
+        batchTask = CompositeOpenClBatchTask.create(modId, gpuTasks, metadata, BATCH_KEY_SEQUENCE.incrementAndGet());
+        if (batchTask == null) {
+            return null;
+        }
         return OpenCLManager.executeOnGpu(batchTask)
             .exceptionally(throwable -> {
-                LOGGER.warning("Composite GPU batch failed for mod " + modId + ": " + throwable.getMessage());
+                LOGGER.warning(() -> "Composite GPU batch failed for mod " + modId + ": " + throwable.getMessage());
                 return null;
             });
     }
@@ -67,7 +75,7 @@ public final class OpenClBatchWorkload implements TaskMetadata.GpuBatchWorkload 
             }
             String name = "GPU-Batch-" + sequence;
             long key = (modId.hashCode() * 31L + sequence) & Long.MAX_VALUE;
-            Builder builder = new Builder(modId, name, key, tasks, metadata);
+            Builder builder = new Builder(modId, name, key, tasks);
             return builder.build();
         }
 
@@ -117,8 +125,7 @@ public final class OpenClBatchWorkload implements TaskMetadata.GpuBatchWorkload 
             private Builder(String modId,
                             String name,
                             long taskKey,
-                            List<OpenCLTask<?>> tasks,
-                            TaskMetadata metadata) {
+                            List<OpenCLTask<?>> tasks) {
                 super(modId, name, taskKey, () -> {
                     throw new IllegalStateException("Composite GPU batch routed to CPU fallback unexpectedly");
                 });

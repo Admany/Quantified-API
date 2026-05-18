@@ -38,9 +38,11 @@ import java.util.function.Supplier;
 public final class QuantifiedHandle {
 
     public static final String CACHE_PREFIX = "quantified.api.cache";
+    private static final AtomicLong UNIQUE_TASK_SEQUENCE = new AtomicLong(1L);
 
     final String modId;
     private volatile String version;
+    private final int modHash;
     private final Supplier<NetworkManager> networkAccessor;
 
     private final AtomicLong tasksSubmitted = new AtomicLong();
@@ -55,6 +57,7 @@ public final class QuantifiedHandle {
     QuantifiedHandle(String modId, String version, Supplier<NetworkManager> networkAccessor) {
         this.modId = Objects.requireNonNull(modId, "modId");
         this.version = version;
+        this.modHash = modId.hashCode();
         this.networkAccessor = Objects.requireNonNull(networkAccessor, "networkAccessor");
     }
 
@@ -89,57 +92,114 @@ public final class QuantifiedHandle {
 
     private static final Duration DEFAULT_CACHE_TTL = Duration.ofMinutes(5);
     private static final long CACHE_TOTAL_REFRESH_MIN_INTERVAL_NS = TimeUnit.MILLISECONDS.toNanos(250);
+    private static final long MOD_TOUCH_MIN_INTERVAL_NS = TimeUnit.MILLISECONDS.toNanos(
+        Math.max(1L, Long.getLong("quantified.modTouchMinIntervalMs", 15L))
+    );
 
     private final AtomicLong lastCacheRefreshNs = new AtomicLong();
+    private final AtomicLong lastModTouchNs = new AtomicLong();
     private final AtomicBoolean cacheRefreshScheduled = new AtomicBoolean();
+    private volatile ConnectedModImpl cachedConnectedMod;
 
     <T> CompletableFuture<T> submitTask(QuantifiedTask<T> task) {
         Objects.requireNonNull(task, "task");
+        return submitTaskInternal(
+            task.name(),
+            task.priority(),
+            task.autoPriority(),
+            task.threadSafe(),
+            task.timeout().orElse(null),
+            task.gpuPreferred(),
+            task.gpuRequired(),
+            task.batchKey(),
+            task.work()
+        );
+    }
+
+    <T> CompletableFuture<T> submitRuntimeTask(String taskName,
+                                               PriorityTaskType priority,
+                                               boolean autoPriority,
+                                               boolean threadSafe,
+                                               Duration timeout,
+                                               String batchKey,
+                                               Supplier<T> work) {
+        return submitTaskInternal(taskName, priority, autoPriority, threadSafe, timeout, false, false, batchKey, work);
+    }
+
+    private <T> CompletableFuture<T> submitTaskInternal(String taskName,
+                                                        PriorityTaskType explicitPriority,
+                                                        boolean autoPriority,
+                                                        boolean threadSafe,
+                                                        Duration timeout,
+                                                        boolean gpuPreferred,
+                                                        boolean gpuRequired,
+                                                        String batchKey,
+                                                        Supplier<T> work) {
         ensureReady();
-        final ConnectedModImpl modMetrics = QuantifiedAPI.lookupConnectedMod(modId);
+        final ConnectedModImpl modMetrics = resolveConnectedModMetrics();
         tasksSubmitted.incrementAndGet();
         if (modMetrics != null) {
             modMetrics.recordTaskSubmitted();
         }
-        QuantifiedCoreRuntime.touchMod(modId);
-        long key = ThreadLocalRandom.current().nextLong();
-        Duration timeout = task.timeout().orElse(null);
-        PriorityTaskType resolvedPriority = resolvePriority(task);
+        touchModActivity();
+        PriorityTaskType resolvedPriority = autoPriority
+            ? resolvePriority(explicitPriority, autoPriority)
+            : explicitPriority;
         double score = resolvedPriority.defaultScore();
         final long startTimeNanos = System.nanoTime();
         TaskScheduler.recordExternalCpuTask();
-        TaskMetadata.Builder metadataBuilder = TaskMetadata.builder();
-        if (task.threadSafe()) {
-            String affinity = task.batchKey() != null && !task.batchKey().isBlank()
-                ? task.batchKey()
-                : task.name();
-            metadataBuilder.affinityKey(affinity);
-            metadataBuilder.batchable(true);
-            metadataBuilder.preferredBatchSize(12);
-            metadataBuilder.maximumBatchSize(48);
+        String explicitBatchKey = normalizeBatchKey(batchKey);
+        boolean uniqueCpuPath = explicitBatchKey == null && !gpuPreferred && !gpuRequired;
+        TaskMetadata metadata;
+        if (!gpuPreferred && !gpuRequired) {
+            if (threadSafe && explicitBatchKey != null) {
+                metadata = TaskMetadata.batchableAffinity(explicitBatchKey, 12, 48);
+            } else {
+                metadata = TaskMetadata.NON_BATCHABLE;
+            }
         } else {
-            metadataBuilder.batchable(false);
+            TaskMetadata.Builder metadataBuilder = TaskMetadata.builder();
+            if (threadSafe) {
+                String affinity = explicitBatchKey != null ? explicitBatchKey : taskName;
+                metadataBuilder.affinityKey(affinity);
+                metadataBuilder.batchable(true);
+                metadataBuilder.preferredBatchSize(12);
+                metadataBuilder.maximumBatchSize(48);
+            } else {
+                metadataBuilder.batchable(false);
+            }
+            if (gpuPreferred) {
+                metadataBuilder.gpuPreferred(true);
+            }
+            if (gpuRequired) {
+                metadataBuilder.gpuRequired(true);
+            }
+            metadata = metadataBuilder.build();
         }
-        if (task.gpuPreferred()) {
-            metadataBuilder.gpuPreferred(true);
-        }
-        if (task.gpuRequired()) {
-            metadataBuilder.gpuRequired(true);
-        }
-        TaskMetadata metadata = metadataBuilder.build();
-        CompletableFuture<T> future = AsyncManager.submitSync(
-            key,
-            resolvedPriority,
-            score,
-            task.work(),
-            timeout,
-            task.threadSafe(),
-            modId,
-            metadata
-        );
+        long key = resolveTaskKey(taskName, resolvedPriority, threadSafe, gpuPreferred, gpuRequired, metadata, explicitBatchKey != null);
+        CompletableFuture<T> future = uniqueCpuPath && timeout == null
+            ? AsyncManager.submitUniqueSync(
+                key,
+                resolvedPriority,
+                score,
+                work,
+                threadSafe,
+                modId,
+                metadata
+            )
+            : AsyncManager.submitSync(
+                key,
+                resolvedPriority,
+                score,
+                work,
+                timeout,
+                threadSafe,
+                modId,
+                metadata
+            );
         return future.whenComplete((result, throwable) -> {
             long durationNanos = System.nanoTime() - startTimeNanos;
-            QuantifiedCoreRuntime.touchMod(modId);
+            touchModActivity();
             if (throwable == null) {
                 tasksSucceeded.incrementAndGet();
                 Metrics.increment("quantified_api_tasks_success");
@@ -197,12 +257,13 @@ public final class QuantifiedHandle {
         return TaskGraphExecutor.submitAll(this, builder);
     }
 
-    <T> T cacheGet(String cacheName, String key, Supplier<T> loader, Duration ttl, long maximumSize, boolean persistence) {
+    <T> T cacheGet(String cacheName, String key, Supplier<T> loader, Duration ttl, long maximumSize,
+                   boolean persistence, boolean compression, boolean refreshOnAccess) {
         Objects.requireNonNull(cacheName, "cacheName");
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(loader, "loader");
         ensureReady();
-        ThreadSafeCache<String, Object> cache = cacheFor(cacheName, maximumSize, ttl, persistence);
+        ThreadSafeCache<String, Object> cache = cacheFor(cacheName, maximumSize, ttl, persistence, compression, refreshOnAccess);
         final ConnectedModImpl modMetrics = QuantifiedAPI.lookupConnectedMod(modId);
         @SuppressWarnings("unchecked")
         T cached = (T) cache.getIfPresent(key);
@@ -232,13 +293,14 @@ public final class QuantifiedHandle {
         return computed;
     }
 
-    <T> CompletableFuture<T> cacheGetAsync(String cacheName, String key, Supplier<T> loader, Duration ttl, long maximumSize, boolean persistence) {
+    <T> CompletableFuture<T> cacheGetAsync(String cacheName, String key, Supplier<T> loader, Duration ttl, long maximumSize,
+                                           boolean persistence, boolean compression, boolean refreshOnAccess) {
         Objects.requireNonNull(cacheName, "cacheName");
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(loader, "loader");
         ensureReady();
 
-        ThreadSafeCache<String, Object> cache = cacheFor(cacheName, maximumSize, ttl, persistence);
+        ThreadSafeCache<String, Object> cache = cacheFor(cacheName, maximumSize, ttl, persistence, compression, refreshOnAccess);
         final ConnectedModImpl modMetrics = QuantifiedAPI.lookupConnectedMod(modId);
         @SuppressWarnings("unchecked")
         T cached = (T) cache.getIfPresent(key);
@@ -329,6 +391,11 @@ public final class QuantifiedHandle {
         return Map.copyOf(caches);
     }
 
+    ThreadSafeCache<String, Object> cache(String cacheName, long maximumSize, Duration ttl,
+                                          boolean persistence, boolean compression, boolean refreshOnAccess) {
+        return cacheFor(cacheName, maximumSize, ttl, persistence, compression, refreshOnAccess);
+    }
+
     ModCacheManager getCacheManager() {
         return new ModCacheManagerImpl(this);
     }
@@ -343,9 +410,9 @@ public final class QuantifiedHandle {
         }
     }
 
-    private PriorityTaskType resolvePriority(QuantifiedTask<?> task) {
-        if (!task.autoPriority()) {
-            return task.priority();
+    private PriorityTaskType resolvePriority(PriorityTaskType explicitPriority, boolean autoPriority) {
+        if (!autoPriority) {
+            return explicitPriority;
         }
         try {
             PriorityScheduler.SchedulerSnapshot snapshot = AsyncManager.schedulerSnapshot();
@@ -372,6 +439,36 @@ public final class QuantifiedHandle {
         }
     }
 
+    private long resolveTaskKey(String taskName,
+                                PriorityTaskType priority,
+                                boolean threadSafe,
+                                boolean gpuPreferred,
+                                boolean gpuRequired,
+                                TaskMetadata metadata,
+                                boolean stableAffinityKey) {
+        String affinity = metadata != null ? metadata.affinityKey() : "";
+        if (affinity == null || affinity.isBlank()) {
+            return nextUniqueTaskKey();
+        }
+        int taskHash = taskName != null ? taskName.hashCode() : 0;
+        int affinityHash = affinity.hashCode();
+        long hash = 1125899906842597L;
+        hash = 31L * hash + modHash;
+        hash = 31L * hash + taskHash;
+        hash = 31L * hash + affinityHash;
+        if (!stableAffinityKey) {
+            hash = 31L * hash + (priority != null ? priority.ordinal() + 1 : 0);
+        }
+        hash = 31L * hash + (threadSafe ? 1 : 0);
+        hash = 31L * hash + (gpuPreferred ? 1 : 0);
+        hash = 31L * hash + (gpuRequired ? 1 : 0);
+        return hash;
+    }
+
+    private static long nextUniqueTaskKey() {
+        return UNIQUE_TASK_SEQUENCE.getAndIncrement();
+    }
+
     private long inFlightTasks() {
         long submitted = tasksSubmitted.get();
         long completed = tasksSucceeded.get() + tasksFailed.get();
@@ -387,10 +484,15 @@ public final class QuantifiedHandle {
     }
 
     private ThreadSafeCache<String, Object> cacheFor(String cacheName, long maximumSize, Duration ttl) {
-        return cacheFor(cacheName, maximumSize, ttl, false); // Default to no persistence
+        return cacheFor(cacheName, maximumSize, ttl, false, false, false); // Default to no persistence
     }
 
     private ThreadSafeCache<String, Object> cacheFor(String cacheName, long maximumSize, Duration ttl, boolean persistence) {
+        return cacheFor(cacheName, maximumSize, ttl, persistence, false, false);
+    }
+
+    private ThreadSafeCache<String, Object> cacheFor(String cacheName, long maximumSize, Duration ttl,
+                                                     boolean persistence, boolean compression, boolean refreshOnAccess) {
         String normalized = CACHE_PREFIX + "." + modId + "." + cacheName;
         return caches.computeIfAbsent(normalized, name -> {
             ThreadSafeCache<String, Object> existing = CacheManager.lookup(name);
@@ -401,7 +503,7 @@ public final class QuantifiedHandle {
             Duration effectiveTtl = ttl == null || ttl.isNegative() || ttl.isZero()
                 ? DEFAULT_CACHE_TTL
                 : ttl;
-            return CacheManager.register(name, effectiveSize, effectiveTtl, false, persistence);
+            return CacheManager.register(name, effectiveSize, effectiveTtl, refreshOnAccess, persistence, compression);
         });
     }
 
@@ -459,6 +561,37 @@ public final class QuantifiedHandle {
         }
         long totalBytes = totalEntries * 512L;
         modMetrics.updateCacheStats(totalEntries, totalBytes);
+    }
+
+    private ConnectedModImpl resolveConnectedModMetrics() {
+        ConnectedModImpl cached = cachedConnectedMod;
+        if (cached != null) {
+            return cached;
+        }
+        ConnectedModImpl resolved = QuantifiedAPI.lookupConnectedMod(modId);
+        if (resolved != null) {
+            cachedConnectedMod = resolved;
+        }
+        return resolved;
+    }
+
+    private void touchModActivity() {
+        long now = System.nanoTime();
+        long last = lastModTouchNs.get();
+        if (now - last < MOD_TOUCH_MIN_INTERVAL_NS) {
+            return;
+        }
+        if (lastModTouchNs.compareAndSet(last, now)) {
+            QuantifiedCoreRuntime.touchMod(modId);
+        }
+    }
+
+    private static String normalizeBatchKey(String batchKey) {
+        if (batchKey == null) {
+            return null;
+        }
+        String normalized = batchKey.trim();
+        return normalized.isEmpty() ? null : normalized;
     }
 
     private static boolean isServerThread() {

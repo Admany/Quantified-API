@@ -14,7 +14,6 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.Timeout;
-import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.opencl.CL10;
 import org.lwjgl.system.MemoryStack;
@@ -34,8 +33,8 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-@EnabledIfSystemProperty(named = "quantified.benchmarks", matches = "true")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class GpuBackendComparisonBenchmarkTest {
 
@@ -86,6 +85,10 @@ class GpuBackendComparisonBenchmarkTest {
     @Test
     @Timeout(value = 15, unit = TimeUnit.MINUTES)
     void compareOpenClAndVulkanBackends() {
+        assumeTrue(benchmarksEnabled(), "Set quantified.benchmarks=true or QUANTIFIED_BENCHMARKS=true to run GPU benchmarks");
+        assumeTrue(Boolean.getBoolean("quantified.benchmarks.gpu.compare.mixed")
+                || "true".equalsIgnoreCase(System.getenv("QUANTIFIED_BENCHMARKS_GPU_COMPARE_MIXED")),
+            "Set quantified.benchmarks.gpu.compare.mixed=true to run mixed OpenCL/Vulkan comparison in one JVM");
         BenchmarkInputs inputs = new BenchmarkInputs(
             createVector(VECTOR_LENGTH, 0.25f, 0.003f),
             createVector(VECTOR_LENGTH, -0.15f, 0.005f),
@@ -124,6 +127,7 @@ class GpuBackendComparisonBenchmarkTest {
     }
 
     private List<BenchmarkTarget> discoverTargets() {
+        VulkanManager.forceProbeSynchronous();
         LinkedHashMap<String, BenchmarkTargetBuilder> targets = new LinkedHashMap<>();
 
         for (GPUDetector.OpenCLDeviceInfo device : GPUDetector.listDevices()) {
@@ -137,6 +141,9 @@ class GpuBackendComparisonBenchmarkTest {
 
         for (VulkanManager.VulkanDeviceInfo device : VulkanManager.listDevices()) {
             if (device.softwareAdapter()) {
+                continue;
+            }
+            if (device.name() != null && device.name().startsWith("Microsoft (")) {
                 continue;
             }
             String key = normalizeDeviceKey(device.name());
@@ -186,6 +193,7 @@ class GpuBackendComparisonBenchmarkTest {
 
         try {
             VulkanManager.setPreferredDevice(device.name());
+            VulkanManager.forceProbeSynchronous();
             boolean ready = VulkanManager.ensureInitialised();
             if (!ready) {
                 return BackendSuiteResult.failed("Vulkan", device.name(), VulkanManager.runtimeStatus().failureReason());
@@ -354,6 +362,11 @@ class GpuBackendComparisonBenchmarkTest {
             return root.getClass().getSimpleName() + ": " + message;
         }
         return root.getClass().getSimpleName();
+    }
+
+    private static boolean benchmarksEnabled() {
+        return Boolean.getBoolean("quantified.benchmarks")
+            || "true".equalsIgnoreCase(System.getenv("QUANTIFIED_BENCHMARKS"));
     }
 
     private static float[] createVector(int length, float base, float delta) {
@@ -554,47 +567,7 @@ class GpuBackendComparisonBenchmarkTest {
 
         @Override
         public float[] executeOnGPU(OpenCLContext context) {
-            long bufferA = 0L;
-            long bufferB = 0L;
-            long bufferC = 0L;
-            long kernel = 0L;
-            try (MemoryStack stack = MemoryStack.stackPush()) {
-                bufferA = context.createBuffer(CL10.CL_MEM_READ_ONLY, (long) a.length * Float.BYTES);
-                bufferB = context.createBuffer(CL10.CL_MEM_READ_ONLY, (long) b.length * Float.BYTES);
-                bufferC = context.createBuffer(CL10.CL_MEM_WRITE_ONLY, (long) a.length * Float.BYTES);
-                context.enqueueWriteBuffer(bufferA, true, 0, (long) a.length * Float.BYTES, directFloatBuffer(a));
-                context.enqueueWriteBuffer(bufferB, true, 0, (long) b.length * Float.BYTES, directFloatBuffer(b));
-
-                kernel = context.createKernel("vector_add");
-                context.setKernelArgBuffer(kernel, 0, bufferA);
-                context.setKernelArgBuffer(kernel, 1, bufferB);
-                context.setKernelArgBuffer(kernel, 2, bufferC);
-
-                PointerBuffer workSize = stack.pointers(a.length);
-                context.enqueueNDRangeKernel(kernel, 1, workSize);
-                context.finish();
-
-                ByteBuffer resultBuffer = ByteBuffer.allocateDirect(a.length * Float.BYTES)
-                    .order(ByteOrder.nativeOrder());
-                context.enqueueReadBuffer(bufferC, true, 0, (long) a.length * Float.BYTES, resultBuffer);
-                resultBuffer.position(0);
-                float[] result = new float[a.length];
-                resultBuffer.asFloatBuffer().get(result);
-                return result;
-            } finally {
-                if (kernel != 0L) {
-                    context.releaseKernel(kernel);
-                }
-                if (bufferA != 0L) {
-                    context.releaseBuffer(bufferA);
-                }
-                if (bufferB != 0L) {
-                    context.releaseBuffer(bufferB);
-                }
-                if (bufferC != 0L) {
-                    context.releaseBuffer(bufferC);
-                }
-            }
+            return context.vectorAdd(a, b);
         }
 
         @Override
@@ -664,53 +637,7 @@ class GpuBackendComparisonBenchmarkTest {
 
         @Override
         public float[][] executeOnGPU(OpenCLContext context) {
-            float[] flatA = flatten(a);
-            float[] flatB = flatten(b);
-            int outputSize = rows * cols;
-            long bufferA = 0L;
-            long bufferB = 0L;
-            long bufferC = 0L;
-            long kernel = 0L;
-            try (MemoryStack stack = MemoryStack.stackPush()) {
-                bufferA = context.createBuffer(CL10.CL_MEM_READ_ONLY, (long) flatA.length * Float.BYTES);
-                bufferB = context.createBuffer(CL10.CL_MEM_READ_ONLY, (long) flatB.length * Float.BYTES);
-                bufferC = context.createBuffer(CL10.CL_MEM_WRITE_ONLY, (long) outputSize * Float.BYTES);
-                context.enqueueWriteBuffer(bufferA, true, 0, (long) flatA.length * Float.BYTES, directFloatBuffer(flatA));
-                context.enqueueWriteBuffer(bufferB, true, 0, (long) flatB.length * Float.BYTES, directFloatBuffer(flatB));
-
-                kernel = context.createKernel("matrix_multiply");
-                context.setKernelArgBuffer(kernel, 0, bufferA);
-                context.setKernelArgBuffer(kernel, 1, bufferB);
-                context.setKernelArgBuffer(kernel, 2, bufferC);
-                context.setKernelArgInt(kernel, 3, rows);
-                context.setKernelArgInt(kernel, 4, cols);
-                context.setKernelArgInt(kernel, 5, inner);
-
-                PointerBuffer workSize = stack.pointers(rows, cols);
-                context.enqueueNDRangeKernel(kernel, 2, workSize);
-                context.finish();
-
-                ByteBuffer resultBuffer = ByteBuffer.allocateDirect(outputSize * Float.BYTES)
-                    .order(ByteOrder.nativeOrder());
-                context.enqueueReadBuffer(bufferC, true, 0, (long) outputSize * Float.BYTES, resultBuffer);
-                resultBuffer.position(0);
-                float[] flatResult = new float[outputSize];
-                resultBuffer.asFloatBuffer().get(flatResult);
-                return expand(flatResult, rows, cols);
-            } finally {
-                if (kernel != 0L) {
-                    context.releaseKernel(kernel);
-                }
-                if (bufferA != 0L) {
-                    context.releaseBuffer(bufferA);
-                }
-                if (bufferB != 0L) {
-                    context.releaseBuffer(bufferB);
-                }
-                if (bufferC != 0L) {
-                    context.releaseBuffer(bufferC);
-                }
-            }
+            return context.matrixMultiply(a, b);
         }
 
         @Override
@@ -772,38 +699,7 @@ class GpuBackendComparisonBenchmarkTest {
 
         @Override
         public Double executeOnGPU(OpenCLContext context) {
-            long resultsBuffer = 0L;
-            long kernel = 0L;
-            try (MemoryStack stack = MemoryStack.stackPush()) {
-                resultsBuffer = context.createBuffer(CL10.CL_MEM_WRITE_ONLY, (long) samples * Float.BYTES);
-                kernel = context.createKernel("monte_carlo_pi");
-                context.setKernelArgBuffer(kernel, 0, resultsBuffer);
-                context.setKernelArgInt(kernel, 1, samples);
-
-                PointerBuffer workSize = stack.pointers(samples);
-                context.enqueueNDRangeKernel(kernel, 1, workSize);
-                context.finish();
-
-                ByteBuffer resultBuffer = ByteBuffer.allocateDirect(samples * Float.BYTES)
-                    .order(ByteOrder.nativeOrder());
-                context.enqueueReadBuffer(resultsBuffer, true, 0, (long) samples * Float.BYTES, resultBuffer);
-                resultBuffer.position(0);
-
-                int hits = 0;
-                for (int i = 0; i < samples; i++) {
-                    if (resultBuffer.getFloat() > 0.5f) {
-                        hits++;
-                    }
-                }
-                return 4.0d * hits / samples;
-            } finally {
-                if (kernel != 0L) {
-                    context.releaseKernel(kernel);
-                }
-                if (resultsBuffer != 0L) {
-                    context.releaseBuffer(resultsBuffer);
-                }
-            }
+            return context.monteCarloPi(samples);
         }
 
         @Override

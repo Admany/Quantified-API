@@ -17,6 +17,7 @@ import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.opencl.gpu.AsyncProbeScheduler;
 import org.admany.quantified.core.common.telemetry.TelemetryService;
 import org.admany.quantified.core.common.threading.core.MainThreadExecutor;
+import org.admany.quantified.core.common.threading.core.WorkerClassLoaderContext;
 import org.admany.quantified.core.common.util.LwjglRuntimeTuning;
 import org.admany.quantified.core.common.util.QuantifiedConnectionListener;
 import org.admany.quantified.core.common.util.QuantifiedPaths;
@@ -37,6 +38,8 @@ public final class QuantifiedCoreRuntime {
     public static final String MODID = "quantified";
 
     private static final AtomicBoolean CORE_BOOTSTRAPPED = new AtomicBoolean(false);
+    private static final AtomicBoolean SHUTDOWN_HOOK_REGISTERED = new AtomicBoolean(false);
+    private static final AtomicBoolean RUNTIME_SHUTDOWN = new AtomicBoolean(false);
     private static final ConcurrentHashMap<String, ModInfo> REGISTERED_MODS = new ConcurrentHashMap<>();
 
     private static volatile ScheduledExecutorService coalescer;
@@ -77,6 +80,8 @@ public final class QuantifiedCoreRuntime {
         if (!CORE_BOOTSTRAPPED.compareAndSet(false, true)) {
             return;
         }
+        WorkerClassLoaderContext.capture();
+        registerRuntimeShutdownHook();
 
         QuantifiedPaths.setPathProvider(new QuantifiedPaths.PathProvider() {
             @Override
@@ -99,13 +104,15 @@ public final class QuantifiedCoreRuntime {
         recordLog(logger, "[Quantified] Quantified Core Starting");
 
         int availableProcessors = Math.max(2, Runtime.getRuntime().availableProcessors());
-        int coalescerThreads = Math.max(2, Math.min(4, availableProcessors / 2));
+        int coalescerThreads = Math.max(1,
+            Integer.getInteger("quantified.coalescerThreads", 1));
 
-        coalescer = Executors.newScheduledThreadPool(coalescerThreads, r -> {
-            Thread t = new Thread(r, "quantified-coalescer");
-            t.setDaemon(true);
-            return t;
-        });
+        coalescer = Executors.newScheduledThreadPool(coalescerThreads,
+            WorkerClassLoaderContext.wrap(r -> {
+                Thread t = new Thread(r, "quantified-coalescer");
+                t.setDaemon(true);
+                return t;
+            }));
 
         AsyncManagerBootstrap bootstrap = AsyncManagerBootstrap.defaults(availableProcessors);
         int configuredQueueBound = MultithreadingConfig.CONFIG != null ? MultithreadingConfig.CONFIG.taskQueueSize : 0;
@@ -153,6 +160,12 @@ public final class QuantifiedCoreRuntime {
     }
 
     public static void onClientSetup(Logger logger) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            if (logger != null) {
+                logger.debug("Quantified client GPU probes skipped because GPU acceleration is disabled.");
+            }
+            return;
+        }
         AsyncProbeScheduler.triggerProbe("client-setup");
         VulkanProbeScheduler.triggerProbe("client-setup");
         if (logger != null) {
@@ -171,6 +184,9 @@ public final class QuantifiedCoreRuntime {
 
     public static void onServerStarting(Executor mainThreadExecutor) {
         MainThreadExecutor.install(mainThreadExecutor);
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            return;
+        }
         AsyncProbeScheduler.triggerProbe("server-start");
         VulkanProbeScheduler.triggerProbe("server-start");
     }
@@ -183,8 +199,39 @@ public final class QuantifiedCoreRuntime {
         }
         VulkanProbeScheduler.reset();
         StressTestController.shutdown();
-        DeveloperDashboardServer.stop();
-        DiskCacheManager.shutdown();
+    }
+
+    public static void shutdownRuntime() {
+        if (!RUNTIME_SHUTDOWN.compareAndSet(false, true)) {
+            return;
+        }
+        MainThreadExecutor.clear();
+        try {
+            OpenCLManager.shutdown();
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (VulkanRuntime.hasBindings()) {
+                VulkanManager.shutdown();
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            VulkanProbeScheduler.reset();
+        } catch (Throwable ignored) {
+        }
+        try {
+            StressTestController.shutdown();
+        } catch (Throwable ignored) {
+        }
+        try {
+            DeveloperDashboardServer.stop();
+        } catch (Throwable ignored) {
+        }
+        try {
+            DiskCacheManager.shutdown();
+        } catch (Throwable ignored) {
+        }
     }
 
     public static NetworkManager getNetworkManager() {
@@ -219,10 +266,10 @@ public final class QuantifiedCoreRuntime {
         if (modId == null) {
             return;
         }
-        REGISTERED_MODS.computeIfPresent(modId, (id, info) -> {
+        ModInfo info = REGISTERED_MODS.get(modId);
+        if (info != null) {
             info.touch();
-            return info;
-        });
+        }
     }
 
     public static ModInfo getModInfo(String modId) {
@@ -262,6 +309,11 @@ public final class QuantifiedCoreRuntime {
     }
 
     private static void initializeGpuBackends(Logger logger) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            logger.info("GPU acceleration disabled in Quantified config; skipping OpenCL/Vulkan probes.");
+            DeveloperOverlayManager.recordApiLog("[Quantified] GPU acceleration disabled in config");
+            return;
+        }
         try {
             OpenCLManager.initialize();
             logger.info("OpenCL initialization deferred to background probe.");
@@ -287,6 +339,10 @@ public final class QuantifiedCoreRuntime {
     }
 
     private static void updateGpuNameFromOpenGl(Logger logger) {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            gpuNameUpdated = true;
+            return;
+        }
         try {
             String renderer = org.lwjgl.opengl.GL11.glGetString(org.lwjgl.opengl.GL11.GL_RENDERER);
             if (renderer == null || renderer.isBlank()) {
@@ -313,6 +369,10 @@ public final class QuantifiedCoreRuntime {
     }
 
     private static void triggerClientWorldProbe() {
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            clientWorldProbeTriggered = true;
+            return;
+        }
         try {
             Class<?> minecraftClass = Class.forName("net.minecraft.client.Minecraft");
             Object minecraft = minecraftClass.getMethod("getInstance").invoke(null);
@@ -417,5 +477,12 @@ public final class QuantifiedCoreRuntime {
     private static void recordLog(Logger logger, String message) {
         logger.info(message);
         DeveloperOverlayManager.recordApiLog(message);
+    }
+
+    private static void registerRuntimeShutdownHook() {
+        if (!SHUTDOWN_HOOK_REGISTERED.compareAndSet(false, true)) {
+            return;
+        }
+        Runtime.getRuntime().addShutdownHook(new Thread(QuantifiedCoreRuntime::shutdownRuntime, "quantified-runtime-shutdown"));
     }
 }

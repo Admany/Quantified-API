@@ -53,7 +53,10 @@ import java.io.IOException;
 import java.io.File;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.BindException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
@@ -61,6 +64,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.List;
 import java.util.Locale;
@@ -110,7 +114,9 @@ public final class DeveloperDashboardServer {
     private static volatile com.sun.net.httpserver.HttpServer server;
     private static volatile ExecutorService executor;
     private static volatile int boundPort = -1;
+    private static volatile String boundHost = "";
     private static volatile boolean isHttps = false;
+    private static volatile boolean authRequired = false;
 
     private static final Map<String, Long> sessions = new HashMap<>();
     private static final Object SESSIONS_LOCK = new Object();
@@ -166,7 +172,7 @@ public final class DeveloperDashboardServer {
                 stopInternal();
                 return;
             }
-            if (server != null && boundPort == port && isHttps == https) {
+            if (server != null && boundPort == port && Objects.equals(boundHost, host) && isHttps == https && authRequired == auth) {
                 return;
             }
             stopInternal();
@@ -183,20 +189,10 @@ public final class DeveloperDashboardServer {
 
     private static void startInternal(int port, String host, boolean https, boolean auth) {
         try {
-            LOGGER.fine("Starting developer dashboard server on " + host + ":" + port + " (https=" + https + ", auth=" + auth + ")");
-            if (https) {
-                try {
-                    server = createHttpsServer(host, port);
-                    isHttps = true;
-                } catch (Exception httpsEx) {
-                    LOGGER.warning("Failed to create HTTPS server, falling back to HTTP: " + httpsEx.getMessage());
-                    server = HttpServer.create(new InetSocketAddress(host, port), 0);
-                    isHttps = false;
-                }
-            } else {
-                server = HttpServer.create(new InetSocketAddress(host, port), 0);
-                isHttps = false;
-            }
+            String bindHost = normalizeBindHost(host);
+            LOGGER.fine("Starting developer dashboard server on " + bindHost + ":" + port + " (https=" + https + ", auth=" + auth + ")");
+            server = createServer(bindHost, port, https);
+            isHttps = https && server instanceof HttpsServer;
             Objects.requireNonNull(server, "server");
             executor = Executors.newCachedThreadPool(r -> {
                 Thread thread = new Thread(r, "quantified-dashboard");
@@ -209,13 +205,73 @@ public final class DeveloperDashboardServer {
 
             server.start();
             boundPort = port;
-            String protocol = https ? "https" : "http";
-            LOGGER.fine(() -> "Developer dashboard listening on " + protocol + "://" + host + ":" + port);
+            boundHost = bindHost;
+            authRequired = auth;
+            String protocol = isHttps ? "https" : "http";
+            String finalBindHost = bindHost;
+            LOGGER.fine(() -> "Developer dashboard listening on " + protocol + "://" + finalBindHost + ":" + port);
         } catch (Exception ex) {
             boundPort = -1;
+            boundHost = "";
             isHttps = false;
+            authRequired = false;
             LOGGER.log(Level.WARNING, "Failed to start developer dashboard on " + host + ":" + port, ex);
         }
+    }
+
+    private static HttpServer createServer(String host, int port, boolean https) throws Exception {
+        try {
+            return createServerOnce(host, port, https);
+        } catch (BindException bindException) {
+            if (!shouldFallbackToWildcard(host)) {
+                throw bindException;
+            }
+            LOGGER.warning("Dashboard host '" + host + "' is not bindable on this machine, retrying on 0.0.0.0");
+            return createServerOnce("0.0.0.0", port, https);
+        }
+    }
+
+    private static HttpServer createServerOnce(String host, int port, boolean https) throws Exception {
+        if (https) {
+            try {
+                return createHttpsServer(host, port);
+            } catch (Exception httpsEx) {
+                LOGGER.warning("Failed to create HTTPS server, falling back to HTTP: " + httpsEx.getMessage());
+                return HttpServer.create(new InetSocketAddress(host, port), 0);
+            }
+        }
+        return HttpServer.create(new InetSocketAddress(host, port), 0);
+    }
+
+    private static String normalizeBindHost(String host) {
+        if (host == null) {
+            return "127.0.0.1";
+        }
+        String normalized = host.trim();
+        return normalized.isEmpty() ? "127.0.0.1" : normalized;
+    }
+
+    private static boolean shouldFallbackToWildcard(String host) {
+        if (host == null) {
+            return false;
+        }
+        String normalized = host.trim().toLowerCase(Locale.ROOT);
+        if (normalized.isEmpty()
+            || normalized.equals("0.0.0.0")
+            || normalized.equals("::")
+            || normalized.equals("127.0.0.1")
+            || normalized.equals("localhost")) {
+            return false;
+        }
+        try {
+            InetAddress address = InetAddress.getByName(host);
+            if (address.isAnyLocalAddress() || address.isLoopbackAddress()) {
+                return false;
+            }
+        } catch (UnknownHostException ignored) {
+            return true;
+        }
+        return true;
     }
 
     private static HttpServer createHttpsServer(String host, int port) throws Exception {
@@ -274,7 +330,9 @@ public final class DeveloperDashboardServer {
             } finally {
                 server = null;
                 boundPort = -1;
+                boundHost = "";
                 isHttps = false;
+                authRequired = false;
                 LOGGER.info("Developer dashboard stopped");
             }
         }
@@ -317,6 +375,7 @@ public final class DeveloperDashboardServer {
         httpServer.createContext("/api/v1/resources", wrap(auth ? DeveloperDashboardServer::handleAuthRequired : DeveloperDashboardServer::handleResourceOverview));
         httpServer.createContext("/api/v1/resources/flush", wrap(auth ? DeveloperDashboardServer::handleAuthRequired : DeveloperDashboardServer::handleResourceFlush));
         httpServer.createContext("/api/v1/resources/disk", wrap(auth ? DeveloperDashboardServer::handleAuthRequired : DeveloperDashboardServer::handleDiskManager));
+        httpServer.createContext("/api/v1/mod-metrics", wrap(auth ? DeveloperDashboardServer::handleAuthRequired : DeveloperDashboardServer::handleModMetrics));
         httpServer.createContext("/api/v1/config", wrap(auth ? DeveloperDashboardServer::handleAuthRequired : DeveloperDashboardServer::handleConfigEndpoint));
     }
 
@@ -609,6 +668,173 @@ public final class DeveloperDashboardServer {
         DeveloperOverlayManager.DeveloperDiagnosticsView diagnostics = DeveloperOverlayManager.diagnosticsView();
         JsonObject payload = buildResourcePayload(diagnostics);
         sendJson(exchange, payload);
+    }
+
+    private static void handleModMetrics(HttpExchange exchange) {
+        if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            sendError(exchange, 405, "Method not allowed");
+            return;
+        }
+        sendJson(exchange, buildModMetricsPayload());
+    }
+
+    private static JsonObject buildModMetricsPayload() {
+        long now = System.currentTimeMillis();
+        long windowMs = 5 * 60 * 1000L;
+        Map<String, ModActivityMetrics> aggregate = new LinkedHashMap<>();
+        Map<String, String> displayNames = new HashMap<>();
+        Set<String> onlineMods = QuantifiedAPI.getConnectedMods().stream()
+            .map(ConnectedMod::getModId)
+            .collect(Collectors.toSet());
+        for (ConnectedMod mod : QuantifiedAPI.getConnectedMods()) {
+            displayNames.put(mod.getModId(), mod.getDisplayName());
+            aggregate.computeIfAbsent(mod.getModId(), ModActivityMetrics::new).displayName = mod.getDisplayName();
+        }
+
+        TaskKindTelemetry.Snapshot taskSnapshot = TaskKindTelemetry.snapshot(windowMs, 200);
+        JsonArray taskArray = new JsonArray();
+        for (TaskKindTelemetry.KindStats entry : taskSnapshot.entries()) {
+            ModActivityMetrics metrics = aggregate.computeIfAbsent(entry.modId, ModActivityMetrics::new);
+            metrics.displayName = displayNames.getOrDefault(entry.modId, metrics.displayName);
+            metrics.taskEvents += entry.count;
+            metrics.batchCount += entry.batchCount;
+            metrics.batchTotal += entry.batchTotal;
+            metrics.batchMax = Math.max(metrics.batchMax, entry.batchMax);
+            metrics.lastSeenMs = Math.max(metrics.lastSeenMs, entry.lastSeenMs);
+            String route = entry.route == null ? "" : entry.route;
+            if ("GPU Accel".equalsIgnoreCase(route)) {
+                metrics.gpuEvents += entry.count;
+            } else if ("Parallel".equalsIgnoreCase(route)) {
+                metrics.parallelEvents += entry.count;
+            } else if ("Multithreading".equalsIgnoreCase(route)) {
+                metrics.multithreadingEvents += entry.count;
+            } else {
+                metrics.otherEvents += entry.count;
+            }
+
+            JsonObject task = new JsonObject();
+            task.addProperty("modId", entry.modId);
+            task.addProperty("displayName", displayNames.getOrDefault(entry.modId, entry.modId));
+            task.addProperty("taskName", entry.taskName);
+            task.addProperty("route", route);
+            task.addProperty("count", entry.count);
+            task.addProperty("lastSeenMs", entry.lastSeenMs);
+            task.addProperty("batchCount", entry.batchCount);
+            task.addProperty("batchTotal", entry.batchTotal);
+            task.addProperty("batchMax", entry.batchMax);
+            task.addProperty("batchAvg", entry.batchCount > 0 ? (double) entry.batchTotal / entry.batchCount : 0.0);
+            taskArray.add(task);
+        }
+
+        DetailedInventory inventory = CacheManager.detailedInventory();
+        inventory.caches().forEach((name, detail) -> {
+            String modId = extractMetricModId(name);
+            ModActivityMetrics metrics = aggregate.computeIfAbsent(modId, ModActivityMetrics::new);
+            metrics.displayName = displayNames.getOrDefault(modId, metrics.displayName);
+            metrics.cacheEntries += Math.max(0L, detail.entries());
+            ThreadSafeCache.CacheStats stats = detail.stats();
+            if (stats != null) {
+                metrics.cacheHits += Math.max(0L, stats.hitCount());
+                metrics.cacheMisses += Math.max(0L, stats.missCount());
+                metrics.cacheEvictions += Math.max(0L, stats.evictionCount());
+            }
+        });
+
+        Map<String, Long> diskUsage = DiskCacheManager.listCacheFiles().stream()
+            .collect(Collectors.groupingBy(CacheFileDescriptor::modId, Collectors.summingLong(CacheFileDescriptor::sizeBytes)));
+        for (Map.Entry<String, Long> entry : diskUsage.entrySet()) {
+            ModActivityMetrics metrics = aggregate.computeIfAbsent(entry.getKey(), ModActivityMetrics::new);
+            metrics.displayName = displayNames.getOrDefault(entry.getKey(), metrics.displayName);
+            metrics.diskBytes = Math.max(0L, entry.getValue());
+        }
+
+        Map<String, ModStatistics> modStats = QuantifiedAPI.getAllModStatistics();
+        for (Map.Entry<String, ModStatistics> entry : modStats.entrySet()) {
+            String modId = entry.getKey();
+            ModActivityMetrics metrics = aggregate.computeIfAbsent(modId, ModActivityMetrics::new);
+            metrics.displayName = displayNames.getOrDefault(modId, modId);
+            ModStatistics stats = entry.getValue();
+            metrics.queueDepth = Math.max(metrics.queueDepth, stats.getCurrentQueueDepth());
+            metrics.tasksPerSecond = Math.max(metrics.tasksPerSecond, stats.getTasksPerSecond());
+            metrics.ramBytes = Math.max(metrics.ramBytes, Math.max(stats.getCacheMemoryUsage(), stats.getCacheSize() * 512L));
+            metrics.peakVramBytes = Math.max(metrics.peakVramBytes, stats.getPeakVRAMUsage());
+            Instant last = stats.getLastActivity();
+            if (last != null) {
+                metrics.lastSeenMs = Math.max(metrics.lastSeenMs, last.toEpochMilli());
+            }
+        }
+
+        List<ModActivityMetrics> mods = new ArrayList<>(aggregate.values());
+        mods.sort(Comparator
+            .comparingLong(ModActivityMetrics::activityScore)
+            .reversed()
+            .thenComparing(metrics -> metrics.modId, String.CASE_INSENSITIVE_ORDER));
+
+        JsonArray modArray = new JsonArray();
+        long totalTaskEvents = 0L;
+        long totalCacheRequests = 0L;
+        long totalGpuEvents = 0L;
+        for (ModActivityMetrics metrics : mods) {
+            long cacheRequests = metrics.cacheHits + metrics.cacheMisses;
+            totalTaskEvents += metrics.taskEvents;
+            totalCacheRequests += cacheRequests;
+            totalGpuEvents += metrics.gpuEvents;
+
+            JsonObject mod = new JsonObject();
+            mod.addProperty("modId", metrics.modId);
+            mod.addProperty("displayName", metrics.displayName == null || metrics.displayName.isBlank() ? metrics.modId : metrics.displayName);
+            mod.addProperty("online", onlineMods.contains(metrics.modId));
+            mod.addProperty("active", metrics.lastSeenMs > 0L && Math.abs(now - metrics.lastSeenMs) < 25_000L);
+            mod.addProperty("lastSeenMs", metrics.lastSeenMs);
+            mod.addProperty("taskEvents", metrics.taskEvents);
+            mod.addProperty("gpuEvents", metrics.gpuEvents);
+            mod.addProperty("parallelEvents", metrics.parallelEvents);
+            mod.addProperty("multithreadingEvents", metrics.multithreadingEvents);
+            mod.addProperty("otherEvents", metrics.otherEvents);
+            mod.addProperty("batchCount", metrics.batchCount);
+            mod.addProperty("batchTotal", metrics.batchTotal);
+            mod.addProperty("batchAvg", metrics.batchCount > 0L ? (double) metrics.batchTotal / metrics.batchCount : 0.0);
+            mod.addProperty("batchMax", metrics.batchMax);
+            mod.addProperty("cacheRequests", cacheRequests);
+            mod.addProperty("cacheHits", metrics.cacheHits);
+            mod.addProperty("cacheMisses", metrics.cacheMisses);
+            mod.addProperty("cacheHitRate", cacheRequests > 0L ? (double) metrics.cacheHits / cacheRequests : 0.0);
+            mod.addProperty("cacheEntries", metrics.cacheEntries);
+            mod.addProperty("cacheEvictions", metrics.cacheEvictions);
+            mod.addProperty("diskBytes", metrics.diskBytes);
+            mod.addProperty("ramBytes", metrics.ramBytes);
+            mod.addProperty("peakVramBytes", metrics.peakVramBytes);
+            mod.addProperty("queueDepth", metrics.queueDepth);
+            mod.addProperty("tasksPerSecond", metrics.tasksPerSecond);
+            modArray.add(mod);
+        }
+
+        JsonObject summary = new JsonObject();
+        summary.addProperty("modsTracked", mods.size());
+        summary.addProperty("taskEvents", totalTaskEvents);
+        summary.addProperty("gpuEvents", totalGpuEvents);
+        summary.addProperty("cacheRequests", totalCacheRequests);
+        summary.addProperty("gpuShare", totalTaskEvents > 0L ? (double) totalGpuEvents / totalTaskEvents : 0.0);
+
+        JsonObject payload = new JsonObject();
+        payload.addProperty("generatedAt", now);
+        payload.addProperty("windowMs", taskSnapshot.windowMs());
+        payload.add("summary", summary);
+        payload.add("mods", modArray);
+        payload.add("tasks", taskArray);
+        return payload;
+    }
+
+    private static String extractMetricModId(String cacheName) {
+        if (cacheName == null || cacheName.isBlank()) {
+            return "quantified";
+        }
+        int dot = cacheName.indexOf('.');
+        if (dot <= 0) {
+            return "quantified";
+        }
+        String modId = cacheName.substring(0, dot).trim();
+        return modId.isEmpty() || "unknown".equalsIgnoreCase(modId) ? "quantified" : modId;
     }
 
     private static JsonObject buildResourcePayload(DeveloperOverlayManager.DeveloperDiagnosticsView diagnostics) {
@@ -1009,6 +1235,17 @@ public final class DeveloperDashboardServer {
                     }
                 }
                 MultithreadingConfig.writePrettyJsonConfig(MultithreadingConfig.CONFIG);
+                boolean gpuEnabledNow = MultithreadingConfig.isGpuAccelerationEnabled();
+                if (!gpuEnabledNow) {
+                    VulkanProbeScheduler.reset();
+                    AsyncProbeScheduler.reset();
+                    OpenCLManager.shutdown();
+                    if (VulkanRuntime.hasBindings()) {
+                        VulkanManager.shutdown();
+                    }
+                    DeveloperOverlayManager.recordApiLog("[Quantified] GPU acceleration disabled from config");
+                    return;
+                }
                 if (vulkanDeviceChanged && VulkanRuntime.hasBindings()) {
                     VulkanManager.setPreferredDevice(normalizeAutoDeviceValue(updatedVulkanDeviceId));
                 }
@@ -2137,6 +2374,7 @@ public final class DeveloperDashboardServer {
             case "/api/v1/resources" -> handleResourceOverview(exchange);
             case "/api/v1/resources/flush" -> handleResourceFlush(exchange);
             case "/api/v1/resources/disk" -> handleDiskManager(exchange);
+            case "/api/v1/mod-metrics" -> handleModMetrics(exchange);
             case "/api/v1/config" -> handleConfigEndpoint(exchange);
             case "/api/v1/mods" -> handleModRequest(exchange);
             default -> {
@@ -2165,9 +2403,21 @@ public final class DeveloperDashboardServer {
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>Quantified API - Login</title>
+                <title>Quantified API - Dashboard Login</title>
                 <link rel="stylesheet" href="/dashboard.css">
                 <link rel="icon" type="image/png" href="/dashboard-logo.png">
+                <script>
+                    (function() {
+                        try {
+                            const saved = localStorage.getItem('quantifiedThemeMode') || localStorage.getItem('quantifiedThemeOverride') || localStorage.getItem('quantifiedTheme');
+                            const theme = saved === 'dark' || saved === 'light'
+                                ? saved
+                                : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+                            document.documentElement.setAttribute('data-theme', theme);
+                        } catch (ignored) {
+                        }
+                    })();
+                </script>
                 <style>
                     body { display:flex; align-items:center; justify-content:center; min-height:100vh; }
                     * {
@@ -2513,14 +2763,454 @@ public final class DeveloperDashboardServer {
                         transform: translateY(-1px);
                     }
 
-                    @media (max-width: 480px) {
-                        .login-container {
-                            margin: 40px 20px;
-                            padding: 30px 24px;
+                    body {
+                        align-items: stretch;
+                        justify-content: flex-start;
+                        background:
+                            radial-gradient(circle at top left, rgba(95, 111, 138, 0.14), transparent 34rem),
+                            linear-gradient(135deg, var(--bg), var(--surface-strong));
+                        background-color: var(--bg);
+                        background-size: auto;
+                        animation: none;
+                        color: var(--text-primary);
+                        padding: clamp(14px, 2.4vw, 26px);
+                        position: relative;
+                        isolation: isolate;
+                    }
+
+                    body::before {
+                        display: none;
+                    }
+
+                    .dashboard-bg-stage {
+                        position: fixed;
+                        inset: 0;
+                        z-index: 0;
+                        overflow: hidden;
+                        pointer-events: none;
+                        background:
+                            radial-gradient(circle at 17% 14%, rgba(198, 94, 69, 0.12), transparent 30rem),
+                            radial-gradient(circle at 82% 10%, rgba(47, 118, 96, 0.12), transparent 34rem),
+                            linear-gradient(140deg, var(--bg) 0%, var(--surface-strong) 55%, var(--bg) 100%);
+                    }
+
+                    .dashboard-bg-grid,
+                    .dashboard-bg-grid::before,
+                    .dashboard-bg-glow,
+                    .dashboard-bg-sweep,
+                    .dashboard-bg-aurora,
+                    .dashboard-bg-noise {
+                        position: absolute;
+                        inset: 0;
+                    }
+
+                    .dashboard-bg-grid {
+                        opacity: 0.45;
+                        background-image:
+                            linear-gradient(rgba(95, 111, 138, 0.16) 1px, transparent 1px),
+                            linear-gradient(90deg, rgba(95, 111, 138, 0.14) 1px, transparent 1px);
+                        background-size: 54px 54px;
+                        mask-image: radial-gradient(circle at center, black 0%, transparent 72%);
+                        animation: dashboard-grid-drift 26s linear infinite;
+                    }
+
+                    .dashboard-bg-grid::before {
+                        content: "";
+                        opacity: 0.42;
+                        background:
+                            linear-gradient(115deg, transparent 0%, rgba(198, 94, 69, 0.18) 38%, transparent 58%),
+                            linear-gradient(245deg, transparent 4%, rgba(47, 118, 96, 0.14) 42%, transparent 64%);
+                        filter: blur(14px);
+                        transform: translateX(-18%);
+                        animation: dashboard-grid-wind 12s ease-in-out infinite alternate;
+                    }
+
+                    .dashboard-bg-glow {
+                        width: 32rem;
+                        height: 32rem;
+                        border-radius: 999px;
+                        inset: auto;
+                        filter: blur(28px);
+                        opacity: 0.22;
+                        mix-blend-mode: multiply;
+                    }
+
+                    .dashboard-bg-glow-a {
+                        left: -8rem;
+                        top: 10%;
+                        background: rgba(198, 94, 69, 0.5);
+                        animation: dashboard-orb-a 20s ease-in-out infinite alternate;
+                    }
+
+                    .dashboard-bg-glow-b {
+                        right: -9rem;
+                        bottom: 6%;
+                        background: rgba(47, 118, 96, 0.45);
+                        animation: dashboard-orb-b 24s ease-in-out infinite alternate;
+                    }
+
+                    .dashboard-bg-sweep {
+                        opacity: 0.32;
+                        background: linear-gradient(110deg, transparent 8%, rgba(255, 255, 255, 0.34) 46%, transparent 70%);
+                        transform: translateX(-78%) skewX(-12deg);
+                        animation: dashboard-bg-sweep 15s ease-in-out infinite;
+                    }
+
+                    .dashboard-bg-aurora {
+                        opacity: 0.18;
+                        background:
+                            conic-gradient(from 180deg at 54% 44%, transparent, rgba(198, 94, 69, 0.22), transparent, rgba(47, 118, 96, 0.2), transparent);
+                        filter: blur(48px);
+                        animation: dashboard-aurora-shift 18s ease-in-out infinite alternate;
+                    }
+
+                    .dashboard-bg-noise {
+                        opacity: 0.035;
+                        background-image:
+                            radial-gradient(circle at 20% 20%, #111 0 1px, transparent 1px),
+                            radial-gradient(circle at 80% 30%, #111 0 1px, transparent 1px),
+                            radial-gradient(circle at 40% 70%, #111 0 1px, transparent 1px);
+                        background-size: 180px 180px;
+                    }
+
+                    :root[data-theme="dark"] .dashboard-bg-stage {
+                        background:
+                            radial-gradient(circle at 17% 14%, rgba(217, 111, 82, 0.22), transparent 31rem),
+                            radial-gradient(circle at 82% 10%, rgba(69, 153, 126, 0.18), transparent 34rem),
+                            linear-gradient(140deg, var(--bg) 0%, var(--surface-strong) 55%, var(--bg) 100%);
+                    }
+
+                    :root[data-theme="dark"] .dashboard-bg-grid {
+                        opacity: 0.62;
+                        background-image:
+                            linear-gradient(rgba(224, 229, 238, 0.12) 1px, transparent 1px),
+                            linear-gradient(90deg, rgba(224, 229, 238, 0.1) 1px, transparent 1px);
+                    }
+
+                    :root[data-theme="dark"] .dashboard-bg-glow {
+                        opacity: 0.32;
+                        mix-blend-mode: screen;
+                    }
+
+                    :root[data-theme="dark"] .dashboard-bg-sweep {
+                        opacity: 0.22;
+                    }
+
+                    :root[data-theme="dark"] .dashboard-bg-noise {
+                        opacity: 0.055;
+                        filter: invert(1);
+                    }
+
+                    .login-shell {
+                        width: min(1120px, 100%);
+                        min-height: calc(100vh - clamp(28px, 4.8vw, 52px));
+                        margin: 0 auto;
+                        display: grid;
+                        grid-template-columns: minmax(0, 1fr);
+                        align-items: stretch;
+                        position: relative;
+                        z-index: 1;
+                    }
+
+                    .login-rail,
+                    .login-overview,
+                    .login-card {
+                        background: var(--surface);
+                        border: 1px solid var(--border-soft);
+                        border-radius: var(--radius-card);
+                        box-shadow: var(--shadow-soft-1);
+                    }
+
+                    .login-rail-inner {
+                        position: sticky;
+                        top: 24px;
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                        gap: var(--space-6);
+                        padding: var(--space-5) var(--space-3);
+                    }
+
+                    .login-brand,
+                    .login-header img {
+                        background: var(--surface-contrast);
+                        display: grid;
+                        place-items: center;
+                    }
+
+                    .login-brand {
+                        width: 36px;
+                        height: 36px;
+                        border-radius: 12px;
+                        padding: 6px;
+                    }
+
+                    .login-brand img {
+                        width: 100%;
+                        height: 100%;
+                        object-fit: contain;
+                    }
+
+                    .rail-dot {
+                        width: 44px;
+                        height: 44px;
+                        border-radius: 14px;
+                        display: grid;
+                        place-items: center;
+                        background: var(--surface-strong);
+                        border: 1px solid var(--border-strong);
+                        color: var(--text-primary);
+                        font-size: 0.78rem;
+                        font-weight: 700;
+                    }
+
+                    .login-main {
+                        min-width: 0;
+                        display: grid;
+                        grid-template-columns: minmax(0, 1.15fr) minmax(360px, 430px);
+                        gap: var(--space-6);
+                        align-items: center;
+                    }
+
+                    .login-overview {
+                        min-height: 540px;
+                        padding: clamp(26px, 5vw, 56px);
+                        display: flex;
+                        flex-direction: column;
+                        justify-content: center;
+                        gap: var(--space-5);
+                        position: relative;
+                        overflow: hidden;
+                    }
+
+                    .login-overview::after {
+                        content: "";
+                        position: absolute;
+                        inset: auto -18% -26% auto;
+                        width: 340px;
+                        height: 340px;
+                        border-radius: 50%;
+                        background: radial-gradient(circle, rgba(111, 126, 104, 0.16), transparent 68%);
+                        pointer-events: none;
+                    }
+
+                    .login-eyebrow {
+                        display: inline-flex;
+                        width: fit-content;
+                        align-items: center;
+                        gap: 8px;
+                        border-radius: var(--radius-pill);
+                        border: 1px solid var(--border-soft);
+                        background: var(--surface-strong);
+                        color: var(--text-secondary);
+                        padding: 8px 12px;
+                        font-size: 0.78rem;
+                        font-weight: 700;
+                        text-transform: uppercase;
+                        letter-spacing: 0.07em;
+                    }
+
+                    .status-light {
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 50%;
+                        background: var(--success);
+                        box-shadow: 0 0 0 4px rgba(44, 143, 93, 0.12);
+                    }
+
+                    .login-copy {
+                        max-width: 620px;
+                        display: flex;
+                        flex-direction: column;
+                        gap: var(--space-5);
+                    }
+
+                    .login-copy h1 {
+                        margin: 0;
+                        color: var(--text-primary);
+                        font-size: clamp(2.1rem, 5vw, 4.6rem);
+                        font-weight: 780;
+                        line-height: 0.94;
+                        text-wrap: balance;
+                    }
+
+                    .login-copy p {
+                        max-width: 58ch;
+                        margin: 0;
+                        color: var(--text-primary);
+                        font-size: clamp(1rem, 1.7vw, 1.2rem);
+                        line-height: 1.65;
+                    }
+
+                    .login-card {
+                        padding: clamp(22px, 3vw, 32px);
+                        align-self: center;
+                    }
+
+                    .login-header {
+                        display: flex;
+                        align-items: center;
+                        gap: var(--space-4);
+                        margin-bottom: var(--space-7);
+                        text-align: left;
+                    }
+
+                    .login-header img {
+                        width: 48px;
+                        height: 48px;
+                        border-radius: 14px;
+                        padding: 8px;
+                        object-fit: contain;
+                        margin: 0;
+                        opacity: 1;
+                        animation: none;
+                        box-shadow: none;
+                    }
+
+                    .login-header h1 {
+                        margin: 0;
+                        color: var(--text-primary);
+                        background: none;
+                        -webkit-text-fill-color: currentColor;
+                        font-size: 1.15rem;
+                        font-weight: 760;
+                        letter-spacing: 0;
+                        animation: none;
+                    }
+
+                    .login-header p {
+                        margin: 3px 0 0;
+                        color: var(--text-muted);
+                        font-size: 0.86rem;
+                        opacity: 1;
+                        animation: none;
+                    }
+
+                    .login-form {
+                        gap: var(--space-5);
+                    }
+
+                    .form-group {
+                        gap: 8px;
+                    }
+
+                    .form-group label {
+                        color: var(--text-secondary);
+                        font-size: 0.78rem;
+                        font-weight: 720;
+                        letter-spacing: 0.07em;
+                        margin: 0;
+                        opacity: 1;
+                        animation: none;
+                    }
+
+                    .form-group input {
+                        background: var(--surface);
+                        color: var(--text-primary);
+                        border: 1px solid var(--border-soft);
+                        padding: 12px 14px;
+                        font-size: 0.94rem;
+                        opacity: 1;
+                        animation: none;
+                        transform: none;
+                    }
+
+                    .form-group input:hover {
+                        border-color: var(--border-strong);
+                        transform: none;
+                        box-shadow: none;
+                    }
+
+                    .form-group input:focus {
+                        outline: 2px solid rgba(95, 111, 138, 0.2);
+                        border-color: var(--accent-1);
+                        background: var(--surface);
+                        box-shadow: none;
+                        transform: none;
+                    }
+
+                    .login-btn {
+                        width: 100%;
+                        min-height: 46px;
+                        border: 1px solid var(--surface-contrast);
+                        background: var(--surface-contrast);
+                        color: #ffffff;
+                        padding: 12px 16px;
+                        font-size: 0.94rem;
+                        font-weight: 740;
+                        box-shadow: var(--shadow-soft-2);
+                        opacity: 1;
+                        animation: none;
+                    }
+
+                    .login-btn:hover {
+                        transform: translateY(-1px);
+                        box-shadow: var(--shadow-soft-3);
+                    }
+
+                    .login-btn.loading::after {
+                        inset: 0;
+                        border-top-color: currentColor;
+                    }
+
+                    .error-message {
+                        color: var(--danger);
+                        background: color-mix(in srgb, var(--danger) 10%, var(--surface));
+                        border: 1px solid color-mix(in srgb, var(--danger) 28%, var(--border-soft));
+                        padding: 12px 14px;
+                        margin-bottom: var(--space-5);
+                        font-size: 0.88rem;
+                        font-weight: 650;
+                        box-shadow: none;
+                        animation: none;
+                        opacity: 1;
+                    }
+
+                    .setup-link {
+                        margin-top: var(--space-5);
+                        color: var(--text-muted);
+                        font-size: 0.85rem;
+                        opacity: 1;
+                        animation: none;
+                    }
+
+                    .setup-link a {
+                        color: var(--text-primary);
+                        font-weight: 680;
+                    }
+
+                    .setup-link a:hover {
+                        color: var(--text-primary);
+                        text-decoration: underline;
+                        transform: none;
+                    }
+
+                    @media (max-width: 860px) {
+                        .login-shell {
+                            grid-template-columns: 1fr;
+                            min-height: auto;
                         }
 
-                        .login-header h1 {
-                            font-size: 24px;
+                        .login-main {
+                            grid-template-columns: 1fr;
+                        }
+
+                        .login-overview {
+                            min-height: auto;
+                        }
+                    }
+
+                    @media (max-width: 560px) {
+                        body {
+                            padding: 12px;
+                        }
+
+                        .login-main {
+                            gap: var(--space-4);
+                        }
+
+                        .login-card {
+                            padding: 20px;
                         }
                     }
 
@@ -2531,49 +3221,156 @@ public final class DeveloperDashboardServer {
                             transition-duration: 0.01ms !important;
                         }
                     }
+
+                    @keyframes dashboard-grid-drift {
+                        from { background-position: 0 0, 0 0; }
+                        to { background-position: 54px 54px, 54px 54px; }
+                    }
+
+                    @keyframes dashboard-grid-wind {
+                        0% { transform: translateX(-18%) translateY(-3%) skewX(-8deg); }
+                        100% { transform: translateX(16%) translateY(5%) skewX(8deg); }
+                    }
+
+                    @keyframes dashboard-orb-a {
+                        0% { transform: translate3d(0, 0, 0) scale(1); }
+                        100% { transform: translate3d(18vw, 7vh, 0) scale(1.18); }
+                    }
+
+                    @keyframes dashboard-orb-b {
+                        0% { transform: translate3d(0, 0, 0) scale(1); }
+                        100% { transform: translate3d(-14vw, -10vh, 0) scale(1.12); }
+                    }
+
+                    @keyframes dashboard-bg-sweep {
+                        0%, 35% { transform: translateX(-82%) skewX(-12deg); }
+                        70%, 100% { transform: translateX(82%) skewX(-12deg); }
+                    }
+
+                    @keyframes dashboard-aurora-shift {
+                        0% { transform: translateY(-3%) rotate(0deg) scale(1); }
+                        100% { transform: translateY(5%) rotate(10deg) scale(1.08); }
+                    }
                 </style>
             </head>
             <body>
-                <div class="login-container">
-                    <div class="login-header">
-                        <img src="/dashboard-logo.png" alt="Quantified API logo">
-                        <h1>Quantified API</h1>
-                        <p>Webpanel Login</p>
-                    </div>
-                    <div id="error-message" class="error-message" style="display: none;"></div>
-                    <form class="login-form" id="login-form">
-                        <div class="form-group">
-                            <label for="username">Username</label>
-                            <input type="text" id="username" name="username" placeholder="Enter your username" required>
-                        </div>
-                        <div class="form-group">
-                            <label for="password">Password</label>
-                            <input type="password" id="password" name="password" placeholder="Enter your password" required>
-                        </div>
-                        <button type="submit" class="login-btn" id="login-btn">
-                            <span id="btn-text">Login</span>
-                        </button>
-                    </form>
-                    <div class="setup-link">
-                        Interested in the project? <a href="https://github.com/Admany/Quantified-API/" target="_blank" rel="noopener noreferrer">Check it out!</a>
-                    </div>
+                <div class="dashboard-bg-stage" aria-hidden="true">
+                    <div class="dashboard-bg-grid"></div>
+                    <div class="dashboard-bg-glow dashboard-bg-glow-a"></div>
+                    <div class="dashboard-bg-glow dashboard-bg-glow-b"></div>
+                    <div class="dashboard-bg-sweep"></div>
+                    <div class="dashboard-bg-aurora"></div>
+                    <div class="dashboard-bg-noise"></div>
                 </div>
+                <div class="theme-toggle" aria-label="Theme">
+                    <button class="theme-toggle__btn" type="button" data-theme-choice="light" aria-label="Use light theme">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path><path d="M12 20v2"></path><path d="m4.93 4.93 1.41 1.41"></path><path d="m17.66 17.66 1.41 1.41"></path><path d="M2 12h2"></path><path d="M20 12h2"></path><path d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path></svg>
+                    </button>
+                    <button class="theme-toggle__btn" type="button" data-theme-choice="dark" aria-label="Use dark theme">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5 8.5 8.5 0 1 0 20.5 14.5Z"></path></svg>
+                    </button>
+                    <button class="theme-toggle__btn" type="button" data-theme-choice="system" aria-label="Use system theme">
+                        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"></rect><path d="M8 20h8"></path><path d="M12 16v4"></path></svg>
+                    </button>
+                </div>
+                <main class="login-shell">
+                    <section class="login-main">
+                        <div class="login-overview">
+                            <div class="login-copy">
+                                <h1>Quantified API webpanel</h1>
+                                <p>Next-gen independent powerhouse built to run your code with maximum performance and scalability, giving you full source transparency, designed with love at the Anti-Corpo BlackRift Studios :]</p>
+                            </div>
+                        </div>
+                        <div class="login-card">
+                            <div class="login-header">
+                                <img src="/dashboard-logo.png" alt="Quantified API logo">
+                                <div>
+                                    <h1>Sign in</h1>
+                                </div>
+                            </div>
+                            <div id="error-message" class="error-message" style="display: none;"></div>
+                            <form class="login-form" id="login-form">
+                                <div class="form-group">
+                                    <label for="username">Username</label>
+                                    <input type="text" id="username" name="username" placeholder="Dashboard username" autocomplete="username" required>
+                                </div>
+                                <div class="form-group">
+                                    <label for="password">Password</label>
+                                    <input type="password" id="password" name="password" placeholder="Dashboard password" autocomplete="current-password" required>
+                                </div>
+                                <button type="submit" class="login-btn" id="login-btn">
+                                    <span id="btn-text">Log In</span>
+                                </button>
+                            </form>
+                            <div class="setup-link">
+                                Project source: <a href="https://github.com/Admany/Quantified-API/" target="_blank" rel="noopener noreferrer">GitHub</a>
+                            </div>
+                        </div>
+                    </section>
+                </main>
                 <script>
-                    document.getElementById('login-form').addEventListener('submit', async (e) => {
+                    const loginForm = document.getElementById('login-form');
+                    const loginButton = document.getElementById('login-btn');
+                    const buttonText = document.getElementById('btn-text');
+                    const errorMessage = document.getElementById('error-message');
+                    const media = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+                    const themeButtons = Array.from(document.querySelectorAll('[data-theme-choice]'));
+
+                    function effectiveTheme(mode) {
+                        if (mode === 'light' || mode === 'dark') return mode;
+                        return media && media.matches ? 'dark' : 'light';
+                    }
+
+                    function currentThemeMode() {
+                        try {
+                            const saved = localStorage.getItem('quantifiedThemeMode') || localStorage.getItem('quantifiedThemeOverride') || localStorage.getItem('quantifiedTheme');
+                            return saved === 'light' || saved === 'dark' ? saved : 'system';
+                        } catch (ignored) {
+                            return 'system';
+                        }
+                    }
+
+                    function applyThemeMode(mode) {
+                        const nextMode = mode === 'light' || mode === 'dark' ? mode : 'system';
+                        document.documentElement.setAttribute('data-theme', effectiveTheme(nextMode));
+                        themeButtons.forEach(button => button.classList.toggle('active', button.dataset.themeChoice === nextMode));
+                    }
+
+                    themeButtons.forEach(button => {
+                        button.addEventListener('click', () => {
+                            const mode = button.dataset.themeChoice;
+                            try {
+                                if (mode === 'system') {
+                                    localStorage.removeItem('quantifiedThemeMode');
+                                    localStorage.removeItem('quantifiedThemeOverride');
+                                    localStorage.removeItem('quantifiedTheme');
+                                } else {
+                                    localStorage.setItem('quantifiedThemeMode', mode);
+                                    localStorage.setItem('quantifiedThemeOverride', mode);
+                                    localStorage.setItem('quantifiedTheme', mode);
+                                }
+                            } catch (ignored) {
+                            }
+                            applyThemeMode(mode);
+                        });
+                    });
+
+                    if (media) {
+                        const refreshSystemTheme = () => {
+                            if (currentThemeMode() === 'system') applyThemeMode('system');
+                        };
+                        if (media.addEventListener) media.addEventListener('change', refreshSystemTheme);
+                        else if (media.addListener) media.addListener(refreshSystemTheme);
+                    }
+
+                    applyThemeMode(currentThemeMode());
+
+                    loginForm.addEventListener('submit', async (e) => {
                         e.preventDefault();
-                        const btn = document.getElementById('login-btn');
-                        const btnText = document.getElementById('btn-text');
-                        const errorDiv = document.getElementById('error-message');
-
-                        btn.classList.add('loading');
-                        btn.disabled = true;
-                        btnText.textContent = 'Authenticating...';
-                        errorDiv.style.display = 'none';
-
-                        // Add subtle animation to the container during login
-                        const container = document.querySelector('.login-container');
-                        container.style.transform = 'scale(0.98)';
-                        container.style.transition = 'transform 0.2s ease';
+                        loginButton.classList.add('loading');
+                        loginButton.disabled = true;
+                        buttonText.textContent = 'Checking credentials';
+                        errorMessage.style.display = 'none';
 
                         try {
                             const formData = new FormData(e.target);
@@ -2589,47 +3386,22 @@ public final class DeveloperDashboardServer {
                             });
 
                             if (response.ok) {
-                                // Success animation
-                                container.style.transform = 'scale(1.02)';
-                                container.style.boxShadow = '0 30px 60px rgba(0, 0, 0, 0.2)';
-                                setTimeout(() => {
-                                    window.location.href = '/';
-                                }, 300);
-                            } else {
-                                // Error animation
-                                container.style.transform = 'scale(1)';
-                                container.style.animation = 'shake 0.5s ease-in-out';
-                                setTimeout(() => {
-                                    container.style.animation = '';
-                                }, 500);
-
-                                const data = await response.json().catch(() => ({}));
-                                errorDiv.textContent = (data && data.error) ? data.error : 'Login failed';
-                                errorDiv.style.display = 'block';
+                                buttonText.textContent = 'Opening dashboard';
+                                window.location.href = '/';
+                                return;
                             }
+
+                            const data = await response.json().catch(() => ({}));
+                            errorMessage.textContent = (data && data.error) ? data.error : 'Invalid credentials';
+                            errorMessage.style.display = 'block';
                         } catch (error) {
-                            container.style.transform = 'scale(1)';
-                            errorDiv.textContent = 'Network error. Please try again.';
-                            errorDiv.style.display = 'block';
+                            errorMessage.textContent = 'Connection failed. Please try again.';
+                            errorMessage.style.display = 'block';
                         } finally {
-                            btn.classList.remove('loading');
-                            btn.disabled = false;
-                            btnText.textContent = 'Login';
+                            loginButton.classList.remove('loading');
+                            loginButton.disabled = false;
+                            buttonText.textContent = 'Log In';
                         }
-                    });
-
-                    
-
-                    // Add focus effects to inputs
-                    document.querySelectorAll('input').forEach(input => {
-                        input.addEventListener('focus', () => {
-                            input.parentElement.style.transform = 'scale(1.02)';
-                            input.parentElement.style.transition = 'transform 0.2s ease';
-                        });
-
-                        input.addEventListener('blur', () => {
-                            input.parentElement.style.transform = 'scale(1)';
-                        });
                     });
                 </script>
             </body>
@@ -3440,6 +4212,38 @@ public final class DeveloperDashboardServer {
             os.write(bytes);
         }
         exchange.close();
+    }
+
+    private static final class ModActivityMetrics {
+        final String modId;
+        String displayName;
+        long taskEvents;
+        long gpuEvents;
+        long parallelEvents;
+        long multithreadingEvents;
+        long otherEvents;
+        long batchCount;
+        long batchTotal;
+        int batchMax;
+        long cacheHits;
+        long cacheMisses;
+        long cacheEntries;
+        long cacheEvictions;
+        long diskBytes;
+        long ramBytes;
+        long peakVramBytes;
+        int queueDepth;
+        double tasksPerSecond;
+        long lastSeenMs;
+
+        ModActivityMetrics(String modId) {
+            this.modId = modId == null || modId.isBlank() ? "unknown-mod" : modId;
+            this.displayName = this.modId;
+        }
+
+        long activityScore() {
+            return taskEvents + cacheHits + cacheMisses + batchTotal + queueDepth;
+        }
     }
 }
 

@@ -69,6 +69,9 @@ public final class GpuBackendRouter {
                                    boolean vulkanSupported,
                                    boolean vulkanAvailable) {
         GpuBackendPreference effective = resolvePreference(modId, taskPreference);
+        if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
+            return new Selection(effective, GpuBackendType.CPU);
+        }
         if (effective.isCpuOnly()) {
             return new Selection(effective, GpuBackendType.CPU);
         }

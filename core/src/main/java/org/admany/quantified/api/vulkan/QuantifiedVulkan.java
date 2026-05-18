@@ -3,7 +3,6 @@ package org.admany.quantified.api.vulkan;
 import org.admany.quantified.api.compute.GpuBackendPreference;
 import org.admany.quantified.api.opencl.QuantifiedOpenCL;
 import org.admany.quantified.core.common.util.TaskScheduler;
-import org.admany.quantified.core.common.vulkan.core.McDensityVulkanTask;
 import org.admany.quantified.core.common.vulkan.core.VulkanContext;
 import org.admany.quantified.core.common.vulkan.core.VulkanManager;
 
@@ -40,11 +39,6 @@ public final class QuantifiedVulkan {
         float[][] matrixMultiply(float[][] a, float[][] b);
         double monteCarloPi(int samples);
         float[] terrainGeneration(float[] inputCoords);
-        float[] mcDensityFunctions(float[] packedCoords, float[] encodedProgram, int instructionCount);
-        default float[] mcDensityFunctions(float[] packedCoords, float[] encodedProgram, int instructionCount,
-                                           float[] auxValues, int auxValueCount) {
-            return mcDensityFunctions(packedCoords, encodedProgram, instructionCount);
-        }
         String deviceName();
     }
 
@@ -60,14 +54,6 @@ public final class QuantifiedVulkan {
 
     public static boolean isGpuReady() {
         return VulkanManager.isAvailable();
-    }
-
-    public static void registerDensityShader(String key, byte[] spirv) {
-        VulkanManager.registerDensityShader(key, spirv);
-    }
-
-    public static void unregisterDensityShader(String key) {
-        VulkanManager.unregisterDensityShader(key);
     }
 
     public static final class Builder<T> {
@@ -287,17 +273,6 @@ public final class QuantifiedVulkan {
         }
 
         @Override
-        public float[] mcDensityFunctions(float[] packedCoords, float[] encodedProgram, int instructionCount) {
-            return delegate.mcDensityFunctions(packedCoords, encodedProgram, instructionCount);
-        }
-
-        @Override
-        public float[] mcDensityFunctions(float[] packedCoords, float[] encodedProgram, int instructionCount,
-                                          float[] auxValues, int auxValueCount) {
-            return delegate.mcDensityFunctions(packedCoords, encodedProgram, instructionCount, auxValues, auxValueCount);
-        }
-
-        @Override
         public String deviceName() {
             return delegate.deviceName();
         }
@@ -432,92 +407,6 @@ public final class QuantifiedVulkan {
             .complexity(Complexity.MODERATE)
             .kind(WorkloadKind.STATISTICAL)
             .submit();
-    }
-
-    public static CompletableFuture<float[]> parallelMcDensityFunctions(String modId,
-                                                                        String taskName,
-                                                                        long taskKey,
-                                                                        float[] packedCoords,
-                                                                        McDensityProgram program,
-                                                                        Supplier<float[]> cpuFallback) {
-        Objects.requireNonNull(program, "program");
-        return parallelMcDensityFunctions(modId, taskName, taskKey,
-            packedCoords, program.encoded(), program.instructionCount(), cpuFallback);
-    }
-
-    public static CompletableFuture<float[]> parallelMcDensityFunctions(String modId,
-                                                                        String taskName,
-                                                                        long taskKey,
-                                                                        float[] packedCoords,
-                                                                        McDensityProgram program,
-                                                                        float[] auxValues,
-                                                                        int auxValueCount,
-                                                                        Supplier<float[]> cpuFallback) {
-        Objects.requireNonNull(program, "program");
-        return parallelMcDensityFunctions(modId, taskName, taskKey,
-            packedCoords, program.encoded(), program.instructionCount(), auxValues, auxValueCount, cpuFallback);
-    }
-
-    public static CompletableFuture<float[]> parallelMcDensityFunctions(String modId,
-                                                                        String taskName,
-                                                                        long taskKey,
-                                                                        float[] packedCoords,
-                                                                        float[] encodedProgram,
-                                                                        int instructionCount,
-                                                                        Supplier<float[]> cpuFallback) {
-        return parallelMcDensityFunctions(modId, taskName, taskKey,
-            packedCoords, encodedProgram, instructionCount, new float[0], 0, cpuFallback);
-    }
-
-    public static CompletableFuture<float[]> parallelMcDensityFunctions(String modId,
-                                                                        String taskName,
-                                                                        long taskKey,
-                                                                        float[] packedCoords,
-                                                                        float[] encodedProgram,
-                                                                        int instructionCount,
-                                                                        float[] auxValues,
-                                                                        int auxValueCount,
-                                                                        Supplier<float[]> cpuFallback) {
-        Objects.requireNonNull(packedCoords, "packedCoords");
-        Objects.requireNonNull(encodedProgram, "encodedProgram");
-        Objects.requireNonNull(auxValues, "auxValues");
-        Objects.requireNonNull(cpuFallback, "cpuFallback");
-        if (packedCoords.length % 3 != 0) {
-            throw new IllegalArgumentException("Packed coordinate array must be xyz triples");
-        }
-        if (instructionCount <= 0) {
-            throw new IllegalArgumentException("Instruction count must be positive: " + instructionCount);
-        }
-        if (encodedProgram.length < instructionCount * McDensityProgram.STRIDE) {
-            throw new IllegalArgumentException("Encoded program is shorter than instruction count: "
-                + encodedProgram.length + " floats for " + instructionCount + " instructions");
-        }
-        int sampleCount = packedCoords.length / 3;
-        if (auxValueCount < 0) {
-            throw new IllegalArgumentException("Aux value count must be non-negative: " + auxValueCount);
-        }
-        if (auxValues.length < auxValueCount * sampleCount) {
-            throw new IllegalArgumentException("Aux values are shorter than aux count: "
-                + auxValues.length + " floats for " + auxValueCount + " aux values and " + sampleCount + " samples");
-        }
-        long estimatedBytes = ((long) packedCoords.length + encodedProgram.length
-            + ((long) auxValueCount * sampleCount) + sampleCount) * Float.BYTES;
-        McDensityVulkanTask task = new McDensityVulkanTask(modId, taskName, taskKey,
-            packedCoords, encodedProgram, instructionCount, auxValues, auxValueCount, cpuFallback, null);
-        return TaskScheduler.submitComputeTask(
-            modId,
-            taskName,
-            taskKey,
-            cpuFallback,
-            task,
-            estimatedBytes,
-            Math.max(1, sampleCount),
-            TaskScheduler.TaskComplexity.MASSIVE,
-            TaskScheduler.TaskType.SPATIAL_ANALYSIS,
-            null,
-            true,
-            GpuBackendPreference.VULKAN_REQUIRED
-        );
     }
 
     private static TaskScheduler.TaskComplexity mapComplexity(Complexity complexity) {

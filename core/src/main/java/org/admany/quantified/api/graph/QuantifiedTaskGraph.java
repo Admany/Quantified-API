@@ -1,7 +1,8 @@
 package org.admany.quantified.api.graph;
 
+import org.admany.quantified.api.ExecutionPriority;
 import org.admany.quantified.api.QuantifiedAPI;
-import org.admany.quantified.api.builders.QuantifiedTaskBuilder;
+import org.admany.quantified.api.StableTaskKeys;
 
 import java.time.Duration;
 import java.util.Collection;
@@ -16,6 +17,10 @@ import java.util.function.Supplier;
 public final class QuantifiedTaskGraph {
 
     private QuantifiedTaskGraph() {
+    }
+
+    public static Builder builder(String modId, String graphName) {
+        return new Builder(modId, graphName, StableTaskKeys.of("graph", modId, graphName));
     }
 
     public static Builder builder(String modId, String graphName, long graphKey) {
@@ -33,12 +38,18 @@ public final class QuantifiedTaskGraph {
         Map<String, Object> dependencyResults();
     }
 
+    public enum ExecutionMode {
+        SCHEDULED,
+        WAVEFRONT
+    }
+
     public static final class Builder {
         private final String modId;
         private final String graphName;
-        private final long graphKey;
+        private long graphKey;
         private final LinkedHashMap<String, NodeHandle<?>> nodes = new LinkedHashMap<>();
         private String localityKey;
+        private ExecutionMode executionMode = ExecutionMode.SCHEDULED;
 
         private Builder(String modId, String graphName, long graphKey) {
             this.modId = Objects.requireNonNull(modId, "modId");
@@ -46,9 +57,36 @@ public final class QuantifiedTaskGraph {
             this.graphKey = graphKey;
         }
 
+        public Builder key(long graphKey) {
+            this.graphKey = graphKey;
+            return this;
+        }
+
+        public Builder key(String graphKey) {
+            this.graphKey = StableTaskKeys.named("graph", modId, graphName, graphKey);
+            return this;
+        }
+
         public Builder localityKey(String localityKey) {
             this.localityKey = localityKey;
             return this;
+        }
+
+        public Builder locality(String localityKey) {
+            return localityKey(localityKey);
+        }
+
+        public Builder executionMode(ExecutionMode executionMode) {
+            this.executionMode = Objects.requireNonNull(executionMode, "executionMode");
+            return this;
+        }
+
+        public Builder wavefront() {
+            return executionMode(ExecutionMode.WAVEFRONT);
+        }
+
+        public Builder scheduled() {
+            return executionMode(ExecutionMode.SCHEDULED);
         }
 
         public <T> NodeHandle<T> node(String name, Supplier<T> work) {
@@ -86,6 +124,10 @@ public final class QuantifiedTaskGraph {
             return localityKey;
         }
 
+        public ExecutionMode executionMode() {
+            return executionMode;
+        }
+
         public Collection<NodeHandle<?>> nodes() {
             return Collections.unmodifiableCollection(nodes.values());
         }
@@ -111,7 +153,7 @@ public final class QuantifiedTaskGraph {
         private final String name;
         private final NodeWork<T> work;
         private final LinkedHashSet<String> dependencyNames = new LinkedHashSet<>();
-        private QuantifiedTaskBuilder.Priority priority = QuantifiedTaskBuilder.Priority.AUTO;
+        private ExecutionPriority priority = ExecutionPriority.AUTO;
         private boolean threadSafe = true;
         private Duration timeout;
         private String batchKey;
@@ -142,9 +184,21 @@ public final class QuantifiedTaskGraph {
             return this;
         }
 
-        public NodeHandle<T> priority(QuantifiedTaskBuilder.Priority priority) {
+        public NodeHandle<T> priority(ExecutionPriority priority) {
             this.priority = Objects.requireNonNull(priority, "priority");
             return this;
+        }
+
+        public NodeHandle<T> foreground() {
+            return priority(ExecutionPriority.FOREGROUND);
+        }
+
+        public NodeHandle<T> background() {
+            return priority(ExecutionPriority.BACKGROUND);
+        }
+
+        public NodeHandle<T> critical() {
+            return priority(ExecutionPriority.CRITICAL);
         }
 
         public NodeHandle<T> timeout(Duration timeout) {
@@ -179,7 +233,7 @@ public final class QuantifiedTaskGraph {
             return Collections.unmodifiableSet(dependencyNames);
         }
 
-        public QuantifiedTaskBuilder.Priority priority() {
+        public ExecutionPriority priority() {
             return priority;
         }
 

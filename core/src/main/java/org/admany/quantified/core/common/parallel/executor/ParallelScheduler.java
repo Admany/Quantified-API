@@ -8,6 +8,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
 import org.admany.quantified.core.common.parallel.config.ParallelConfig;
+import org.admany.quantified.core.common.threading.core.WorkerClassLoaderContext;
 
 public final class ParallelScheduler {
     private static final Logger LOGGER = Logger.getLogger(ParallelScheduler.class.getName());
@@ -27,13 +28,13 @@ public final class ParallelScheduler {
                 if (current == null) {
                     SHARED = new ForkJoinPool(
                         desiredParallelism,
-                        pool -> {
+                        WorkerClassLoaderContext.wrapForkJoin(pool -> {
                             ForkJoinWorkerThread worker = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
                             worker.setName("quantified-parallel-" + COUNTER.incrementAndGet());
                             worker.setDaemon(true);
                             worker.setPriority(Thread.NORM_PRIORITY);
                             return worker;
-                        },
+                        }),
                         null,
                         true);
                     current = SHARED;

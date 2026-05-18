@@ -27,6 +27,7 @@ public final class ParallelCompute {
         private final long taskKey;
         private Supplier<List<S>> sliceSupplier = List::of;
         private Function<S, CompletableFuture<R>> sliceExecutor;
+        private Function<S, R> directSliceExecutor;
         private Function<List<R>, O> reducer;
         private Consumer<R> sliceListener;
         private ParallelFailurePolicy failurePolicy = ParallelFailurePolicy.FAIL_FAST;
@@ -46,11 +47,13 @@ public final class ParallelCompute {
 
         public Builder<S, R, O> sliceExecutor(Function<S, R> executor) {
             Objects.requireNonNull(executor, "executor");
+            this.directSliceExecutor = executor;
             this.sliceExecutor = slice -> CompletableFuture.completedFuture(executor.apply(slice));
             return this;
         }
 
         public Builder<S, R, O> asyncSliceExecutor(Function<S, CompletableFuture<R>> executor) {
+            this.directSliceExecutor = null;
             this.sliceExecutor = Objects.requireNonNull(executor, "executor");
             return this;
         }
@@ -178,6 +181,7 @@ public final class ParallelCompute {
                 taskKey,
                 supplier,
                 sliceExecutor,
+                directSliceExecutor,
                 finalReducer,
                 sliceListener,
                 failurePolicy,

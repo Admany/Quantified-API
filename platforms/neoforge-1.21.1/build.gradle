@@ -112,6 +112,7 @@ dependencies {
 
     vulkanProbeImplementation("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
     vulkanProbeCompileOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+    vulkanProbeRuntimeOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
     vulkanProbeRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${lwjglNatives}") { transitive = false }
 
     shaderCompilerImplementation("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }

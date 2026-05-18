@@ -6,7 +6,6 @@ import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
@@ -21,6 +20,7 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 import org.admany.quantified.core.common.cache.interfaces.ThreadSafeCache;
+import org.admany.quantified.core.common.threading.core.WorkerClassLoaderContext;
 import org.admany.quantified.core.common.util.QuantifiedPaths;
 
 public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
@@ -38,14 +38,12 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
     private final boolean compression;
     private static final long SAVE_DEBOUNCE_MS = Math.max(250L, Long.getLong("quantified.cache.save_debounce_ms", 1500L));
 
-    private static final ScheduledExecutorService IO_EXECUTOR = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
-        @Override
-        public Thread newThread(Runnable r) {
+    private static final ScheduledExecutorService IO_EXECUTOR = Executors.newSingleThreadScheduledExecutor(
+        WorkerClassLoaderContext.wrap(r -> {
             Thread t = new Thread(r, "quantified-cache-io");
             t.setDaemon(true);
             return t;
-        }
-    });
+        }));
 
     private static final ConcurrentMap<Path, Object> FILE_LOCKS = new ConcurrentHashMap<>();
 
@@ -99,12 +97,14 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
 
     @Override
     public void put(K key, V value) {
+        awaitInitialLoad();
         delegate.put(key, value);
         saveToDiskAsync();
     }
 
     @Override
     public void invalidate(K key) {
+        awaitInitialLoad();
         delegate.invalidate(key);
         saveToDiskAsync();
     }
@@ -249,30 +249,42 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
                     }
                 }
 
-                LOGGER.log(Level.FINE, "Loaded " + data.size() + " entries from disk cache for " + modId + "/" + cacheName);
+                LOGGER.log(Level.FINE, "Loaded {0} entries from disk cache for {1}/{2}",
+                    new Object[]{data.size(), modId, cacheName});
 
             } catch (EOFException | StreamCorruptedException | ZipException e) {
                 Path quarantined = quarantineCorruptCacheFile(e);
                 LOGGER.log(Level.WARNING,
-                    "Failed to load cache from disk (corrupt/truncated): " + cacheFile
-                        + (quarantined != null ? " (moved to " + quarantined + ")" : "")
-                        + ". Starting with empty cache. Cause=" + e.getClass().getSimpleName() + ": " + e.getMessage());
+                    "Failed to load cache from disk (corrupt/truncated): {0}{1}. Starting with empty cache. Cause={2}: {3}",
+                    new Object[]{
+                        cacheFile,
+                        quarantined != null ? " (moved to " + quarantined + ")" : "",
+                        e.getClass().getSimpleName(),
+                        e.getMessage()
+                    });
             } catch (IOException e) {
                 if (looksLikeTruncatedGzip(e)) {
                     Path quarantined = quarantineCorruptCacheFile(e);
                     LOGGER.log(Level.WARNING,
-                        "Failed to load cache from disk (corrupt/truncated): " + cacheFile
-                            + (quarantined != null ? " (moved to " + quarantined + ")" : "")
-                            + ". Starting with empty cache. Cause=" + e.getClass().getSimpleName() + ": " + e.getMessage());
+                        "Failed to load cache from disk (corrupt/truncated): {0}{1}. Starting with empty cache. Cause={2}: {3}",
+                        new Object[]{
+                            cacheFile,
+                            quarantined != null ? " (moved to " + quarantined + ")" : "",
+                            e.getClass().getSimpleName(),
+                            e.getMessage()
+                        });
                 } else {
-                    LOGGER.log(Level.WARNING, "Failed to load cache from disk: " + cacheFile + ". This may be due to serialization incompatibility.", e);
+                    LOGGER.log(Level.WARNING,
+                        String.format("Failed to load cache from disk: %s. This may be due to serialization incompatibility.", cacheFile), e);
                     quarantineCorruptCacheFile(e);
                 }
             } catch (ClassNotFoundException e) {
-                LOGGER.log(Level.WARNING, "Failed to load cache from disk: " + cacheFile + ". Missing class during deserialization.", e);
+                LOGGER.log(Level.WARNING,
+                    String.format("Failed to load cache from disk: %s. Missing class during deserialization.", cacheFile), e);
                 quarantineCorruptCacheFile(e);
             } catch (Exception e) {
-                LOGGER.log(Level.WARNING, "Failed to load cache from disk: " + cacheFile + ". This may be due to serialization incompatibility.", e);
+                LOGGER.log(Level.WARNING,
+                    String.format("Failed to load cache from disk: %s. This may be due to serialization incompatibility.", cacheFile), e);
                 quarantineCorruptCacheFile(e);
             }
         }
@@ -335,7 +347,8 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
                 }
 
                 if (serializableData.isEmpty()) {
-                    LOGGER.log(Level.FINE, "No serializable data to save for cache " + modId + "/" + cacheName);
+                    LOGGER.log(Level.FINE, "No serializable data to save for cache {0}/{1}",
+                        new Object[]{modId, cacheName});
                     return;
                 }
 
@@ -355,8 +368,8 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
 
                 moveTempIntoPlaceWithRetries(tmp, cacheFile);
 
-            } catch (Exception e) {
-                LOGGER.log(Level.WARNING, "Failed to save cache to disk: " + cacheFile, e);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, String.format("Failed to save cache to disk: %s", cacheFile), e);
             }
         }
     }
@@ -390,7 +403,7 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
                 last = e;
                 try {
                     Files.deleteIfExists(target);
-                } catch (Exception ignored) {
+                } catch (IOException ignored) {
                 }
             } catch (IOException e) {
                 last = e;
@@ -416,7 +429,7 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
         return msg.contains("Unexpected end of ZLIB input stream") || msg.contains("unexpected end of ZLIB input stream");
     }
 
-    private Path quarantineCorruptCacheFile(Exception e) {
+    private Path quarantineCorruptCacheFile(Exception cause) {
         try {
             if (!Files.exists(cacheFile)) {
                 return null;
@@ -425,12 +438,12 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
             Path quarantined = cacheFile.resolveSibling(cacheFile.getFileName().toString() + suffix);
             Files.move(cacheFile, quarantined, StandardCopyOption.REPLACE_EXISTING);
             return quarantined;
-        } catch (Exception ex) {
+        } catch (IOException ex) {
             try {
                 Files.deleteIfExists(cacheFile);
-            } catch (IOException ignored) {
+            } catch (IOException deleteError) {
             }
-            LOGGER.log(Level.FINE, "Failed to quarantine corrupted cache file: " + cacheFile, ex);
+            LOGGER.log(Level.FINE, String.format("Failed to quarantine corrupted cache file: %s", cacheFile), ex);
             return null;
         }
     }

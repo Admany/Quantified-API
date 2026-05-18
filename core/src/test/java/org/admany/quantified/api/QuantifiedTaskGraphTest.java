@@ -1,6 +1,5 @@
 package org.admany.quantified.api;
 
-import org.admany.quantified.api.builders.QuantifiedTaskBuilder;
 import org.admany.quantified.api.graph.QuantifiedTaskGraph;
 import org.admany.quantified.core.common.async.core.AsyncManager;
 import org.admany.quantified.core.common.async.core.AsyncManagerBootstrap;
@@ -12,8 +11,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -48,7 +49,7 @@ class QuantifiedTaskGraphTest {
         QuantifiedTaskGraph.NodeHandle<Integer> seed = graph.node("seed", () -> {
             executionOrder.add("seed");
             return 4;
-        }).priority(QuantifiedTaskBuilder.Priority.FOREGROUND);
+        }).priority(ExecutionPriority.FOREGROUND);
 
         QuantifiedTaskGraph.NodeHandle<Integer> doubled = graph.node("doubled", context -> {
             executionOrder.add("doubled");
@@ -93,6 +94,40 @@ class QuantifiedTaskGraphTest {
 
         assertThat(results.get("a")).isEqualTo(2);
         assertThat(results.get("b")).isEqualTo(7);
+    }
+
+    @Test
+    void wavefrontGraphResolvesDependenciesWithSingleGraphAdmission() {
+        ConcurrentHashMap<String, String> threads = new ConcurrentHashMap<>();
+        AtomicInteger executed = new AtomicInteger();
+
+        QuantifiedTaskGraph.Builder graph = QuantifiedAPI.graph("graph_test", "wavefront")
+            .localityKey("region-wave")
+            .wavefront();
+
+        QuantifiedTaskGraph.NodeHandle<Integer> a = graph.node("a", () -> {
+            threads.put("a", Thread.currentThread().getName());
+            executed.incrementAndGet();
+            return 2;
+        }).priority(ExecutionPriority.FOREGROUND);
+
+        QuantifiedTaskGraph.NodeHandle<Integer> b = graph.node("b", () -> {
+            threads.put("b", Thread.currentThread().getName());
+            executed.incrementAndGet();
+            return 3;
+        }).priority(ExecutionPriority.FOREGROUND);
+
+        QuantifiedTaskGraph.NodeHandle<Integer> sum = graph.node("sum", context -> {
+            threads.put("sum", Thread.currentThread().getName());
+            executed.incrementAndGet();
+            return context.result(a) + context.result(b);
+        }).dependsOn(a, b);
+
+        Integer result = graph.submit(sum).join();
+
+        assertThat(result).isEqualTo(5);
+        assertThat(executed.get()).isEqualTo(3);
+        assertThat(threads.keySet()).containsExactlyInAnyOrder("a", "b", "sum");
     }
 
     @Test

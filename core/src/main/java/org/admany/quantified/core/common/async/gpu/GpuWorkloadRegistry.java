@@ -74,10 +74,28 @@ public final class GpuWorkloadRegistry {
     }
 
     public static List<OpenCLTask<?>> collect(Collection<PriorityTask> tasks) {
-        return collectOpenCl(tasks);
+        return claimOpenCl(tasks);
     }
 
     public static List<OpenCLTask<?>> collectOpenCl(Collection<PriorityTask> tasks) {
+        return claimOpenCl(tasks);
+    }
+
+    public static List<OpenCLTask<?>> peekOpenCl(Collection<PriorityTask> tasks) {
+        List<OpenCLTask<?>> collected = new ArrayList<>(tasks.size());
+        for (PriorityTask task : tasks) {
+            RegisteredTask registeredTask = TASKS.get(task.taskKey());
+            OpenCLTask<?> gpuTask = registeredTask != null && registeredTask.backendType == GpuBackendType.OPENCL
+                ? (OpenCLTask<?>) registeredTask.task
+                : null;
+            if (gpuTask != null) {
+                collected.add(gpuTask);
+            }
+        }
+        return collected;
+    }
+
+    public static List<OpenCLTask<?>> claimOpenCl(Collection<PriorityTask> tasks) {
         List<OpenCLTask<?>> collected = new ArrayList<>(tasks.size());
         for (PriorityTask task : tasks) {
             OpenCLTask<?> gpuTask = take(task.taskKey());
@@ -89,6 +107,24 @@ public final class GpuWorkloadRegistry {
     }
 
     public static List<VulkanTask<?>> collectVulkan(Collection<PriorityTask> tasks) {
+        return claimVulkan(tasks);
+    }
+
+    public static List<VulkanTask<?>> peekVulkan(Collection<PriorityTask> tasks) {
+        List<VulkanTask<?>> collected = new ArrayList<>(tasks.size());
+        for (PriorityTask task : tasks) {
+            RegisteredTask registeredTask = TASKS.get(task.taskKey());
+            VulkanTask<?> gpuTask = registeredTask != null && registeredTask.backendType == GpuBackendType.VULKAN
+                ? (VulkanTask<?>) registeredTask.task
+                : null;
+            if (gpuTask != null) {
+                collected.add(gpuTask);
+            }
+        }
+        return collected;
+    }
+
+    public static List<VulkanTask<?>> claimVulkan(Collection<PriorityTask> tasks) {
         List<VulkanTask<?>> collected = new ArrayList<>(tasks.size());
         for (PriorityTask task : tasks) {
             VulkanTask<?> gpuTask = takeVulkan(task.taskKey());
