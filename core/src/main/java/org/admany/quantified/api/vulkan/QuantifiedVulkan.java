@@ -2,10 +2,10 @@ package org.admany.quantified.api.vulkan;
 
 import org.admany.quantified.api.compute.GpuBackendPreference;
 import org.admany.quantified.api.opencl.QuantifiedOpenCL;
+import org.admany.quantified.core.common.gpu.backend.VulkanExecutionSupport;
 import org.admany.quantified.core.common.util.TaskScheduler;
-import org.admany.quantified.core.common.vulkan.core.VulkanContext;
-import org.admany.quantified.core.common.vulkan.core.VulkanManager;
 
+import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
@@ -53,7 +53,11 @@ public final class QuantifiedVulkan {
     }
 
     public static boolean isGpuReady() {
-        return VulkanManager.isAvailable();
+        return VulkanExecutionSupport.hasExecutableRuntime();
+    }
+
+    public static String deviceName() {
+        return VulkanExecutionSupport.deviceName();
     }
 
     public static final class Builder<T> {
@@ -214,9 +218,8 @@ public final class QuantifiedVulkan {
         }
 
         public T executeOnGPU(Object context) throws Exception {
-            VulkanContext ctx = (VulkanContext) context;
             try {
-                return spec.workload().execute(new ApiContext(ctx));
+                return spec.workload().execute(new ApiContext(context));
             } catch (RuntimeException runtimeException) {
                 throw runtimeException;
             } catch (Exception exception) {
@@ -246,35 +249,63 @@ public final class QuantifiedVulkan {
     }
 
     private static final class ApiContext implements Context {
-        private final VulkanContext delegate;
+        private final Object delegate;
+        private final Method vectorAdd;
+        private final Method matrixMultiply;
+        private final Method monteCarloPi;
+        private final Method terrainGeneration;
+        private final Method deviceName;
 
-        private ApiContext(VulkanContext delegate) {
-            this.delegate = delegate;
+        private ApiContext(Object delegate) {
+            this.delegate = Objects.requireNonNull(delegate, "delegate");
+            Class<?> type = delegate.getClass();
+            this.vectorAdd = method(type, "vectorAdd", float[].class, float[].class);
+            this.matrixMultiply = method(type, "matrixMultiply", float[][].class, float[][].class);
+            this.monteCarloPi = method(type, "monteCarloPi", int.class);
+            this.terrainGeneration = method(type, "terrainGeneration", float[].class);
+            this.deviceName = method(type, "deviceName");
         }
 
         @Override
         public float[] vectorAdd(float[] a, float[] b) {
-            return delegate.vectorAdd(a, b);
+            return invoke(vectorAdd, float[].class, a, b);
         }
 
         @Override
         public float[][] matrixMultiply(float[][] a, float[][] b) {
-            return delegate.matrixMultiply(a, b);
+            return invoke(matrixMultiply, float[][].class, a, b);
         }
 
         @Override
         public double monteCarloPi(int samples) {
-            return delegate.monteCarloPi(samples);
+            return invoke(monteCarloPi, Double.class, samples);
         }
 
         @Override
         public float[] terrainGeneration(float[] inputCoords) {
-            return delegate.terrainGeneration(inputCoords);
+            return invoke(terrainGeneration, float[].class, inputCoords);
         }
 
         @Override
         public String deviceName() {
-            return delegate.deviceName();
+            return invoke(deviceName, String.class);
+        }
+
+        private static Method method(Class<?> type, String name, Class<?>... parameterTypes) {
+            try {
+                return type.getMethod(name, parameterTypes);
+            } catch (NoSuchMethodException exception) {
+                throw new IllegalStateException("Vulkan context missing method " + name, exception);
+            }
+        }
+
+        private <R> R invoke(Method method, Class<R> resultType, Object... args) {
+            try {
+                Object result = method.invoke(delegate, args);
+                return resultType.cast(result);
+            } catch (ReflectiveOperationException exception) {
+                throw new IllegalStateException("Vulkan context call failed: " + method.getName(), exception);
+            }
         }
     }
 
@@ -284,7 +315,7 @@ public final class QuantifiedVulkan {
         if (a.length != b.length) {
             throw new IllegalArgumentException("Vector lengths must match: " + a.length + " vs " + b.length);
         }
-        if (!VulkanManager.isAvailable()) {
+        if (!VulkanExecutionSupport.hasExecutableRuntime()) {
             return QuantifiedOpenCL.parallelVectorAdd(modId, taskName, taskKey, a, b);
         }
         return QuantifiedVulkan.<float[]>builder(modId, taskName, taskKey)
@@ -324,7 +355,7 @@ public final class QuantifiedVulkan {
         if (a.length == 0 || b.length == 0 || a[0].length != b.length) {
             throw new IllegalArgumentException("Invalid matrix dimensions for multiplication");
         }
-        if (!VulkanManager.isAvailable()) {
+        if (!VulkanExecutionSupport.hasExecutableRuntime()) {
             return QuantifiedOpenCL.parallelMatrixMultiply(modId, taskName, taskKey, a, b);
         }
         int m = a.length;
@@ -371,7 +402,7 @@ public final class QuantifiedVulkan {
         if (samples <= 0) {
             throw new IllegalArgumentException("Samples must be positive: " + samples);
         }
-        if (!VulkanManager.isAvailable()) {
+        if (!VulkanExecutionSupport.hasExecutableRuntime()) {
             return QuantifiedOpenCL.parallelMonteCarloPi(modId, taskName, taskKey, samples);
         }
         return QuantifiedVulkan.<Double>builder(modId, taskName, taskKey)

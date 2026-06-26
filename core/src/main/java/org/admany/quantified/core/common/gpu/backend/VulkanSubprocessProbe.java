@@ -9,14 +9,11 @@ import org.admany.quantified.core.common.util.QuantifiedPaths;
 import org.slf4j.Logger;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.net.URL;
-import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -28,6 +25,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.zip.GZIPInputStream;
 
 final class VulkanSubprocessProbe {
 
@@ -53,6 +51,7 @@ final class VulkanSubprocessProbe {
             LwjglRuntimeTuning.ensureConfigured();
             List<String> command = new ArrayList<>();
             command.add(javaExecutable);
+            LwjglRuntimeTuning.addModernJvmCompatArgs(command);
             command.add("-Xms16m");
             command.add("-Xmx" + PROBE_HEAP_MAX);
             command.add("-XX:MaxDirectMemorySize=" + PROBE_DIRECT_MEMORY_MAX);
@@ -60,14 +59,7 @@ final class VulkanSubprocessProbe {
             command.add("-Dorg.lwjgl.system.stackSize=" + PROBE_LWJGL_STACK_KB);
             command.add("-Dquantified.lwjgl.stackSizeKb=" + PROBE_LWJGL_STACK_KB);
             command.add("-Dquantified.lwjgl.stackSizeBytes=" + PROBE_LWJGL_STACK_BYTES);
-            addSystemPropertyArg(command, "java.library.path");
-            String lwjglLibraryPath = System.getProperty("org.lwjgl.librarypath");
-            if (lwjglLibraryPath != null && !lwjglLibraryPath.isBlank()) {
-                command.add("-Dorg.lwjgl.librarypath=" + lwjglLibraryPath);
-                command.add("-Dorg.lwjgl.system.SharedLibraryExtractPath=" + lwjglLibraryPath);
-            } else {
-                addSystemPropertyArg(command, "org.lwjgl.system.SharedLibraryExtractPath");
-            }
+            LwjglRuntimeTuning.addIsolatedProbeNativeExtractPath(command, probeBundle.rootDir());
             command.add("-cp");
             command.add(probeBundle.classpath());
             command.add(PROBE_ENTRYPOINT);
@@ -111,7 +103,6 @@ final class VulkanSubprocessProbe {
     private static ExtractedProbeBundle extractProbeBundle() throws IOException {
         Path bundleRoot = QuantifiedPaths.getCacheDir().resolve("tools").resolve("vulkanProbe");
         Files.createDirectories(bundleRoot);
-        Path currentRuntimePath = currentRuntimePath();
         List<String> relativeEntries = readClasspathIndex();
         if (relativeEntries.isEmpty()) {
             throw new IOException("Embedded Vulkan probe classpath index missing or empty: " + PROBE_INDEX_RESOURCE);
@@ -119,126 +110,21 @@ final class VulkanSubprocessProbe {
         List<Path> extractedEntries = new ArrayList<>(relativeEntries.size());
         for (String relativeEntry : relativeEntries) {
             Path destination = bundleRoot.resolve(relativeEntry.replace('/', File.separatorChar));
-            Files.createDirectories(destination.getParent());
+                Files.createDirectories(destination.getParent());
             String resourcePath = PROBE_ROOT_RESOURCE + "/" + relativeEntry + PROBE_RESOURCE_SUFFIX;
             try (InputStream stream = VulkanSubprocessProbe.class.getClassLoader().getResourceAsStream(resourcePath)) {
                 if (stream == null) {
                     throw new IOException("Embedded Vulkan probe resource missing: " + resourcePath);
                 }
-                Files.copy(stream, destination, StandardCopyOption.REPLACE_EXISTING);
+                extractEmbeddedBinary(stream, destination);
             }
             extractedEntries.add(destination);
         }
-        List<String> classpathEntries = new ArrayList<>(extractedEntries.size() + 1);
-        classpathEntries.add(currentRuntimePath.toAbsolutePath().toString());
-        classpathEntries.addAll(extractedEntries.stream()
+        String classpath = extractedEntries.stream()
             .map(path -> path.toAbsolutePath().toString())
-            .toList());
-        String classpath = classpathEntries.stream()
             .reduce((left, right) -> left + File.pathSeparator + right)
             .orElseThrow(() -> new IOException("Failed to build Vulkan probe classpath"));
         return new ExtractedProbeBundle(bundleRoot, classpath);
-    }
-
-    private static Path currentRuntimePath() throws IOException {
-        List<String> attempted = new ArrayList<>();
-        try {
-            URL codeSource = VulkanSubprocessProbe.class.getProtectionDomain().getCodeSource() != null
-                ? VulkanSubprocessProbe.class.getProtectionDomain().getCodeSource().getLocation()
-                : null;
-            Path fromCodeSource = resolveRuntimeLocation(codeSource, attempted);
-            if (fromCodeSource != null) {
-                return fromCodeSource;
-            }
-        } catch (URISyntaxException exception) {
-            attempted.add("codesource-uri-error:" + exception.getMessage());
-        }
-        try {
-            Path fromVkResource = resolveRuntimeLocation(
-                VulkanSubprocessProbe.class.getClassLoader().getResource("org/lwjgl/vulkan/VK.class"),
-                attempted);
-            if (fromVkResource != null) {
-                return fromVkResource;
-            }
-        } catch (URISyntaxException exception) {
-            attempted.add("vk-resource-uri-error:" + exception.getMessage());
-        }
-        try {
-            Path fromSelfResource = resolveRuntimeLocation(
-                VulkanSubprocessProbe.class.getResource("VulkanSubprocessProbe.class"),
-                attempted);
-            if (fromSelfResource != null) {
-                return fromSelfResource;
-            }
-        } catch (URISyntaxException exception) {
-            attempted.add("self-resource-uri-error:" + exception.getMessage());
-        }
-        throw new IOException("Failed to resolve current Quantified runtime location from " + attempted);
-    }
-
-    private static Path resolveRuntimeLocation(URL location, List<String> attempted) throws URISyntaxException {
-        if (location == null) {
-            attempted.add("<null>");
-            return null;
-        }
-        String raw = URLDecoder.decode(location.toString(), StandardCharsets.UTF_8);
-        attempted.add(raw);
-
-        String trimmed = trimToArchive(raw);
-        if (trimmed.startsWith("jar:")) {
-            trimmed = trimmed.substring(4);
-        }
-        if (trimmed.startsWith("union:")) {
-            trimmed = trimmed.substring(6);
-        }
-
-        Path candidate = tryPathFromLocation(trimmed);
-        if (candidate != null && Files.exists(candidate)) {
-            return candidate;
-        }
-        attempted.add("missing:" + trimmed);
-        return null;
-    }
-
-    private static String trimToArchive(String raw) {
-        String value = raw;
-        int bang = value.indexOf('!');
-        if (bang >= 0) {
-            value = value.substring(0, bang);
-        }
-        int jarIndex = value.toLowerCase(Locale.ROOT).indexOf(".jar");
-        if (jarIndex >= 0) {
-            value = value.substring(0, jarIndex + 4);
-        }
-        int hashIndex = value.indexOf('#');
-        if (hashIndex >= 0 && value.toLowerCase(Locale.ROOT).contains(".jar#")) {
-            value = value.substring(0, hashIndex);
-        }
-        return value;
-    }
-
-    private static Path tryPathFromLocation(String location) throws URISyntaxException {
-        if (location == null || location.isBlank()) {
-            return null;
-        }
-        if (location.startsWith("file:")) {
-            String filePath = location.substring("file:".length()).replace('/', File.separatorChar);
-            if (filePath.length() >= 3
-                && filePath.charAt(0) == File.separatorChar
-                && Character.isLetter(filePath.charAt(1))
-                && filePath.charAt(2) == ':') {
-                filePath = filePath.substring(1);
-            }
-            return Path.of(filePath).normalize();
-        }
-        String normalized = location.replace('/', File.separatorChar);
-        if (normalized.length() >= 3
-            && normalized.charAt(0) == File.separatorChar
-            && Character.isLetter(normalized.charAt(1))
-            && normalized.charAt(2) == ':') {
-            normalized = normalized.substring(1);
-        }
-        return Path.of(normalized).normalize();
     }
 
     private static List<String> readClasspathIndex() throws IOException {
@@ -262,14 +148,6 @@ final class VulkanSubprocessProbe {
         return ProcessHandle.current().info().command()
             .orElseGet(() -> System.getProperty("java.home") + System.getProperty("file.separator") + "bin"
                 + System.getProperty("file.separator") + "java");
-    }
-
-    private static void addSystemPropertyArg(List<String> command, String propertyName) {
-        String value = System.getProperty(propertyName);
-        if (value == null || value.isBlank()) {
-            return;
-        }
-        command.add("-D" + propertyName + "=" + value);
     }
 
     private static Thread startStdoutReader(Logger logger,
@@ -303,6 +181,17 @@ final class VulkanSubprocessProbe {
         } catch (InterruptedException interruptedException) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    private static void extractEmbeddedBinary(InputStream stream, Path destination) throws IOException {
+        byte[] payload = stream.readAllBytes();
+        if (payload.length >= 2 && (payload[0] & 0xFF) == 0x1F && (payload[1] & 0xFF) == 0x8B) {
+            try (GZIPInputStream gzip = new GZIPInputStream(new ByteArrayInputStream(payload))) {
+                Files.copy(gzip, destination, StandardCopyOption.REPLACE_EXISTING);
+            }
+            return;
+        }
+        Files.write(destination, payload);
     }
 
     private static String joinOutput(List<String> outputLines) {

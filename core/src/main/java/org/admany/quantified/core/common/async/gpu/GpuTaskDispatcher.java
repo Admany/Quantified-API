@@ -29,6 +29,10 @@ public final class GpuTaskDispatcher {
     private static final long MIN_FLUSH_DELAY_MILLIS = 1L;
     private static final long MAX_BATCH_AGE_NANOS = TimeUnit.MILLISECONDS.toNanos(5L);
     private static final AtomicLong BATCH_SEQUENCE = new AtomicLong(Long.MIN_VALUE);
+    private static final AtomicLong NEXT_GPU_REQUIRED_FALLBACK_WARNING_MS = new AtomicLong();
+    private static final AtomicLong NEXT_GPU_BATCH_FAILURE_WARNING_MS = new AtomicLong();
+    private static final long GPU_REQUIRED_FALLBACK_WARNING_INTERVAL_MS = 30000L;
+    private static final long GPU_BATCH_FAILURE_WARNING_INTERVAL_MS = 30000L;
 
     private final PriorityScheduler scheduler;
     private final ScheduledExecutorService flushExecutor;
@@ -231,10 +235,21 @@ public final class GpuTaskDispatcher {
             GpuBatchTelemetry.recordFallback();
             GpuBatchTelemetry.recordFallbackExecutionFailure();
             if (metadata.gpuRequired()) {
-                LOGGER.warning("GPU-required batch falling back to CPU due to unavailable workload or runtime");
+                warnGpuRequiredFallbackOncePerWindow();
             }
             failGpuTasks(tasks);
             rerouteTasksToCpu(tasks);
+        }
+    }
+
+    private static void warnGpuRequiredFallbackOncePerWindow() {
+        long now = System.currentTimeMillis();
+        long nextAllowed = NEXT_GPU_REQUIRED_FALLBACK_WARNING_MS.get();
+        if (now < nextAllowed) {
+            return;
+        }
+        if (NEXT_GPU_REQUIRED_FALLBACK_WARNING_MS.compareAndSet(nextAllowed, now + GPU_REQUIRED_FALLBACK_WARNING_INTERVAL_MS)) {
+            LOGGER.warning("GPU-required batch falling back to CPU due to unavailable workload or runtime");
         }
     }
 
@@ -286,8 +301,19 @@ public final class GpuTaskDispatcher {
             gpuFuture.join();
             return true;
         } catch (Throwable throwable) {
-            LOGGER.log(Level.WARNING, "GPU batch execution failed; reverting to CPU", throwable);
+            warnGpuBatchFailureOncePerWindow(throwable);
             return false;
+        }
+    }
+
+    private static void warnGpuBatchFailureOncePerWindow(Throwable throwable) {
+        long now = System.currentTimeMillis();
+        long nextAllowed = NEXT_GPU_BATCH_FAILURE_WARNING_MS.get();
+        if (now < nextAllowed) {
+            return;
+        }
+        if (NEXT_GPU_BATCH_FAILURE_WARNING_MS.compareAndSet(nextAllowed, now + GPU_BATCH_FAILURE_WARNING_INTERVAL_MS)) {
+            LOGGER.log(Level.WARNING, "GPU batch execution failed; reverting to CPU", throwable);
         }
     }
 

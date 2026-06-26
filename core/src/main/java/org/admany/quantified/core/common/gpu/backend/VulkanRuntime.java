@@ -12,9 +12,16 @@ public final class VulkanRuntime {
     private static final Logger LOGGER = LoggerFactory.getLogger(VulkanRuntime.class);
     private static final AtomicReference<AvailabilitySnapshot> SNAPSHOT = new AtomicReference<>();
     private static final AtomicReference<Boolean> BINDINGS_PRESENT = new AtomicReference<>();
+    private static final AtomicReference<Boolean> PROBE_RUNTIME_PRESENT = new AtomicReference<>();
     private static final AtomicInteger PROBE_SEQUENCE = new AtomicInteger(0);
 
     private VulkanRuntime() {
+    }
+
+    public enum RuntimeMode {
+        NONE,
+        IN_PROCESS,
+        ISOLATED
     }
 
     public static AvailabilitySnapshot snapshot() {
@@ -29,6 +36,10 @@ public final class VulkanRuntime {
         return new AvailabilitySnapshot(false, false, false, 0, 0, "Vulkan probe not yet run", List.of());
     }
 
+    public static AvailabilitySnapshot cachedSnapshot() {
+        return SNAPSHOT.get();
+    }
+
     public static boolean hasBindings() {
         Boolean cached = BINDINGS_PRESENT.get();
         if (cached != null) {
@@ -37,6 +48,26 @@ public final class VulkanRuntime {
         boolean present = detectBindingsPresent();
         BINDINGS_PRESENT.compareAndSet(null, present);
         return present;
+    }
+
+    public static boolean hasProbeRuntime() {
+        Boolean cached = PROBE_RUNTIME_PRESENT.get();
+        if (cached != null) {
+            return cached;
+        }
+        boolean present = hasBindings() || hasEmbeddedProbeBundle();
+        PROBE_RUNTIME_PRESENT.compareAndSet(null, present);
+        return present;
+    }
+
+    public static RuntimeMode runtimeMode() {
+        if (hasBindings()) {
+            return RuntimeMode.IN_PROCESS;
+        }
+        if (hasEmbeddedProbeBundle()) {
+            return RuntimeMode.ISOLATED;
+        }
+        return RuntimeMode.NONE;
     }
 
     /**
@@ -67,8 +98,10 @@ public final class VulkanRuntime {
         LOGGER.info(prefix(probeId) + "Probe start on thread '" + Thread.currentThread().getName()
             + "' LWJGL-stack=" + (lwjglStackBytes / (1024 * 1024)) + " MiB");
         logProbeEnvironment(probeId, lwjglStackBytes);
-        if (!hasBindings()) {
-            return new AvailabilitySnapshot(false, false, false, 0, 0, "LWJGL Vulkan binding not present", List.of());
+        boolean inProcessBindingsPresent = hasBindings();
+        if (!inProcessBindingsPresent && !hasEmbeddedProbeBundle()) {
+            return new AvailabilitySnapshot(false, false, false, 0, 0,
+                "LWJGL Vulkan binding not present and embedded Vulkan probe bundle is missing", List.of());
         }
 
         VulkanSubprocessProbe.Result result = VulkanSubprocessProbe.run(LOGGER, probeId);
@@ -82,6 +115,12 @@ public final class VulkanRuntime {
                 device.softwareAdapter()))
             .toList();
         if (result.ok()) {
+            if (!inProcessBindingsPresent) {
+                String reason = "Isolated Vulkan probe succeeded; in-process LWJGL Vulkan binding is not present, so execution will use the isolated bundled runtime";
+                LOGGER.info(prefix(probeId) + reason);
+                return new AvailabilitySnapshot(false, true, false,
+                    result.maxApiVersion(), result.selectedApiVersion(), reason, devices);
+            }
             String conservativeBlockReason = conservativeBlockReason(devices);
             if (conservativeBlockReason != null) {
                 LOGGER.warn(prefix(probeId) + conservativeBlockReason);
@@ -97,7 +136,7 @@ public final class VulkanRuntime {
             ? result.failureReason()
             : "Isolated Vulkan probe failed";
         LOGGER.warn(prefix(probeId) + reason);
-        return new AvailabilitySnapshot(true, true, false,
+        return new AvailabilitySnapshot(inProcessBindingsPresent, true, false,
             result.maxApiVersion(), result.selectedApiVersion(), reason, devices);
     }
 
@@ -178,6 +217,12 @@ public final class VulkanRuntime {
         } catch (Throwable ignored) {
             return false;
         }
+    }
+
+    private static boolean hasEmbeddedProbeBundle() {
+        ClassLoader loader = VulkanRuntime.class.getClassLoader();
+        return loader.getResource("quantified/embedded/vulkanProbe/classpath.index") != null
+            && loader.getResource("quantified/embedded/vulkanProbe/quantified-vulkan-probe.jar.bin") != null;
     }
 
     public static final class AvailabilitySnapshot {

@@ -11,6 +11,10 @@ public final class ApiVulkanTaskWrapper<T> extends VulkanTask<T> {
         this.apiTask = apiTask;
     }
 
+    public QuantifiedVulkan.ApiVulkanTask<T> apiTask() {
+        return apiTask;
+    }
+
     @Override
     public long estimatedVramBytes() {
         return apiTask.estimatedVramBytes();

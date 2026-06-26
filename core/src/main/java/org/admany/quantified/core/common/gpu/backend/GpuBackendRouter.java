@@ -62,12 +62,12 @@ public final class GpuBackendRouter {
         );
     }
 
-    static Selection selectBackend(String modId,
-                                   GpuBackendPreference taskPreference,
-                                   boolean openclSupported,
-                                   boolean openclAvailable,
-                                   boolean vulkanSupported,
-                                   boolean vulkanAvailable) {
+    public static Selection selectBackend(String modId,
+                                          GpuBackendPreference taskPreference,
+                                          boolean openclSupported,
+                                          boolean openclAvailable,
+                                          boolean vulkanSupported,
+                                          boolean vulkanAvailable) {
         GpuBackendPreference effective = resolvePreference(modId, taskPreference);
         if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
             return new Selection(effective, GpuBackendType.CPU);

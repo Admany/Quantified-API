@@ -2,6 +2,7 @@ package org.admany.quantified.core.common.async.gpu;
 
 import org.admany.quantified.core.common.async.task.PriorityTask;
 import org.admany.quantified.core.common.async.task.TaskMetadata;
+import org.admany.quantified.core.common.gpu.backend.VulkanExecutionSupport;
 import org.admany.quantified.core.common.vulkan.core.VulkanManager;
 import org.admany.quantified.core.common.vulkan.core.VulkanTask;
 
@@ -24,6 +25,9 @@ public final class VulkanBatchWorkload implements TaskMetadata.GpuBatchWorkload 
     @Override
     public CompletableFuture<Void> submit(String modId, List<PriorityTask> tasks, TaskMetadata metadata) {
         Objects.requireNonNull(tasks, "tasks");
+        if (!VulkanExecutionSupport.inProcessAvailable()) {
+            return null;
+        }
         List<VulkanTask<?>> gpuTasks = GpuWorkloadRegistry.peekVulkan(tasks);
         if (gpuTasks.isEmpty()) {
             return null;

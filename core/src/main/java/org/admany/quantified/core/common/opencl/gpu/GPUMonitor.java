@@ -84,6 +84,10 @@ public final class GPUMonitor {
         return getInstance().taskTracker.estimatedActiveVramBytes();
     }
 
+    public int activeComputeUnits() {
+        return getInstance().taskTracker.getActiveComputeUnits();
+    }
+
     public synchronized void configure(long detectedVramBytes, int detectedComputeUnits, String deviceName) {
         memoryManager.configureVram(detectedVramBytes);
         if (detectedComputeUnits > 0) {

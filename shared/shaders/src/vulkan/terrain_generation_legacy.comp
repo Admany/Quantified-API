@@ -1,0 +1,32 @@
+#version 450
+#pragma STDGL no_contraction
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(std430, set = 0, binding = 0) readonly buffer InCoords { float inputCoords[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer OutFeatures { float outputFeatures[]; };
+layout(push_constant) uniform Push { int count; } pushData;
+
+uint mixBits(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uint(pushData.count)) {
+        return;
+    }
+
+    uint seed = floatBitsToUint(inputCoords[id]) ^ (id * 0x9e3779b9u);
+    seed = mixBits(seed);
+
+    uint base = id * 4u;
+    outputFeatures[base] = float(seed & 0x00ffffffu) * (1.0 / 16777215.0);
+    outputFeatures[base + 1u] = (float((seed >> 24u) & 0x0fu) - 7.0) * 0.5;
+    outputFeatures[base + 2u] = float((seed >> 20u) & 0x07u);
+    outputFeatures[base + 3u] = float((seed >> 16u) & 0x0fu);
+}

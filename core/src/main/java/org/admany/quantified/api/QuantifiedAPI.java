@@ -10,10 +10,13 @@ import org.admany.quantified.api.model.QuantifiedPacket;
 import org.admany.quantified.api.model.QuantifiedTask;
 import org.admany.quantified.api.util.ForgeMetadataUtil;
 import org.admany.quantified.api.util.ModMetadataResolver;
+import org.admany.quantified.api.parallel.ParallelCompute;
 import org.admany.quantified.core.common.gpu.backend.GpuBackendRouter;
 import org.admany.quantified.core.common.platform.QuantifiedCoreRuntime;
 import org.admany.quantified.core.common.util.ConnectedModImpl;
+import org.admany.quantified.core.compat.LegacyApiRegistry;
 
+import java.time.Duration;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -36,16 +39,41 @@ public final class QuantifiedAPI {
     private static final List<ModConnectionListener> connectionListeners = new CopyOnWriteArrayList<>();
 
     public static boolean register(String modId) {
+        return register(modId, true);
+    }
+
+    /**
+     * Registers a mod against Quantified API v2 and opts it out of the legacy fallback notice.
+     */
+    public static boolean registerV2(String modId) {
+        if (modId != null && !modId.isBlank()) {
+            LegacyApiRegistry.markV2(modId, modId);
+        }
+        return register(modId, false);
+    }
+
+    public static boolean registerV2(String modId, String displayName, String version) {
+        if (modId != null && !modId.isBlank()) {
+            LegacyApiRegistry.markV2(modId, displayName);
+        }
+        return register(modId, displayName, version, false);
+    }
+
+    private static boolean register(String modId, boolean legacySurface) {
         ModMetadataResolver.ResolvedMod resolved = ModMetadataResolver.resolveByModId(modId);
         if (resolved != null) {
-            return register(resolved.modId(), resolved.displayName(), resolved.version());
+            return register(resolved.modId(), resolved.displayName(), resolved.version(), legacySurface);
         }
         String displayName = ForgeMetadataUtil.getModDisplayNameFromForge(modId);
         String version = ForgeMetadataUtil.getModVersionFromForge(modId);
-        return register(modId, displayName, version);
+        return register(modId, displayName, version, legacySurface);
     }
 
     public static boolean register(String modId, String displayName, String version) {
+        return register(modId, displayName, version, true);
+    }
+
+    private static boolean register(String modId, String displayName, String version, boolean legacySurface) {
         if (modId == null || modId.isBlank()) {
             throw new IllegalArgumentException("modId must not be blank");
         }
@@ -112,12 +140,25 @@ public final class QuantifiedAPI {
             }
         }
 
+        if (legacySurface && shouldTrackLegacyBinding(modId)) {
+            LegacyApiRegistry.markLegacyRegistration(modId, resolvedDisplayName, "register()");
+        }
+
         return true;
     }
 
     @Deprecated
     public static void init(String modId, String version) {
-        register(modId, modId, version);
+        if (shouldTrackLegacyBinding(modId)) {
+            LegacyApiRegistry.markLegacyRegistration(modId, modId, "init()");
+        }
+        register(modId, modId, version, true);
+    }
+
+    private static boolean shouldTrackLegacyBinding(String modId) {
+        return modId != null
+            && !modId.isBlank()
+            && !QuantifiedCoreRuntime.MODID.equals(modId);
     }
 
     public static CompletableFuture<Void> sendPacket(String channelName, QuantifiedPacket packet) {
@@ -186,6 +227,137 @@ public final class QuantifiedAPI {
                 work.run();
                 return null;
             });
+    }
+
+    /**
+     * Legacy v1.x task submit. Prefer {@link #compute(String)} or {@link ComputeRequest#submit(Supplier)}.
+     */
+    public static <T> CompletableFuture<T> submit(String taskName, Supplier<T> supplier) {
+        Objects.requireNonNull(supplier, "supplier");
+        trackLegacyApiCall("submit(String)");
+        QuantifiedHandle handle = getHandle();
+        return submitTaskInternal(QuantifiedTask.builder(handle.modId(), taskName, supplier).build());
+    }
+
+    /**
+     * Legacy v1.x task submit. Prefer {@link ComputeRequest#submit(Supplier)}.
+     */
+    public static <T> CompletableFuture<T> submit(QuantifiedTask.Builder<T> builder) {
+        Objects.requireNonNull(builder, "builder");
+        trackLegacyApiCall(builder.modId(), "submit(Builder)");
+        return submitTaskInternal(builder.build());
+    }
+
+    /**
+     * Legacy v1.x parallel submit. Prefer {@link ParallelRequest}.
+     */
+    public static <S, R, O> CompletableFuture<O> submitParallel(ParallelCompute.Builder<S, R, O> builder) {
+        Objects.requireNonNull(builder, "builder");
+        trackLegacyApiCall("submitParallel");
+        return builder.submit();
+    }
+
+    /**
+     * Legacy v1.x cache read. Prefer {@link CacheRequest#get(String, Supplier)}.
+     */
+    public static <T> T getCached(String cacheName, String key, Supplier<T> loader) {
+        trackLegacyApiCall("getCached");
+        return cache(cacheName).get(key, loader);
+    }
+
+    /**
+     * Legacy v1.x cache read. Prefer {@link CacheRequest#get(String, Supplier)}.
+     */
+    public static <T> T getCached(
+        String cacheName,
+        String key,
+        Supplier<T> loader,
+        Duration ttl,
+        long maximumSize,
+        boolean persistence
+    ) {
+        trackLegacyApiCall("getCached");
+        return configureLegacyCache(cacheName, ttl, maximumSize, persistence).get(key, loader);
+    }
+
+    /**
+     * Legacy v1.x async cache read. Prefer {@link CacheRequest#getAsync(String, Supplier)}.
+     */
+    public static <T> CompletableFuture<T> getCachedAsync(String cacheName, String key, Supplier<T> loader) {
+        trackLegacyApiCall("getCachedAsync");
+        return cache(cacheName).getAsync(key, loader);
+    }
+
+    /**
+     * Legacy v1.x async cache read. Prefer {@link CacheRequest#getAsync(String, Supplier)}.
+     */
+    public static <T> CompletableFuture<T> getCachedAsync(
+        String cacheName,
+        String key,
+        Supplier<T> loader,
+        Duration ttl,
+        long maximumSize,
+        boolean persistence
+    ) {
+        trackLegacyApiCall("getCachedAsync");
+        return configureLegacyCache(cacheName, ttl, maximumSize, persistence).getAsync(key, loader);
+    }
+
+    /**
+     * Legacy v1.x cache write. Prefer {@link CacheRequest#put(String, Object)}.
+     */
+    public static <T> void putCached(String cacheName, String key, T value) {
+        trackLegacyApiCall("putCached");
+        cache(cacheName).put(key, value);
+    }
+
+    /**
+     * Legacy v1.x cache write. Prefer {@link CacheRequest#put(String, Object)}.
+     */
+    public static <T> void putCached(
+        String cacheName,
+        String key,
+        T value,
+        Duration ttl,
+        long maximumSize,
+        boolean persistence
+    ) {
+        trackLegacyApiCall("putCached");
+        configureLegacyCache(cacheName, ttl, maximumSize, persistence).put(key, value);
+    }
+
+    private static CacheRequest configureLegacyCache(
+        String cacheName,
+        Duration ttl,
+        long maximumSize,
+        boolean persistence
+    ) {
+        CacheRequest request = cache(cacheName);
+        if (ttl != null) {
+            request.ttl(ttl);
+        }
+        if (maximumSize > 0) {
+            request.maxEntries(maximumSize);
+        }
+        if (persistence) {
+            request.persistent();
+        } else {
+            request.memoryOnly();
+        }
+        return request;
+    }
+
+    private static void trackLegacyApiCall(String reason) {
+        try {
+            trackLegacyApiCall(getHandle().modId(), reason);
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    private static void trackLegacyApiCall(String modId, String reason) {
+        if (shouldTrackLegacyBinding(modId)) {
+            LegacyApiRegistry.markLegacyRegistration(modId, modId, reason);
+        }
     }
 
     public static <T> void forEach(String taskName, java.util.Collection<T> values, java.util.function.Consumer<T> consumer) {

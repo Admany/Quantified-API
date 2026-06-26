@@ -236,11 +236,11 @@ final class TaskGraphExecutor {
             if (terminalIndex == null) {
                 return CompletableFuture.failedFuture(new IllegalArgumentException("Unknown terminal node: " + terminalName));
             }
-            return submitScheduledTask().thenApply(ignored -> cast(orderedNodes[terminalIndex].value));
+            return submitScheduledTask().thenApply(results -> cast(results.get(terminalName)));
         }
 
         private CompletableFuture<Map<String, Object>> startAll() {
-            return submitScheduledTask().thenApply(ignored -> snapshotResults());
+            return submitScheduledTask();
         }
 
         private <T> CompletableFuture<T> startTerminalWavefront(String terminalName) {
@@ -248,11 +248,11 @@ final class TaskGraphExecutor {
             if (terminalIndex == null) {
                 return CompletableFuture.failedFuture(new IllegalArgumentException("Unknown terminal node: " + terminalName));
             }
-            return submitWavefrontTask().thenApply(ignored -> cast(orderedNodes[terminalIndex].value));
+            return submitWavefrontTask().thenApply(results -> cast(results.get(terminalName)));
         }
 
         private CompletableFuture<Map<String, Object>> startAllWavefront() {
-            return submitWavefrontTask().thenApply(ignored -> snapshotResults());
+            return submitWavefrontTask();
         }
 
         private CompletableFuture<Map<String, Object>> submitWavefrontTask() {
@@ -265,7 +265,7 @@ final class TaskGraphExecutor {
             CompletableFuture<Map<String, Object>> scheduled = allNodesThreadSafe()
                 ? executeWavefrontAsync(buildReadyQueue(), 0)
                 : handle.submitRuntimeTask(
-                    builder.graphName() + "/wavefront",
+                    graphTaskName("wavefront"),
                     highestPriorityType(),
                     highestPriority() == ExecutionPriority.AUTO,
                     false,
@@ -291,7 +291,7 @@ final class TaskGraphExecutor {
                 return CompletableFuture.completedFuture(Collections.emptyMap());
             }
             CompletableFuture<Map<String, Object>> scheduled = handle.submitRuntimeTask(
-                builder.graphName() + "/scheduled",
+                graphTaskName("scheduled"),
                 highestPriorityType(),
                 highestPriority() == ExecutionPriority.AUTO,
                 allNodesThreadSafe(),
@@ -362,7 +362,7 @@ final class TaskGraphExecutor {
 
         private CompletableFuture<NodeResult> scheduleWavefrontNode(RuntimeNode node) {
             return handle.submitRuntimeTask(
-                builder.graphName() + "/wave/" + node.handle.name(),
+                graphTaskName("wave/" + node.handle.name()),
                 node.priorityType,
                 node.handle.priority() == ExecutionPriority.AUTO,
                 true,
@@ -474,9 +474,13 @@ final class TaskGraphExecutor {
                 locality = normalize(builder.graphName());
             }
             if (locality == null) {
-                return null;
+                return "graph|" + sanitize(builder.graphName()) + "|" + Long.toUnsignedString(builder.graphKey());
             }
-            return "graph|" + sanitize(builder.graphName()) + "|" + sanitize(locality);
+            return "graph|" + sanitize(builder.graphName()) + "|" + sanitize(locality) + "|" + Long.toUnsignedString(builder.graphKey());
+        }
+
+        private String graphTaskName(String suffix) {
+            return builder.graphName() + "/" + Long.toUnsignedString(builder.graphKey()) + "/" + suffix;
         }
 
         private boolean allNodesThreadSafe() {

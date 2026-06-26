@@ -37,6 +37,7 @@ import org.admany.quantified.core.common.dev.DeveloperFeatures;
 import org.admany.quantified.core.common.dev.StressTestController;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
 import org.admany.quantified.core.common.gpu.backend.GpuBackendRouter;
+import org.admany.quantified.core.common.gpu.backend.VulkanExecutionSupport;
 import org.admany.quantified.core.common.gpu.backend.VulkanProbeScheduler;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.opencl.gpu.AsyncProbeScheduler;
@@ -47,7 +48,6 @@ import org.admany.quantified.core.common.opencl.task.OpenCLTaskManager;
 import org.admany.quantified.core.common.telemetry.TaskKindTelemetry;
 import org.admany.quantified.core.common.util.TaskScheduler;
 import org.admany.quantified.core.common.gpu.backend.VulkanRuntime;
-import org.admany.quantified.core.common.vulkan.core.VulkanManager;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.File;
@@ -117,6 +117,7 @@ public final class DeveloperDashboardServer {
     private static volatile String boundHost = "";
     private static volatile boolean isHttps = false;
     private static volatile boolean authRequired = false;
+    private static volatile String lastStartFailure = "";
 
     private static final Map<String, Long> sessions = new HashMap<>();
     private static final Object SESSIONS_LOCK = new Object();
@@ -187,11 +188,29 @@ public final class DeveloperDashboardServer {
         }
     }
 
+    public static boolean isRunning() {
+        return server != null && boundPort >= 0;
+    }
+
+    public static int boundPort() {
+        return boundPort;
+    }
+
+    public static String boundHost() {
+        return boundHost == null ? "" : boundHost;
+    }
+
+    public static String lastStartFailure() {
+        return lastStartFailure == null ? "" : lastStartFailure;
+    }
+
     private static void startInternal(int port, String host, boolean https, boolean auth) {
         try {
             String bindHost = normalizeBindHost(host);
             LOGGER.fine("Starting developer dashboard server on " + bindHost + ":" + port + " (https=" + https + ", auth=" + auth + ")");
-            server = createServer(bindHost, port, https);
+            ServerBinding binding = createServer(bindHost, port, https);
+            server = binding.server();
+            bindHost = binding.host();
             isHttps = https && server instanceof HttpsServer;
             Objects.requireNonNull(server, "server");
             executor = Executors.newCachedThreadPool(r -> {
@@ -207,6 +226,7 @@ public final class DeveloperDashboardServer {
             boundPort = port;
             boundHost = bindHost;
             authRequired = auth;
+            lastStartFailure = "";
             String protocol = isHttps ? "https" : "http";
             String finalBindHost = bindHost;
             LOGGER.fine(() -> "Developer dashboard listening on " + protocol + "://" + finalBindHost + ":" + port);
@@ -215,20 +235,26 @@ public final class DeveloperDashboardServer {
             boundHost = "";
             isHttps = false;
             authRequired = false;
+            lastStartFailure = ex.getMessage() != null && !ex.getMessage().isBlank()
+                ? ex.getClass().getSimpleName() + ": " + ex.getMessage()
+                : ex.getClass().getSimpleName();
             LOGGER.log(Level.WARNING, "Failed to start developer dashboard on " + host + ":" + port, ex);
         }
     }
 
-    private static HttpServer createServer(String host, int port, boolean https) throws Exception {
+    private static ServerBinding createServer(String host, int port, boolean https) throws Exception {
         try {
-            return createServerOnce(host, port, https);
+            return new ServerBinding(createServerOnce(host, port, https), host);
         } catch (BindException bindException) {
             if (!shouldFallbackToWildcard(host)) {
                 throw bindException;
             }
             LOGGER.warning("Dashboard host '" + host + "' is not bindable on this machine, retrying on 0.0.0.0");
-            return createServerOnce("0.0.0.0", port, https);
+            return new ServerBinding(createServerOnce("0.0.0.0", port, https), "0.0.0.0");
         }
+    }
+
+    private record ServerBinding(HttpServer server, String host) {
     }
 
     private static HttpServer createServerOnce(String host, int port, boolean https) throws Exception {
@@ -1138,9 +1164,9 @@ public final class DeveloperDashboardServer {
         if (!VulkanRuntime.hasBindings()) {
             return options;
         }
-        for (VulkanManager.VulkanDeviceInfo device : VulkanManager.listDevices()) {
+        for (Object device : VulkanExecutionSupport.listInProcessDevices()) {
             JsonObject option = new JsonObject();
-            option.addProperty("value", device.id());
+            option.addProperty("value", invokeVulkanDeviceString(device, "id", "unknown"));
             option.addProperty("label", formatVulkanDeviceLabel(device));
             options.add(option);
         }
@@ -1163,17 +1189,51 @@ public final class DeveloperDashboardServer {
         return device.name() + " (" + device.vendor() + " / " + type + " / " + vram + " / CU " + device.computeUnits() + ")";
     }
 
-    private static String formatVulkanDeviceLabel(VulkanManager.VulkanDeviceInfo device) {
-        String type = switch (device.deviceType()) {
+    private static String formatVulkanDeviceLabel(Object device) {
+        int deviceType = invokeVulkanDeviceInt(device, "deviceType", 0);
+        String type = switch (deviceType) {
             case 2 -> "discrete gpu";
             case 1 -> "integrated gpu";
             case 3 -> "virtual gpu";
             case 4 -> "cpu";
             default -> "gpu";
         };
-        String vram = device.localMemoryBytes() > 0 ? formatBytes(device.localMemoryBytes()) : "unknown VRAM";
-        String suffix = device.softwareAdapter() ? " / software" : "";
-        return device.name() + " (" + device.vendor() + " / " + type + " / " + vram + suffix + ")";
+        long localMemoryBytes = invokeVulkanDeviceLong(device, "localMemoryBytes", 0L);
+        String vram = localMemoryBytes > 0 ? formatBytes(localMemoryBytes) : "unknown VRAM";
+        String suffix = invokeVulkanDeviceBoolean(device, "softwareAdapter", false) ? " / software" : "";
+        return invokeVulkanDeviceString(device, "name", "unknown") + " ("
+            + invokeVulkanDeviceString(device, "vendor", "unknown") + " / " + type + " / " + vram + suffix + ")";
+    }
+
+    private static String invokeVulkanDeviceString(Object device, String methodName, String fallback) {
+        Object value = invokeVulkanDeviceMethod(device, methodName);
+        return value instanceof String string ? string : fallback;
+    }
+
+    private static int invokeVulkanDeviceInt(Object device, String methodName, int fallback) {
+        Object value = invokeVulkanDeviceMethod(device, methodName);
+        return value instanceof Number number ? number.intValue() : fallback;
+    }
+
+    private static long invokeVulkanDeviceLong(Object device, String methodName, long fallback) {
+        Object value = invokeVulkanDeviceMethod(device, methodName);
+        return value instanceof Number number ? number.longValue() : fallback;
+    }
+
+    private static boolean invokeVulkanDeviceBoolean(Object device, String methodName, boolean fallback) {
+        Object value = invokeVulkanDeviceMethod(device, methodName);
+        return value instanceof Boolean bool ? bool : fallback;
+    }
+
+    private static Object invokeVulkanDeviceMethod(Object device, String methodName) {
+        if (device == null) {
+            return null;
+        }
+        try {
+            return device.getClass().getMethod(methodName).invoke(device);
+        } catch (ReflectiveOperationException | LinkageError ignored) {
+            return null;
+        }
     }
 
     private static JsonObject selectOption(String value, String label) {
@@ -1240,14 +1300,12 @@ public final class DeveloperDashboardServer {
                     VulkanProbeScheduler.reset();
                     AsyncProbeScheduler.reset();
                     OpenCLManager.shutdown();
-                    if (VulkanRuntime.hasBindings()) {
-                        VulkanManager.shutdown();
-                    }
+                    VulkanExecutionSupport.shutdownInProcess();
                     DeveloperOverlayManager.recordApiLog("[Quantified] GPU acceleration disabled from config");
                     return;
                 }
                 if (vulkanDeviceChanged && VulkanRuntime.hasBindings()) {
-                    VulkanManager.setPreferredDevice(normalizeAutoDeviceValue(updatedVulkanDeviceId));
+                    VulkanExecutionSupport.setPreferredInProcessDevice(normalizeAutoDeviceValue(updatedVulkanDeviceId));
                 }
                 if (openclDeviceChanged) {
                     OpenCLManager.switchDevice(updatedOpenclDeviceId);
@@ -1257,7 +1315,7 @@ public final class DeveloperDashboardServer {
                 }
                 if ((gpuAccelerationChanged || gpuPreferenceChanged || vulkanDeviceChanged) && VulkanRuntime.hasBindings()
                     && shouldWarmupVulkanAfterConfig(updatedGpuPreference)) {
-                    VulkanManager.warmupAsync("dashboard-config");
+                    VulkanExecutionSupport.warmupInProcessAsync("dashboard-config");
                 }
                 if (gpuAccelerationChanged || gpuPreferenceChanged || openclDeviceChanged) {
                     AsyncProbeScheduler.triggerProbe("dashboard-config");
@@ -1465,17 +1523,19 @@ public final class DeveloperDashboardServer {
         payload.addProperty("modSpotlightEnabled", DeveloperFeatures.isModSpotlightEnabled());
         OpenCLManager.RuntimeStatus openclStatus = OpenCLManager.runtimeStatus();
         boolean vulkanBindingsPresent = VulkanRuntime.hasBindings();
-        boolean vulkanProbeAvailable = vulkanBindingsPresent && VulkanRuntime.isAvailable();
-        boolean vulkanInitialized = vulkanBindingsPresent && VulkanManager.runtimeStatus().isAvailable();
+        VulkanRuntime.RuntimeMode vulkanRuntimeMode = VulkanRuntime.runtimeMode();
+        boolean vulkanProbeAvailable = VulkanRuntime.isAvailable() || vulkanRuntimeMode == VulkanRuntime.RuntimeMode.ISOLATED;
+        boolean vulkanInitialized = VulkanExecutionSupport.hasExecutableRuntime();
         String vulkanFailureReason = vulkanBindingsPresent
-            ? VulkanManager.runtimeStatus().failureReason()
-            : "LWJGL Vulkan classes are not present in this runtime";
+            ? VulkanExecutionSupport.failureReason()
+            : "Using isolated bundled Vulkan runtime for this Minecraft version";
         payload.addProperty("openclAvailable", openclStatus.isAvailable());
         if (openclStatus.failureReason() != null) {
             payload.addProperty("openclFailureReason", openclStatus.failureReason());
         }
         payload.addProperty("vulkanAvailable", vulkanProbeAvailable);
         payload.addProperty("vulkanInitialized", vulkanInitialized);
+        payload.addProperty("vulkanRuntimeMode", vulkanRuntimeMode.name());
         if (!vulkanProbeAvailable) {
             payload.addProperty("vulkanFailureReason", vulkanFailureReason);
         } else if (vulkanFailureReason != null) {
@@ -1483,7 +1543,7 @@ public final class DeveloperDashboardServer {
         }
         GPUMonitor.GPUStatus gpuStatus = OpenCLManager.getGPUStatus();
         payload.addProperty("openclDeviceName", gpuStatus != null ? gpuStatus.deviceName() : "");
-        payload.addProperty("vulkanDeviceName", vulkanProbeAvailable ? VulkanManager.deviceName() : "");
+        payload.addProperty("vulkanDeviceName", vulkanProbeAvailable ? VulkanExecutionSupport.deviceName() : "");
         GpuBackendPreference configuredPreference = GpuBackendRouter.getDefaultPreference();
         payload.addProperty("configuredGpuBackendPreference", configuredPreference.name());
         GpuBackendType activeBackend = resolveDashboardGpuBackend(configuredPreference);
@@ -1613,12 +1673,19 @@ public final class DeveloperDashboardServer {
         if (MultithreadingConfig.CONFIG == null || !MultithreadingConfig.CONFIG.enableGpuAcceleration) {
             return GpuBackendType.CPU;
         }
-        return GpuBackendRouter.selectBackend("dashboard", configuredPreference, true, true).backendType();
+        return GpuBackendRouter.selectBackend(
+            "dashboard",
+            configuredPreference,
+            true,
+            OpenCLManager.hasExecutableRuntime(),
+            true,
+            VulkanExecutionSupport.hasExecutableRuntime()
+        ).backendType();
     }
 
     private static String resolveDashboardGpuDeviceName(GpuBackendType backendType, GPUMonitor.GPUStatus gpuStatus) {
         return switch (backendType) {
-            case VULKAN -> VulkanRuntime.hasBindings() ? VulkanManager.deviceName() : "";
+            case VULKAN -> VulkanExecutionSupport.hasExecutableRuntime() ? VulkanExecutionSupport.deviceName() : "";
             case OPENCL -> gpuStatus != null ? gpuStatus.deviceName() : "";
             case CPU -> "";
         };
@@ -3371,6 +3438,7 @@ public final class DeveloperDashboardServer {
                         loginButton.disabled = true;
                         buttonText.textContent = 'Checking credentials';
                         errorMessage.style.display = 'none';
+                        let loginSucceeded = false;
 
                         try {
                             const formData = new FormData(e.target);
@@ -3386,8 +3454,9 @@ public final class DeveloperDashboardServer {
                             });
 
                             if (response.ok) {
-                                buttonText.textContent = 'Opening dashboard';
-                                window.location.href = '/';
+                                loginSucceeded = true;
+                                buttonText.textContent = 'Opening';
+                                window.location.replace('/');
                                 return;
                             }
 
@@ -3398,6 +3467,9 @@ public final class DeveloperDashboardServer {
                             errorMessage.textContent = 'Connection failed. Please try again.';
                             errorMessage.style.display = 'block';
                         } finally {
+                            if (loginSucceeded) {
+                                return;
+                            }
                             loginButton.classList.remove('loading');
                             loginButton.disabled = false;
                             buttonText.textContent = 'Log In';

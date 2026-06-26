@@ -3,23 +3,27 @@ package org.admany.quantified.core.common.gpu.backend;
 import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
 import org.admany.quantified.core.common.util.LwjglRuntimeTuning;
-import org.admany.quantified.core.common.vulkan.core.VulkanManager;
 
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public final class VulkanProbeScheduler {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(VulkanProbeScheduler.class);
+    private static final AtomicReference<Thread> schedulerThread = new AtomicReference<>();
     private static final ScheduledExecutorService SCHEDULER = Executors.newSingleThreadScheduledExecutor(r -> {
-        return LwjglRuntimeTuning.newDaemonThread(r, "Quantified-Vulkan-Probe-Scheduler",
+        Thread thread = LwjglRuntimeTuning.newDaemonThread(r, "Quantified-Vulkan-Probe-Scheduler",
             LwjglRuntimeTuning.gpuThreadStackSizeKb());
+        schedulerThread.compareAndSet(null, thread);
+        return thread;
     });
 
     private static final int MAX_ATTEMPTS = 3;
@@ -31,6 +35,7 @@ public final class VulkanProbeScheduler {
     private static final AtomicBoolean rendererTriggered = new AtomicBoolean(false);
     private static final AtomicBoolean worldTriggered = new AtomicBoolean(false);
     private static final AtomicBoolean inlineProbeRunning = new AtomicBoolean(false);
+    private static final AtomicBoolean isolatedProbeRunning = new AtomicBoolean(false);
 
     private static volatile boolean scheduled = false;
     private static volatile boolean succeeded = false;
@@ -45,8 +50,13 @@ public final class VulkanProbeScheduler {
             reset();
             return;
         }
-        if (!VulkanRuntime.hasBindings()) {
-            logBindingsUnavailable();
+        if (!VulkanRuntime.hasProbeRuntime()) {
+            logProbeRuntimeUnavailable();
+            return;
+        }
+        if (probeAlreadyResolved()) {
+            succeeded = true;
+            LOGGER.debug("Vulkan background probe skipped because a successful probe snapshot is already cached");
             return;
         }
         if (scheduled) {
@@ -59,7 +69,7 @@ public final class VulkanProbeScheduler {
         remainingAttempts.set(MAX_ATTEMPTS);
         rendererTriggered.set(false);
         worldTriggered.set(false);
-        VulkanManager.notePending("Background probe pending");
+        noteProbePending("Background probe pending");
         String armedMessage = "Vulkan probe scheduler armed (maxAttempts=" + MAX_ATTEMPTS
             + ", initialDelayMs=" + INITIAL_DELAY.toMillis()
             + ", retryDelayMs=" + RETRY_DELAY.toMillis() + ")";
@@ -90,8 +100,12 @@ public final class VulkanProbeScheduler {
             reset();
             return;
         }
-        if (!VulkanRuntime.hasBindings()) {
-            logBindingsUnavailable();
+        if (!VulkanRuntime.hasProbeRuntime()) {
+            logProbeRuntimeUnavailable();
+            return;
+        }
+        if (probeAlreadyResolved()) {
+            succeeded = true;
             return;
         }
         if (succeeded) {
@@ -111,19 +125,19 @@ public final class VulkanProbeScheduler {
         // (gpuThreadStackSizeKb = 64 MB by default) and handle the result asynchronously.
         LOGGER.info("Triggering Vulkan probe inline due to: " + triggerReason);
         DeveloperOverlayManager.recordApiLog("[Vulkan] Probe running inline (" + triggerReason + ")");
-        VulkanManager.notePending("Inline probe (" + triggerReason + ")");
-        VulkanManager.forceProbe().whenComplete((ok, err) -> {
+        noteProbePending("Inline probe (" + triggerReason + ")");
+        forceProbe().whenComplete((ok, err) -> {
             try {
                 if (err != null) {
                     LOGGER.warn("Inline Vulkan probe failed (" + triggerReason + ")", err);
                     DeveloperOverlayManager.recordApiLog("[Vulkan] Inline probe failed (" + triggerReason + ") - " + err.getMessage());
                 } else if (Boolean.TRUE.equals(ok)) {
                     succeeded = true;
-                    String deviceName = VulkanManager.deviceName();
+                    String deviceName = probeDeviceName();
                     LOGGER.info("Inline Vulkan probe succeeded for " + deviceName + " (" + triggerReason + ")");
                     DeveloperOverlayManager.recordApiLog("[Vulkan] Probe succeeded - " + deviceName + " (inline trigger: " + triggerReason + ")");
                 } else {
-                    String detail = VulkanManager.runtimeStatus().failureReason();
+                    String detail = probeFailureReason();
                     DeveloperOverlayManager.recordApiLog("[Vulkan] Inline probe unavailable (" + triggerReason + ") - "
                         + (detail != null && !detail.isBlank() ? detail : "GPU acceleration disabled"));
                 }
@@ -139,8 +153,12 @@ public final class VulkanProbeScheduler {
             reset();
             return;
         }
-        if (!VulkanRuntime.hasBindings()) {
-            logBindingsUnavailable();
+        if (!VulkanRuntime.hasProbeRuntime()) {
+            logProbeRuntimeUnavailable();
+            return;
+        }
+        if (probeAlreadyResolved()) {
+            succeeded = true;
             return;
         }
         if (succeeded) {
@@ -151,7 +169,7 @@ public final class VulkanProbeScheduler {
             scheduleBackgroundProbe();
         }
         LOGGER.info("Triggering Vulkan probe due to: " + triggerReason);
-        VulkanManager.notePending("Probe queued (" + triggerReason + ")");
+        noteProbePending("Probe queued (" + triggerReason + ")");
         scheduleProbe(Duration.ZERO, triggerReason);
     }
 
@@ -173,7 +191,11 @@ public final class VulkanProbeScheduler {
         if (succeeded) {
             return;
         }
-        if (VulkanManager.isProbeRunning()) {
+        if (probeAlreadyResolved()) {
+            succeeded = true;
+            return;
+        }
+        if (isAnyProbeRunning()) {
             LOGGER.debug("Skipping queued Vulkan probe because one is already running");
             return;
         }
@@ -206,7 +228,7 @@ public final class VulkanProbeScheduler {
         LOGGER.info("Running Vulkan probe attempt #" + attemptNo + " (" + trigger + ")");
         // Delegate to an ephemeral large-stack thread via forceProbe() so the SCHEDULER
         // thread is never the one calling vkCreateInstance.
-        VulkanManager.forceProbe().whenComplete((ok, err) ->
+        forceProbe().whenComplete((ok, err) ->
             handleProbeResult(trigger, attemptNo, ok != null && ok, err));
     }
 
@@ -222,14 +244,18 @@ public final class VulkanProbeScheduler {
         }
         if (ok) {
             succeeded = true;
-            String deviceName = VulkanManager.deviceName();
+            String deviceName = probeDeviceName();
             LOGGER.info("Vulkan probe succeeded on attempt #" + attemptNo + " (" + trigger + ") for " + deviceName);
             DeveloperOverlayManager.recordApiLog("[Vulkan] Probe succeeded - " + deviceName + " (attempt " + attemptNo + ", trigger: " + trigger + ")");
             return;
         }
-        String reason = VulkanManager.runtimeStatus().failureReason();
+        String reason = probeFailureReason();
         String detail = reason != null && !reason.isBlank() ? reason : "GPU acceleration disabled";
         DeveloperOverlayManager.recordApiLog("[Vulkan] Probe unavailable - attempt " + attemptNo + " (" + trigger + ") - " + detail);
+        if (detail.contains("execution will use the isolated bundled runtime")) {
+            LOGGER.info("Vulkan isolated probe completed; isolated runtime execution is available");
+            return;
+        }
         scheduleRetry("unavailable");
     }
 
@@ -247,16 +273,123 @@ public final class VulkanProbeScheduler {
     private static void markDisabled() {
         String message = "Vulkan probe skipped because enableGpuAcceleration=false";
         LOGGER.info(message);
-        VulkanManager.notePending("GPU acceleration disabled in config");
+        noteProbePending("GPU acceleration disabled in config");
         DeveloperOverlayManager.recordApiLog("[Vulkan] Probe skipped - GPU acceleration disabled in config");
     }
-    private static void logBindingsUnavailable() {
+
+    private static void logProbeRuntimeUnavailable() {
         if (unavailableLogged) {
             return;
         }
         unavailableLogged = true;
-        String message = "Vulkan backend unavailable - LWJGL Vulkan classes are not present in this runtime";
+        String message = "Vulkan backend unavailable - no in-process LWJGL Vulkan classes or embedded probe bundle present";
         LOGGER.info(message);
         DeveloperOverlayManager.recordApiLog("[Vulkan] " + message);
+    }
+
+    private static void noteProbePending(String reason) {
+        if (VulkanRuntime.hasBindings()) {
+            InProcessVulkan.notePending(reason);
+            return;
+        }
+        String detail = reason != null && !reason.isBlank() ? reason : "Vulkan probe pending";
+        DeveloperOverlayManager.recordApiLog("[Vulkan] " + detail);
+    }
+
+    private static boolean isAnyProbeRunning() {
+        if (VulkanRuntime.hasBindings()) {
+            return InProcessVulkan.isProbeRunning();
+        }
+        return isolatedProbeRunning.get();
+    }
+
+    private static CompletableFuture<Boolean> forceProbe() {
+        if (probeAlreadyResolved()) {
+            succeeded = true;
+            return CompletableFuture.completedFuture(true);
+        }
+        if (VulkanRuntime.hasBindings()) {
+            return InProcessVulkan.forceProbe();
+        }
+        if (!isolatedProbeRunning.compareAndSet(false, true)) {
+            return CompletableFuture.completedFuture(succeeded);
+        }
+        if (Thread.currentThread() == schedulerThread.get()) {
+            try {
+                VulkanRuntime.AvailabilitySnapshot snapshot = VulkanRuntime.reprobe();
+                return CompletableFuture.completedFuture(snapshot.available() || isolatedExecutionReady(snapshot));
+            } catch (Throwable thr) {
+                return CompletableFuture.failedFuture(thr);
+            } finally {
+                isolatedProbeRunning.set(false);
+            }
+        }
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
+        SCHEDULER.submit(() -> {
+            try {
+                VulkanRuntime.AvailabilitySnapshot snapshot = VulkanRuntime.reprobe();
+                future.complete(snapshot.available() || isolatedExecutionReady(snapshot));
+            } catch (Throwable thr) {
+                future.completeExceptionally(thr);
+            } finally {
+                isolatedProbeRunning.set(false);
+            }
+        });
+        return future;
+    }
+
+    private static String probeDeviceName() {
+        if (VulkanRuntime.hasBindings()) {
+            return InProcessVulkan.deviceName();
+        }
+        VulkanRuntime.AvailabilitySnapshot snapshot = VulkanRuntime.snapshot();
+        if (snapshot.devices().isEmpty()) {
+            return "unknown-vulkan-device";
+        }
+        return snapshot.devices().get(0).name();
+    }
+
+    private static String probeFailureReason() {
+        if (VulkanRuntime.hasBindings()) {
+            return InProcessVulkan.failureReason();
+        }
+        return VulkanRuntime.snapshot().failureReason();
+    }
+
+    private static boolean isolatedExecutionReady(VulkanRuntime.AvailabilitySnapshot snapshot) {
+        return VulkanRuntime.runtimeMode() == VulkanRuntime.RuntimeMode.ISOLATED
+            && snapshot != null
+            && !snapshot.devices().isEmpty();
+    }
+
+    private static boolean probeAlreadyResolved() {
+        VulkanRuntime.AvailabilitySnapshot snapshot = VulkanRuntime.cachedSnapshot();
+        return snapshot != null && (snapshot.available() || isolatedExecutionReady(snapshot));
+    }
+
+    private static final class InProcessVulkan {
+
+        private InProcessVulkan() {
+        }
+
+        static void notePending(String reason) {
+            org.admany.quantified.core.common.vulkan.core.VulkanManager.notePending(reason);
+        }
+
+        static boolean isProbeRunning() {
+            return org.admany.quantified.core.common.vulkan.core.VulkanManager.isProbeRunning();
+        }
+
+        static CompletableFuture<Boolean> forceProbe() {
+            return org.admany.quantified.core.common.vulkan.core.VulkanManager.forceProbe();
+        }
+
+        static String deviceName() {
+            return org.admany.quantified.core.common.vulkan.core.VulkanManager.deviceName();
+        }
+
+        static String failureReason() {
+            return org.admany.quantified.core.common.vulkan.core.VulkanManager.runtimeStatus().failureReason();
+        }
     }
 }

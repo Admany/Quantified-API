@@ -1,0 +1,151 @@
+plugins {
+    id 'fabric-loom' version "${fabric_loom_version}"
+    id 'maven-publish'
+}
+
+def rootProps = new Properties()
+file('../../../gradle.properties').withInputStream { rootProps.load(it) }
+['mod_id', 'mod_name', 'mod_license', 'mod_version', 'mod_group_id', 'mod_authors', 'mod_description',
+ 'minecraft_version_fabric_wide', 'minecraft_version_range_wide_fabric', 'fabric_loader_version',
+ 'fabric_api_version_wide', 'fabric_loom_version', 'wide_bytecode_release'].each { key ->
+    ext.set(key, rootProps.getProperty(key))
+}
+
+def minecraft_version = project.property('minecraft_version_fabric_wide')
+def minecraft_version_range = project.property('minecraft_version_range_wide_fabric')
+def fabric_loader_version = project.property('fabric_loader_version')
+def fabric_api_version = project.property('fabric_api_version_wide')
+def wideBytecodeRelease = (project.findProperty('wide_bytecode_release') ?: '17').toInteger()
+def lwjglVersion = "3.3.3"
+def lwjglNatives = org.gradle.internal.os.OperatingSystem.current().isWindows() ? "natives-windows" :
+    (org.gradle.internal.os.OperatingSystem.current().isMacOsX() ? "natives-macos" : "natives-linux")
+def repoRootDir = file("${rootDir}/../../..")
+def spirvResourcesDir = new File(repoRootDir, 'build/shared/spirvResources')
+def shaderSourceDir = new File(repoRootDir, 'shared/shaders/src/vulkan')
+def shadercLwjglVersion = "3.3.3"
+
+configurations {
+    gpuBindings
+}
+
+version = project.property('mod_version')
+group = project.property('mod_group_id')
+
+base {
+    archivesName = "${mod_name}-fabric-wide".toLowerCase()
+}
+
+loom {
+    accessWidenerPath = file("src/main/resources/quantified.accesswidener")
+}
+
+sourceSets {
+    main {
+        java {
+            srcDirs = ['src/main/java', '../../../core/src/main/java']
+        }
+        resources {
+            srcDirs = ['src/main/resources', '../../../core/src/main/resources']
+            srcDir(spirvResourcesDir)
+        }
+    }
+    shaderCompiler {
+        java {
+            srcDirs = ['../../../shader-compiler/src/main/java']
+        }
+    }
+    test {
+        java {
+            srcDirs = []
+        }
+        resources {
+            srcDirs = []
+        }
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${fabric_loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${fabric_api_version}"
+
+    implementation "com.github.ben-manes.caffeine:caffeine:3.2.2"
+    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'net.java.dev.jna:jna:5.13.0'
+    implementation 'com.github.oshi:oshi-core:6.9.1'
+    compileOnly 'org.slf4j:slf4j-api:2.0.9'
+
+    compileOnly("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
+    compileOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    compileOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+    gpuBindings("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    gpuBindings("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+
+    shaderCompilerImplementation("org.lwjgl:lwjgl:${shadercLwjglVersion}") { transitive = false }
+    shaderCompilerImplementation("org.lwjgl:lwjgl-shaderc:${shadercLwjglVersion}") { transitive = false }
+    shaderCompilerRuntimeOnly("org.lwjgl:lwjgl:${shadercLwjglVersion}:${lwjglNatives}") { transitive = false }
+    shaderCompilerRuntimeOnly("org.lwjgl:lwjgl-shaderc:${shadercLwjglVersion}:${lwjglNatives}") { transitive = false }
+}
+
+tasks.register('compileVulkanShaders', JavaExec) {
+    dependsOn tasks.named(sourceSets.shaderCompiler.classesTaskName)
+    inputs.dir(shaderSourceDir)
+    outputs.dir(spirvResourcesDir)
+    classpath = sourceSets.shaderCompiler.runtimeClasspath
+    mainClass.set('org.admany.quantified.build.SpirvCompilerEntrypoint')
+    args shaderSourceDir.absolutePath,
+        new File(spirvResourcesDir, 'quantified/shaders/vulkan').absolutePath
+    jvmArgs '-Xmx256m', '-Dorg.lwjgl.system.stackSize=16384'
+}
+
+tasks.named('jar', Jar).configure {
+    // LWJGL bindings ship via the Forge overlay in the omni jar; Fabric uses the game's LWJGL at runtime.
+}
+
+processResources {
+    dependsOn tasks.named('compileVulkanShaders')
+    inputs.property "version", project.version
+    inputs.property "minecraft_version_range", minecraft_version_range
+    inputs.property "fabric_loader_version", fabric_loader_version
+    inputs.property "mod_id", mod_id
+    inputs.property "mod_name", mod_name
+    inputs.property "mod_description", mod_description
+
+    filesMatching("fabric.mod.json") {
+        expand(
+            version: project.version,
+            minecraft_version_range: minecraft_version_range,
+            fabric_loader_version: fabric_loader_version,
+            mod_id: mod_id,
+            mod_name: mod_name,
+            mod_description: mod_description,
+            mod_authors: mod_authors,
+            mod_license: mod_license
+        )
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = wideBytecodeRelease
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+    withSourcesJar()
+}
+
+tasks.named('sourcesJar', Jar).configure {
+    dependsOn tasks.named('compileVulkanShaders')
+}
+
+publishing {
+    publications {
+        register('mavenJava', MavenPublication) {
+            from components.java
+        }
+    }
+}

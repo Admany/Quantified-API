@@ -1,0 +1,311 @@
+plugins {
+    id 'java-library'
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.neoforged.gradle.userdev' version '7.1.25'
+    id 'com.gradleup.shadow' version '8.3.6'
+}
+
+// Load shared mod metadata from root gradle.properties
+def rootProps = new Properties()
+file('../../../gradle.properties').withInputStream { rootProps.load(it) }
+['mod_id', 'mod_name', 'mod_license', 'mod_version', 'mod_group_id', 'mod_authors', 'mod_description',
+ 'minecraft_version_neoforge_121x', 'minecraft_version_range_neoforge_121x', 'neoforge_version_121x',
+ 'neoforge_version_range_121x', 'loader_version_range_neoforge_121x'].each { key ->
+    ext.set(key, rootProps.getProperty(key))
+}
+
+def minecraft_version = project.property('minecraft_version_neoforge_121x')
+def minecraft_version_range = project.property('minecraft_version_range_neoforge_121x')
+def neoforge_version = project.property('neoforge_version_121x')
+def neoforge_version_range = project.property('neoforge_version_range_121x')
+def loader_version_range = project.property('loader_version_range_neoforge_121x')
+def lwjglVersion = "3.3.3"
+def lwjglNatives = org.gradle.internal.os.OperatingSystem.current().isWindows() ? "natives-windows" :
+    (org.gradle.internal.os.OperatingSystem.current().isMacOsX() ? "natives-macos" : "natives-linux")
+def openclProbeResourcesDir = layout.buildDirectory.dir('generated/openclProbeResources')
+def repoRootDir = file("${rootDir}/../../..")
+def vulkanProbeResourcesDir = layout.buildDirectory.dir('generated/vulkanProbeResources')
+def spirvResourcesDir = new File(repoRootDir, 'build/shared/spirvResources')
+def shaderSourceDir = new File(repoRootDir, 'shared/shaders/src/vulkan')
+def shadercLwjglVersion = "3.3.3"
+
+configurations {
+    gpuBindings
+}
+
+version = project.property('mod_version')
+group = project.property('mod_group_id')
+
+base {
+    archivesName = "${mod_name}-neoforge-1.21.x".toLowerCase()
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+sourceSets {
+    main {
+        java {
+            srcDirs = ['src/main/java', '../../../core/src/main/java']
+            exclude 'org/admany/quantified/core/forge/**'
+        }
+        resources {
+            srcDirs = ['src/main/resources', '../../../core/src/main/resources', 'src/generated/resources']
+            srcDir(openclProbeResourcesDir)
+            srcDir(vulkanProbeResourcesDir)
+            srcDir(spirvResourcesDir)
+        }
+    }
+    test {
+        java {
+            srcDirs = []
+        }
+        resources {
+            srcDirs = []
+        }
+    }
+    openclProbe {
+        java {
+            srcDirs = ['../../forge/omni-base/src/openclProbe/java']
+        }
+        resources {
+            srcDirs = ['../../forge/omni-base/src/openclProbe/resources']
+        }
+    }
+    vulkanProbe {
+        java {
+            srcDirs = ['src/vulkanProbe/java']
+        }
+        resources {
+            srcDirs = ['src/vulkanProbe/resources']
+        }
+    }
+    shaderCompiler {
+        java {
+            srcDirs = ['../../../shader-compiler/src/main/java']
+        }
+    }
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'NeoForged'
+        url = 'https://maven.neoforged.net/releases'
+    }
+}
+
+runs {
+    configureEach {
+        systemProperty 'forge.logging.console.level', 'debug'
+        modSource project.sourceSets.main
+    }
+
+    client {
+        workingDirectory project.file('run')
+    }
+
+    server {
+        workingDirectory project.file('run')
+        arguments '--nogui'
+    }
+}
+
+dependencies {
+    implementation "net.neoforged:neoforge:${neoforge_version}"
+
+    implementation "com.github.ben-manes.caffeine:caffeine:3.2.2"
+    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'net.java.dev.jna:jna:5.13.0'
+    implementation 'com.github.oshi:oshi-core:6.9.1'
+    compileOnly 'org.slf4j:slf4j-api:2.0.9'
+
+    compileOnly("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
+    compileOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    compileOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+    gpuBindings("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    gpuBindings("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+
+    openclProbeImplementation("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
+    openclProbeCompileOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    openclProbeRuntimeOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    openclProbeRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${lwjglNatives}") { transitive = false }
+
+    vulkanProbeImplementation("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
+    vulkanProbeCompileOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+    vulkanProbeRuntimeOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+    vulkanProbeRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${lwjglNatives}") { transitive = false }
+
+    shaderCompilerImplementation("org.lwjgl:lwjgl:${shadercLwjglVersion}") { transitive = false }
+    shaderCompilerImplementation("org.lwjgl:lwjgl-shaderc:${shadercLwjglVersion}") { transitive = false }
+    shaderCompilerRuntimeOnly("org.lwjgl:lwjgl:${shadercLwjglVersion}:${lwjglNatives}") { transitive = false }
+    shaderCompilerRuntimeOnly("org.lwjgl:lwjgl-shaderc:${shadercLwjglVersion}:${lwjglNatives}") { transitive = false }
+}
+
+tasks.register('compileVulkanShaders', JavaExec) {
+    dependsOn tasks.named(sourceSets.shaderCompiler.classesTaskName)
+    inputs.dir(shaderSourceDir)
+    outputs.dir(spirvResourcesDir)
+    classpath = sourceSets.shaderCompiler.runtimeClasspath
+    mainClass.set('org.admany.quantified.build.SpirvCompilerEntrypoint')
+    args shaderSourceDir.absolutePath,
+        new File(spirvResourcesDir, 'quantified/shaders/vulkan').absolutePath
+    jvmArgs '-Xmx256m', '-Dorg.lwjgl.system.stackSize=16384'
+}
+
+tasks.register('vulkanProbeJar', Jar) {
+    archiveBaseName.set('quantified-vulkan-probe')
+    archiveClassifier.set('')
+    archiveVersion.set('')
+    from sourceSets.vulkanProbe.output
+    manifest {
+        attributes('Main-Class': 'org.admany.quantified.vulkan.probe.VulkanProbeEntrypoint')
+    }
+}
+
+tasks.register('openclProbeJar', Jar) {
+    archiveBaseName.set('quantified-opencl-probe')
+    archiveClassifier.set('')
+    archiveVersion.set('')
+    from sourceSets.openclProbe.output
+    manifest {
+        attributes('Main-Class': 'org.admany.quantified.opencl.probe.OpenCLProbeEntrypoint')
+    }
+}
+
+tasks.register('prepareOpenClProbeResource') {
+    dependsOn tasks.named('openclProbeJar')
+    inputs.files(tasks.named('openclProbeJar'))
+    inputs.files(configurations.openclProbeRuntimeClasspath)
+    outputs.dir(openclProbeResourcesDir)
+    doLast {
+        def openclProbeLibs = configurations.openclProbeRuntimeClasspath.files.findAll { file ->
+            !(file.name.startsWith('lwjgl-opencl-') && file.name.contains('natives'))
+        }
+        def embeddedDir = openclProbeResourcesDir.get().dir('quantified/embedded').asFile
+        def rootDir = new File(embeddedDir, 'openclProbe')
+        project.delete(embeddedDir)
+        rootDir.mkdirs()
+
+        copy {
+            from(tasks.named('openclProbeJar'))
+            into(rootDir)
+            rename { 'quantified-opencl-probe.jar.bin' }
+        }
+
+        def libDir = new File(rootDir, 'lib')
+        libDir.mkdirs()
+        copy {
+            from(openclProbeLibs)
+            into(libDir)
+            include('*.jar')
+            rename { String originalName -> originalName.endsWith('.jar') ? originalName + '.bin' : originalName }
+        }
+
+        def classpathEntries = ['quantified-opencl-probe.jar']
+        classpathEntries.addAll(openclProbeLibs.collect { "lib/${it.name}" }.sort())
+        new File(rootDir, 'classpath.index').text = classpathEntries.join(System.lineSeparator()) + System.lineSeparator()
+    }
+}
+
+tasks.register('prepareVulkanProbeResource') {
+    dependsOn tasks.named('vulkanProbeJar')
+    inputs.files(tasks.named('vulkanProbeJar'))
+    inputs.files(configurations.vulkanProbeRuntimeClasspath)
+    outputs.dir(vulkanProbeResourcesDir)
+    doLast {
+        def vulkanProbeLibs = configurations.vulkanProbeRuntimeClasspath.files.findAll { file ->
+            !(file.name.startsWith('lwjgl-vulkan-') && file.name.contains('natives'))
+        }
+        def embeddedDir = vulkanProbeResourcesDir.get().dir('quantified/embedded').asFile
+        def rootDir = new File(embeddedDir, 'vulkanProbe')
+        project.delete(embeddedDir)
+        rootDir.mkdirs()
+
+        copy {
+            from(tasks.named('vulkanProbeJar'))
+            into(rootDir)
+            rename { 'quantified-vulkan-probe.jar.bin' }
+        }
+
+        def libDir = new File(rootDir, 'lib')
+        libDir.mkdirs()
+        copy {
+            from(vulkanProbeLibs)
+            into(libDir)
+            include('*.jar')
+            rename { String originalName -> originalName.endsWith('.jar') ? originalName + '.bin' : originalName }
+        }
+
+        def classpathEntries = ['quantified-vulkan-probe.jar']
+        classpathEntries.addAll(vulkanProbeLibs.collect { "lib/${it.name}" }.sort())
+        new File(rootDir, 'classpath.index').text = classpathEntries.join(System.lineSeparator()) + System.lineSeparator()
+    }
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    dependsOn tasks.named('compileVulkanShaders')
+    dependsOn tasks.named('prepareOpenClProbeResource')
+    dependsOn tasks.named('prepareVulkanProbeResource')
+    var replaceProperties = [
+        minecraft_version: minecraft_version,
+        minecraft_version_range: minecraft_version_range,
+        neoforge_version: neoforge_version,
+        neoforge_version_range: neoforge_version_range,
+        loader_version_range: loader_version_range,
+        mod_id: mod_id,
+        mod_name: mod_name,
+        mod_license: mod_license,
+        mod_version: mod_version,
+        mod_authors: mod_authors,
+        mod_description: mod_description,
+    ]
+    inputs.properties replaceProperties
+    filesMatching(['META-INF/neoforge.mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties + [project: project]
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    enabled = false
+}
+
+tasks.named('shadowJar', Jar).configure {
+    archiveClassifier.set("")
+    from sourceSets.main.output
+    dependencies {
+        include(dependency('com.github.ben-manes.caffeine:caffeine'))
+    }
+    exclude 'net/neoforged/**'
+    exclude 'net/minecraftforge/**'
+    exclude 'net/minecraft/**'
+    exclude 'org/lwjgl/system/**'
+    exclude 'org/lwjgl/*.class'
+    exclude 'windows/**'
+    exclude 'linux/**'
+    exclude 'macos/**'
+    exclude 'org/lwjgl/vulkan/video/**'
+    // Relocation disabled: Shadow's ASM remapper fails on Java 21+ invokedynamic string concat under Gradle 9.
+    minimize {
+        exclude(dependency('org.lwjgl:lwjgl-opencl:.*'))
+        exclude(dependency('com.github.ben-manes.caffeine:caffeine:.*'))
+    }
+}
+
+tasks.named('assemble').configure {
+    dependsOn shadowJar
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+publishing {
+    publications {
+        register('mavenJava', MavenPublication) {
+            artifact shadowJar
+        }
+    }
+}
+

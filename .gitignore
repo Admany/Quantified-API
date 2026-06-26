@@ -31,3 +31,18 @@ logs/debug.log
 Quantified-API-Description.md
 .gitignore
 .hintrc
+
+# nested platform build output
+platforms/**/.gradle/
+platforms/**/build/
+platforms/**/run/
+platforms/**/runs/
+platforms/**/logs/
+platforms/**/bin/
+platforms/**/config/
+
+# generated artifacts
+**/*.class
+**/*.bak
+libs/*.jar
+platforms/**/quantified-api.log

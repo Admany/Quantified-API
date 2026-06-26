@@ -6,14 +6,18 @@ import org.admany.quantified.core.common.async.core.AsyncManager;
 import org.admany.quantified.core.common.async.gpu.GpuWorkloadRegistry;
 import org.admany.quantified.core.common.async.gpu.OpenClBatchWorkload;
 import org.admany.quantified.core.common.async.gpu.VulkanBatchWorkload;
+import org.admany.quantified.core.common.async.gpu.VulkanIsolatedBatchWorkload;
 import org.admany.quantified.core.common.async.task.PriorityTaskType;
 import org.admany.quantified.core.common.async.task.TaskMetadata;
 import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.gpu.backend.GpuBackendRouter;
+import org.admany.quantified.core.common.gpu.backend.VulkanExecutionSupport;
 import org.admany.quantified.core.common.gpu.backend.VulkanRuntime;
+import org.admany.quantified.core.common.opencl.core.OpenCLIsolatedExecutor;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.opencl.core.OpenCLTask;
 import org.admany.quantified.core.common.vulkan.core.ApiVulkanTaskWrapper;
+import org.admany.quantified.core.common.vulkan.core.VulkanIsolatedExecutor;
 import org.admany.quantified.core.common.vulkan.core.VulkanManager;
 import org.admany.quantified.core.common.vulkan.core.VulkanTask;
 import org.admany.quantified.api.QuantifiedAPI;
@@ -117,16 +121,19 @@ public final class TaskScheduler {
 
         OpenCLTask<T> effectiveOpenClTask = null;
         VulkanTask<T> effectiveVulkanTask = null;
+        org.admany.quantified.api.opencl.QuantifiedOpenCL.ApiOpenClTask<T> apiOpenClTask = null;
+        org.admany.quantified.api.vulkan.QuantifiedVulkan.ApiVulkanTask<T> apiVulkanTask = null;
         if (gpuTask instanceof OpenCLTask) {
             effectiveOpenClTask = (OpenCLTask<T>) gpuTask;
         } else if (gpuTask instanceof org.admany.quantified.api.opencl.QuantifiedOpenCL.ApiOpenClTask) {
+            apiOpenClTask = (org.admany.quantified.api.opencl.QuantifiedOpenCL.ApiOpenClTask<T>) gpuTask;
             effectiveOpenClTask = new org.admany.quantified.core.common.opencl.core.ApiOpenClTaskWrapper<>(
-                (org.admany.quantified.api.opencl.QuantifiedOpenCL.ApiOpenClTask<T>) gpuTask);
+                apiOpenClTask);
         } else if (gpuTask instanceof VulkanTask) {
             effectiveVulkanTask = (VulkanTask<T>) gpuTask;
         } else if (gpuTask instanceof org.admany.quantified.api.vulkan.QuantifiedVulkan.ApiVulkanTask) {
-            effectiveVulkanTask = new ApiVulkanTaskWrapper<>(
-                (org.admany.quantified.api.vulkan.QuantifiedVulkan.ApiVulkanTask<T>) gpuTask);
+            apiVulkanTask = (org.admany.quantified.api.vulkan.QuantifiedVulkan.ApiVulkanTask<T>) gpuTask;
+            effectiveVulkanTask = new ApiVulkanTaskWrapper<>(apiVulkanTask);
         }
 
         if (effectiveOpenClTask instanceof org.admany.quantified.core.common.opencl.core.CacheableOpenCLTask<?> cacheableTask) {
@@ -147,6 +154,13 @@ public final class TaskScheduler {
             }
         }
 
+        boolean isolatedOpenClEligible = apiOpenClTask != null
+            && !OpenCLManager.isAvailable()
+            && OpenCLManager.hasExecutableRuntime();
+        boolean isolatedVulkanEligible = apiVulkanTask != null
+            && !VulkanExecutionSupport.inProcessAvailable()
+            && VulkanExecutionSupport.hasExecutableRuntime();
+
         TaskAnalysis analysis = analyzeTask(dataSizeBytes, parallelUnits, complexity, type);
 
         GpuBackendPreference effectivePreference = normalizeBackendPreference(modId, backendPreference);
@@ -154,7 +168,9 @@ public final class TaskScheduler {
             modId,
             effectivePreference,
             effectiveOpenClTask != null,
-            effectiveVulkanTask != null
+            OpenCLManager.isAvailable() || isolatedOpenClEligible,
+            effectiveVulkanTask != null,
+            VulkanRuntime.isAvailable() || isolatedVulkanEligible
         );
 
         ExecutionPlatform platform = decidePlatform(
@@ -162,7 +178,9 @@ public final class TaskScheduler {
             effectiveOpenClTask,
             effectiveVulkanTask,
             backendSelection.backendType(),
-            effectivePreference
+            effectivePreference,
+            isolatedOpenClEligible,
+            isolatedVulkanEligible
         );
 
         LOGGER.fine(() -> String.format("Task '%s' scheduled for %s (data: %d bytes, parallel: %d, complexity: %s)",
@@ -192,7 +210,8 @@ public final class TaskScheduler {
             dataSizeBytes,
             parallelUnits,
             complexity,
-            type
+            type,
+            isolatedVulkanEligible
         );
 
         if (QuantifiedAPI.isPrintDebugLogs()) {
@@ -200,6 +219,34 @@ public final class TaskScheduler {
         }
 
         if (gpuSelected) {
+            if (backendSelection.backendType() == GpuBackendType.OPENCL && isolatedOpenClEligible) {
+                org.admany.quantified.api.opencl.QuantifiedOpenCL.ApiOpenClTask<T> isolatedTask = apiOpenClTask;
+                Supplier<CompletableFuture<T>> asyncSupplier = () -> executeIsolatedOpenCl(isolatedTask, cpuImplementation);
+                return AsyncManager.submitAsync(
+                    taskKey,
+                    PriorityTaskType.BUILDING,
+                    PriorityTaskType.BUILDING.defaultScore(),
+                    asyncSupplier,
+                    timeout,
+                    allowMainThreadRerouting,
+                    modId,
+                    metadata
+                );
+            }
+            if (backendSelection.backendType() == GpuBackendType.VULKAN && isolatedVulkanEligible) {
+                org.admany.quantified.api.vulkan.QuantifiedVulkan.ApiVulkanTask<T> isolatedTask = apiVulkanTask;
+                Supplier<CompletableFuture<T>> asyncSupplier = () -> executeIsolatedVulkan(isolatedTask, cpuImplementation);
+                return AsyncManager.submitAsync(
+                    taskKey,
+                    PriorityTaskType.BUILDING,
+                    PriorityTaskType.BUILDING.defaultScore(),
+                    asyncSupplier,
+                    timeout,
+                    allowMainThreadRerouting,
+                    modId,
+                    metadata
+                );
+            }
             Supplier<CompletableFuture<T>> asyncSupplier = () -> resolveGpuOrCpu(taskKey, cpuImplementation);
             return AsyncManager.submitAsync(
                 taskKey,
@@ -323,7 +370,8 @@ public final class TaskScheduler {
                                               long dataSizeBytes,
                                               int parallelUnits,
                                               TaskComplexity complexity,
-                                              TaskType type) {
+                                              TaskType type,
+                                              boolean isolatedVulkanEligible) {
         TaskMetadata.Builder builder = TaskMetadata.builder();
         double estimatedCost = Math.max(1.0, dataSizeBytes / 4096.0);
         builder.estimatedCost(estimatedCost);
@@ -341,8 +389,11 @@ public final class TaskScheduler {
         builder.maximumBatchSize(Math.max(preferred, preferred * 2));
           if (gpuSelected) {
               builder.gpuPreferred(true);
-              builder.batchable(true);
-              builder.gpuWorkload(backendType == GpuBackendType.VULKAN ? VulkanBatchWorkload.INSTANCE : gpuBatchWorkload);
+              TaskMetadata.GpuBatchWorkload workload = resolveGpuBatchWorkload(backendType, isolatedVulkanEligible);
+              builder.batchable(workload != null);
+              if (workload != null) {
+                  builder.gpuWorkload(workload);
+              }
               if ((backendPreference != null && (backendPreference.requiresOpenCL() || backendPreference.requiresVulkan()))
                   || analysis.dataSizeOptimal()
                   || complexity == TaskComplexity.MASSIVE) {
@@ -354,16 +405,29 @@ public final class TaskScheduler {
         return builder.build();
     }
 
+    private static TaskMetadata.GpuBatchWorkload resolveGpuBatchWorkload(GpuBackendType backendType,
+                                                                         boolean isolatedVulkanEligible) {
+        if (backendType != GpuBackendType.VULKAN) {
+            return gpuBatchWorkload;
+        }
+        if (VulkanExecutionSupport.inProcessAvailable()) {
+            return VulkanBatchWorkload.INSTANCE;
+        }
+        return isolatedVulkanEligible ? VulkanIsolatedBatchWorkload.INSTANCE : null;
+    }
+
     private static ExecutionPlatform decidePlatform(TaskAnalysis analysis,
                                                     OpenCLTask<?> openClTask,
                                                     VulkanTask<?> vulkanTask,
                                                     GpuBackendType backendType,
-                                                    GpuBackendPreference backendPreference) {
+                                                    GpuBackendPreference backendPreference,
+                                                    boolean isolatedOpenClEligible,
+                                                    boolean isolatedVulkanEligible) {
         if (backendType == GpuBackendType.VULKAN) {
-            return decideVulkanPlatform(analysis, vulkanTask, backendPreference);
+            return decideVulkanPlatform(analysis, vulkanTask, backendPreference, isolatedVulkanEligible);
         }
         if (backendType == GpuBackendType.OPENCL) {
-            return decideOpenClPlatform(analysis, openClTask, backendPreference);
+            return decideOpenClPlatform(analysis, openClTask, backendPreference, isolatedOpenClEligible);
         }
         return ExecutionPlatform.CPU;
     }
@@ -375,8 +439,9 @@ public final class TaskScheduler {
 
     private static ExecutionPlatform decideOpenClPlatform(TaskAnalysis analysis,
                                                           OpenCLTask<?> gpuTask,
-                                                          GpuBackendPreference backendPreference) {
-        if (gpuTask == null || !OpenCLManager.isAvailable()) {
+                                                          GpuBackendPreference backendPreference,
+                                                          boolean isolatedOpenClEligible) {
+        if (gpuTask == null || (!OpenCLManager.isAvailable() && !isolatedOpenClEligible)) {
             return ExecutionPlatform.CPU;
         }
 
@@ -384,7 +449,7 @@ public final class TaskScheduler {
             && MultithreadingConfig.CONFIG.enableGpuAcceleration
             && MultithreadingConfig.CONFIG.openclForced;
 
-        boolean capacityOk = canGpuAcceptTask(analysis, gpuTask);
+        boolean capacityOk = canGpuAcceptTask(analysis, gpuTask, isolatedOpenClEligible);
         if (!capacityOk) {
             if (forceOpenCl) {
                 LOGGER.fine(() -> "GPU capacity limit reached while OpenCL forcing enabled; routing task to CPU to avoid VRAM exhaustion.");
@@ -405,11 +470,12 @@ public final class TaskScheduler {
 
     private static ExecutionPlatform decideVulkanPlatform(TaskAnalysis analysis,
                                                           VulkanTask<?> gpuTask,
-                                                          GpuBackendPreference backendPreference) {
-        if (gpuTask == null || !VulkanRuntime.isAvailable()) {
+                                                          GpuBackendPreference backendPreference,
+                                                          boolean isolatedVulkanEligible) {
+        if (gpuTask == null || (!VulkanRuntime.isAvailable() && !isolatedVulkanEligible)) {
             return ExecutionPlatform.CPU;
         }
-        if (!canGpuAcceptTask(analysis, gpuTask)) {
+        if (!canGpuAcceptTask(analysis, gpuTask, isolatedVulkanEligible)) {
             return ExecutionPlatform.CPU;
         }
         if (backendPreference != null && backendPreference.requiresVulkan()) {
@@ -465,13 +531,15 @@ public final class TaskScheduler {
         return true;
     }
 
-    private static boolean canGpuAcceptTask(TaskAnalysis analysis, OpenCLTask<?> gpuTask) {
+    private static boolean canGpuAcceptTask(TaskAnalysis analysis,
+                                            OpenCLTask<?> gpuTask,
+                                            boolean isolatedOpenClEligible) {
         if (gpuTask == null) {
             return false;
         }
 
         if (!OpenCLManager.isAvailable()) {
-            return false;
+            return isolatedOpenClEligible;
         }
         try {
             org.admany.quantified.core.common.async.core.PriorityScheduler.SchedulerSnapshot schedulerSnapshot = AsyncManager.schedulerSnapshot();
@@ -516,9 +584,12 @@ public final class TaskScheduler {
         return accepted;
     }
 
-    private static boolean canGpuAcceptTask(TaskAnalysis analysis, VulkanTask<?> gpuTask) {
-        if (gpuTask == null || !VulkanRuntime.isAvailable()) {
+    private static boolean canGpuAcceptTask(TaskAnalysis analysis, VulkanTask<?> gpuTask, boolean isolatedVulkanEligible) {
+        if (gpuTask == null) {
             return false;
+        }
+        if (!VulkanExecutionSupport.inProcessAvailable()) {
+            return isolatedVulkanEligible;
         }
         try {
             org.admany.quantified.core.common.async.core.PriorityScheduler.SchedulerSnapshot schedulerSnapshot = AsyncManager.schedulerSnapshot();
@@ -814,6 +885,42 @@ public final class TaskScheduler {
         } finally {
             long duration = Math.max(0L, System.nanoTime() - start);
             updateLatencyEma(emaCpuNanos, duration, LATENCY_EMA_ALPHA);
+        }
+    }
+
+    private static <T> CompletableFuture<T> executeIsolatedOpenCl(
+        org.admany.quantified.api.opencl.QuantifiedOpenCL.ApiOpenClTask<T> apiTask,
+        Supplier<T> cpuImplementation
+    ) {
+        try {
+            T result = OpenCLIsolatedExecutor.executeApiTask(apiTask);
+            return CompletableFuture.completedFuture(result);
+        } catch (Throwable ignored) {
+            try {
+                return CompletableFuture.completedFuture(executeMeasuredCpu(cpuImplementation));
+            } catch (Throwable cpuThrowable) {
+                CompletableFuture<T> failed = new CompletableFuture<>();
+                failed.completeExceptionally(cpuThrowable);
+                return failed;
+            }
+        }
+    }
+
+    private static <T> CompletableFuture<T> executeIsolatedVulkan(
+        org.admany.quantified.api.vulkan.QuantifiedVulkan.ApiVulkanTask<T> apiTask,
+        Supplier<T> cpuImplementation
+    ) {
+        try {
+            T result = VulkanIsolatedExecutor.executeApiTask(apiTask);
+            return CompletableFuture.completedFuture(result);
+        } catch (Throwable ignored) {
+            try {
+                return CompletableFuture.completedFuture(executeMeasuredCpu(cpuImplementation));
+            } catch (Throwable cpuThrowable) {
+                CompletableFuture<T> failed = new CompletableFuture<>();
+                failed.completeExceptionally(cpuThrowable);
+                return failed;
+            }
         }
     }
 

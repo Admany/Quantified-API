@@ -39,6 +39,14 @@ public final class GPUDetector {
     public static GPUCapabilities detectCapabilities(String preferredDeviceId) {
         try {
             if (!isOpenCLAvailable()) {
+                OpenCLRuntime.ProbeSnapshot probeSnapshot = OpenCLRuntime.probeSnapshot();
+                if (!probeSnapshot.devices().isEmpty()) {
+                    OpenCLRuntime.ProbeDeviceInfo device = probeSnapshot.devices().get(0);
+                    String reason = "OpenCL hardware detected via isolated probe (" + device.name()
+                        + "), but in-process runtime execution is unavailable";
+                    LOGGER.info(reason);
+                    return new GPUCapabilities(false, null, null, null, null, false, reason);
+                }
                 LOGGER.info("OpenCL not available on this system");
                 return GPUCapabilities.UNSUPPORTED;
             }
@@ -92,7 +100,10 @@ public final class GPUDetector {
 
     private static boolean isOpenCLAvailable() {
         try {
-            CL.class.getName();
+            if (!OpenCLRuntime.hasBindings()) {
+                LOGGER.info("OpenCL binding unavailable in-process: " + OpenCLRuntime.getBindingName());
+                return false;
+            }
             OpenCLRuntime.AvailabilitySnapshot status = OpenCLRuntime.snapshot();
             if (!status.available()) {
                 String reason = status.failureReason() != null ? status.failureReason() : "unknown";
@@ -107,7 +118,23 @@ public final class GPUDetector {
 
     public static List<OpenCLDeviceInfo> listDevices() {
         if (!isOpenCLAvailable()) {
-            return List.of();
+            OpenCLRuntime.ProbeSnapshot probeSnapshot = OpenCLRuntime.probeSnapshot();
+            if (probeSnapshot.devices().isEmpty()) {
+                return List.of();
+            }
+            List<OpenCLDeviceInfo> probedDevices = new ArrayList<>(probeSnapshot.devices().size());
+            for (OpenCLRuntime.ProbeDeviceInfo device : probeSnapshot.devices()) {
+                probedDevices.add(new OpenCLDeviceInfo(
+                    device.id(),
+                    device.name(),
+                    device.vendor(),
+                    mapProbeType(device.type()),
+                    device.vramBytes(),
+                    device.computeUnits(),
+                    device.supportsOpenCL32()
+                ));
+            }
+            return probedDevices;
         }
         List<DeviceCandidate> candidates = enumerateAllDevices(DeviceCriteria.listing());
         java.util.LinkedHashMap<String, DeviceCandidate> unique = new java.util.LinkedHashMap<>();
@@ -171,6 +198,18 @@ public final class GPUDetector {
 
     private static String normalizeDeviceKey(String value) {
         return value == null ? "" : value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", "");
+    }
+
+    private static DeviceType mapProbeType(String type) {
+        if (type == null) {
+            return DeviceType.LEGACY;
+        }
+        return switch (type.toUpperCase(Locale.ROOT)) {
+            case "DISCRETE" -> DeviceType.DISCRETE;
+            case "INTEGRATED" -> DeviceType.INTEGRATED;
+            case "CPU" -> DeviceType.CPU;
+            default -> DeviceType.LEGACY;
+        };
     }
 
     private static boolean preferCandidate(DeviceCandidate candidate, DeviceCandidate existing) {
@@ -251,9 +290,9 @@ public final class GPUDetector {
         List<DeviceCandidate> devices = new ArrayList<>();
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            int[] deviceTypes = {CL10.CL_DEVICE_TYPE_GPU, CL10.CL_DEVICE_TYPE_ACCELERATOR, CL10.CL_DEVICE_TYPE_CPU};
+            long[] deviceTypes = {CL10.CL_DEVICE_TYPE_GPU, CL10.CL_DEVICE_TYPE_ACCELERATOR, CL10.CL_DEVICE_TYPE_CPU};
 
-            for (int deviceType : deviceTypes) {
+            for (long deviceType : deviceTypes) {
                 if (deviceType == CL10.CL_DEVICE_TYPE_CPU && !criteria.allowCpu()) {
                     continue;
                 }
@@ -436,13 +475,17 @@ public final class GPUDetector {
         return vramBytes >= MIN_VRAM_BYTES && computeUnits >= MIN_COMPUTE_UNITS;
     }
 
-    private static String getDeviceTypeName(int deviceType) {
-        switch (deviceType) {
-            case CL10.CL_DEVICE_TYPE_CPU: return "CPU";
-            case CL10.CL_DEVICE_TYPE_GPU: return "GPU";
-            case CL10.CL_DEVICE_TYPE_ACCELERATOR: return "Accelerator";
-            default: return "Unknown";
+    private static String getDeviceTypeName(long deviceType) {
+        if (deviceType == CL10.CL_DEVICE_TYPE_CPU) {
+            return "CPU";
         }
+        if (deviceType == CL10.CL_DEVICE_TYPE_GPU) {
+            return "GPU";
+        }
+        if (deviceType == CL10.CL_DEVICE_TYPE_ACCELERATOR) {
+            return "Accelerator";
+        }
+        return "Unknown";
     }
 
     private static UUID getDeviceUUID(long deviceId) {

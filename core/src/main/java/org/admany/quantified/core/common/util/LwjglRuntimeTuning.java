@@ -2,7 +2,10 @@ package org.admany.quantified.core.common.util;
 
 import org.admany.quantified.core.common.threading.core.WorkerClassLoaderContext;
 import org.lwjgl.system.Configuration;
+import org.lwjgl.system.MemoryStack;
 
+import java.lang.reflect.Field;
+import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
@@ -15,8 +18,33 @@ public final class LwjglRuntimeTuning {
     private static final int DEFAULT_GPU_THREAD_STACK_BYTES = 64 * MIB;
     private static final int DEFAULT_PROBE_THREAD_STACK_BYTES = 64 * MIB;
     private static final AtomicBoolean CONFIGURED = new AtomicBoolean(false);
+    private static final AtomicBoolean THREAD_STACK_REFLECTION_WARNING_LOGGED = new AtomicBoolean(false);
+    private static volatile ThreadLocal<MemoryStack> memoryStackThreadLocal;
+
+    static {
+        prefetchStackSizeProperties();
+    }
 
     private LwjglRuntimeTuning() {
+    }
+
+    private static void prefetchStackSizeProperties() {
+        int stackSizeBytes = maxBytes(
+            DEFAULT_STACK_SIZE_BYTES,
+            parseBytesProperty("quantified.lwjgl.stackSizeBytes"),
+            parseKilobytesProperty("quantified.lwjgl.stackSizeKb"),
+            parseKilobytesProperty("org.lwjgl.system.stackSize")
+        );
+        int stackSizeKb = bytesToKb(stackSizeBytes);
+        System.setProperty("quantified.lwjgl.stackSizeBytes", Integer.toString(stackSizeBytes));
+        System.setProperty("quantified.lwjgl.stackSizeKb", Integer.toString(stackSizeKb));
+        System.setProperty("org.lwjgl.system.stackSize", Integer.toString(stackSizeKb));
+    }
+
+    public static MemoryStack pushMemoryStack() {
+        ensureConfigured();
+        ensureThreadLocalStack();
+        return MemoryStack.stackPush();
     }
 
     public static int ensureConfigured() {
@@ -40,6 +68,46 @@ public final class LwjglRuntimeTuning {
         LOGGER.info("[LwjglRuntimeTuning] Configured LWJGL stack size to "
             + (stackSizeBytes / MIB) + " MiB (" + stackSizeKb + " KiB)");
         return stackSizeBytes;
+    }
+
+    public static void ensureThreadLocalStack() {
+        int desiredBytes = ensureConfigured();
+        try {
+            ThreadLocal<MemoryStack> threadLocal = memoryStackThreadLocal();
+            MemoryStack current = threadLocal.get();
+            if (current != null && current.getSize() >= desiredBytes) {
+                return;
+            }
+            if (current != null && current.getFrameIndex() != 0) {
+                if (THREAD_STACK_REFLECTION_WARNING_LOGGED.compareAndSet(false, true)) {
+                    LOGGER.warning("[LwjglRuntimeTuning] Cannot replace active LWJGL MemoryStack on thread '"
+                        + Thread.currentThread().getName() + "'; current=" + current.getSize()
+                        + " bytes, desired=" + desiredBytes + " bytes");
+                }
+                return;
+            }
+            threadLocal.set(MemoryStack.create(desiredBytes));
+            LOGGER.info("[LwjglRuntimeTuning] Installed thread-local LWJGL MemoryStack for '"
+                + Thread.currentThread().getName() + "' size=" + (desiredBytes / MIB) + " MiB");
+        } catch (Throwable throwable) {
+            if (THREAD_STACK_REFLECTION_WARNING_LOGGED.compareAndSet(false, true)) {
+                LOGGER.warning("[LwjglRuntimeTuning] Failed to install thread-local LWJGL MemoryStack: "
+                    + throwable.getClass().getSimpleName() + ": " + throwable.getMessage());
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ThreadLocal<MemoryStack> memoryStackThreadLocal() throws ReflectiveOperationException {
+        ThreadLocal<MemoryStack> cached = memoryStackThreadLocal;
+        if (cached != null) {
+            return cached;
+        }
+        Field field = MemoryStack.class.getDeclaredField("TLS");
+        field.setAccessible(true);
+        ThreadLocal<MemoryStack> resolved = (ThreadLocal<MemoryStack>) field.get(null);
+        memoryStackThreadLocal = resolved;
+        return resolved;
     }
 
     public static int gpuThreadStackSizeKb() {
@@ -120,5 +188,24 @@ public final class LwjglRuntimeTuning {
         long safeBytes = Math.max(bytes, KIB);
         long rounded = (safeBytes + (KIB - 1L)) / KIB;
         return (int) Math.min(Integer.MAX_VALUE, rounded);
+    }
+
+    public static void addModernJvmCompatArgs(java.util.List<String> command) {
+        int feature = Runtime.version().feature();
+        if (feature >= 22) {
+            command.add("--enable-native-access=ALL-UNNAMED");
+        }
+        if (feature >= 24) {
+            command.add("--sun-misc-unsafe-memory-access=allow");
+        }
+    }
+
+    /**
+     * Keeps probe subprocesses on the embedded LWJGL jars instead of inheriting the game's
+     * {@code java.library.path}, which on MC 26.x points at a different LWJGL version.
+     */
+    public static void addIsolatedProbeNativeExtractPath(java.util.List<String> command, Path extractRoot) {
+        Path nativesDir = extractRoot.resolve("natives");
+        command.add("-Dorg.lwjgl.system.SharedLibraryExtractPath=" + nativesDir.toAbsolutePath());
     }
 }

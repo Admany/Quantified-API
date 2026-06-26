@@ -2,9 +2,9 @@ package org.admany.quantified.core.common.vulkan.core;
 
 public final class VulkanContext {
 
-    private final VulkanManager manager;
+    private final VulkanInProcessManager manager;
 
-    VulkanContext(VulkanManager manager) {
+    VulkanContext(VulkanInProcessManager manager) {
         this.manager = manager;
     }
 

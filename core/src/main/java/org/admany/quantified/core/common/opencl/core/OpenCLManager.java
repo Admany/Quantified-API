@@ -104,6 +104,10 @@ public final class OpenCLManager {
                monitor != null;
     }
 
+    public static boolean hasExecutableRuntime() {
+        return isAvailable() || OpenCLIsolatedExecutor.canExecute();
+    }
+
     public static void registerAvailabilityListener(Runnable listener) {
         if (listener == null) {
             return;
@@ -142,6 +146,11 @@ public final class OpenCLManager {
         return current != null ? current.estimatedActiveVramBytes() : 0L;
     }
 
+    public static int activeTaskComputeUnits() {
+        GPUMonitor current = monitor;
+        return current != null ? current.activeComputeUnits() : 0;
+    }
+
     public static void cacheRemove(String modId, String key) {
         TieredGpuCache cache = tieredCache;
         if (cache != null) cache.remove(modId, key);
@@ -151,6 +160,9 @@ public final class OpenCLManager {
         if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
             lastRuntimeStatus = RuntimeStatus.failed("GPU acceleration disabled in configuration");
             return CompletableFuture.completedFuture(false);
+        }
+        if (hasCachedExecutableProbe()) {
+            return CompletableFuture.completedFuture(true);
         }
         return CompletableFuture.supplyAsync(() -> {
             try {
@@ -170,6 +182,9 @@ public final class OpenCLManager {
         if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
             lastRuntimeStatus = RuntimeStatus.failed("GPU acceleration disabled in configuration");
             return false;
+        }
+        if (hasCachedExecutableProbe()) {
+            return true;
         }
         try {
             return performProbe(ProbeOptions.standard(), getPreferredDeviceId());
@@ -191,6 +206,12 @@ public final class OpenCLManager {
         OpenCLRuntime.AvailabilitySnapshot runtime = OpenCLRuntime.snapshot();
         if (!runtime.available()) {
             String reason = runtime.failureReason() != null ? runtime.failureReason() : "OpenCL runtime unavailable";
+            OpenCLRuntime.ProbeSnapshot probeSnapshot = OpenCLRuntime.probeSnapshot();
+            if (!probeSnapshot.devices().isEmpty()) {
+                OpenCLRuntime.ProbeDeviceInfo device = probeSnapshot.devices().get(0);
+                reason += "; isolated probe detected " + device.vendor() + " " + device.name()
+                    + " but in-process runtime execution is unavailable";
+            }
             String failureMsg = "OpenCL runtime unavailable: " + reason + " (binding: " + OpenCLRuntime.getBindingName() + ")";
             LOGGER.fine("Force probe: " + failureMsg);
             if (options.recordOverlayLogs()) {
@@ -247,6 +268,14 @@ public final class OpenCLManager {
             DeveloperOverlayManager.recordApiLog("[OpenCL] Acceleration ready - " + capabilities.device().name());
         }
         return true;
+    }
+
+    private static boolean hasCachedExecutableProbe() {
+        if (isAvailable()) {
+            return true;
+        }
+        OpenCLRuntime.ProbeSnapshot snapshot = OpenCLRuntime.cachedProbeSnapshot();
+        return snapshot != null && snapshot.success() && !snapshot.devices().isEmpty();
     }
 
     private static void runTestTask(boolean quiet) {

@@ -2,7 +2,6 @@ package org.admany.quantified.core.common.opencl.gpu;
 
 import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.opencl.core.OpenCLRuntime;
-import org.lwjgl.opencl.CL;
 import oshi.SystemInfo;
 import oshi.hardware.CentralProcessor;
 import oshi.hardware.GraphicsCard;
@@ -51,6 +50,9 @@ public final class HardwareDetector {
         if (!runtimeSnapshot.available()) {
             results.failureReason = runtimeSnapshot.failureReason();
         }
+        OpenCLRuntime.ProbeSnapshot probeSnapshot = OpenCLRuntime.probeSnapshot();
+        results.probeRuntimeAvailable = OpenCLRuntime.hasProbeRuntime();
+        results.isolatedProbeDetected = !probeSnapshot.devices().isEmpty();
 
         Optional<GraphicsCard> candidate = selectDiscreteCard(hal.getGraphicsCards());
         if (candidate.isPresent()) {
@@ -94,6 +96,16 @@ public final class HardwareDetector {
                 LOGGER.warning("OpenCL capability detection failed: " + t.getMessage());
                 results.failureReason = "OpenCL device enumeration failed";
             }
+        } else if (!probeSnapshot.devices().isEmpty()) {
+            OpenCLRuntime.ProbeDeviceInfo device = probeSnapshot.devices().get(0);
+            results.openclDeviceDetected = true;
+            results.opencl32Capable = device.supportsOpenCL32();
+            caps.detectedGpuName = device.name();
+            caps.detectedGpuVendor = device.vendor();
+            caps.detectedVramBytes = device.vramBytes();
+            if (results.failureReason == null || results.failureReason.isBlank()) {
+                results.failureReason = "OpenCL hardware detected via isolated probe, but in-process runtime execution is unavailable";
+            }
         }
 
         return buildStatus(results, os);
@@ -119,12 +131,7 @@ public final class HardwareDetector {
     }
 
     private static boolean checkLwjglBinding() {
-        try {
-            Class.forName(CL.class.getName(), false, HardwareDetector.class.getClassLoader());
-            return true;
-        } catch (Throwable t) {
-            return false;
-        }
+        return OpenCLRuntime.hasBindings();
     }
 
     private static Optional<GraphicsCard> selectDiscreteCard(List<GraphicsCard> cards) {
@@ -241,7 +248,11 @@ public final class HardwareDetector {
             builder.append("Enable gpuAcceleration in QuantifiedAPI config to allow detection.\n");
         }
         if (!results.lwjglAvailable) {
-            builder.append("LWJGL OpenCL binding is missing; ensure the runtime ships with org.lwjgl.opencl.\n");
+            if (results.isolatedProbeDetected) {
+                builder.append("OpenCL hardware was detected by the isolated probe, but the runtime is missing in-process org.lwjgl.opencl bindings.\n");
+            } else {
+                builder.append("LWJGL OpenCL binding is missing; ensure the runtime ships with org.lwjgl.opencl.\n");
+            }
         }
         if (!results.openclRuntimeAvailable) {
             builder.append("OpenCL runtime failed to initialise. Install vendor OpenCL drivers or clruntime packages.\n");
@@ -266,11 +277,13 @@ public final class HardwareDetector {
     public static final class DetectionResults {
         boolean configEnabled;
         boolean lwjglAvailable;
+        boolean probeRuntimeAvailable;
         boolean openclRuntimeAvailable;
         boolean discreteGpuDetected;
         boolean meetsVramRequirement;
         boolean opencl32Capable;
         boolean openclDeviceDetected;
+        boolean isolatedProbeDetected;
         public boolean contextCreationSuccessful;
         String failureReason;
         HardwareCapabilities hardwareCapabilities = new HardwareCapabilities();

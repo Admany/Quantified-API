@@ -1,0 +1,16 @@
+pluginManagement {
+    repositories {
+        maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
+dependencyResolutionManagement {
+    repositories {
+        mavenCentral()
+        maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+    }
+}
+
+rootProject.name = 'quantified-api-fabric-26'

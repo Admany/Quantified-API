@@ -241,15 +241,18 @@ public final class DeveloperOverlayManager {
 
             long totalFallbacks = fallbackEventsTotal.get();
             long recentFallbacks = fallbackEventsRecent.getAndSet(0L);
+            long activeGpuTaskBytes = Math.max(0L, OpenCLManager.activeTaskVramBytes());
+            int activeGpuComputeUnits = Math.max(0, OpenCLManager.activeTaskComputeUnits());
+            boolean qapiGpuActive = activeGpuTaskBytes > 0L || activeGpuComputeUnits > 0 || recentFallbacks > 0L;
 
             if (timelineActive.get()) {
-                maybeEmitAutomaticAlerts(now, totalWork, gpuMemoryUtil, gpuComputeUtil, gpuTemperature);
+                maybeEmitAutomaticAlerts(now, totalWork, gpuMemoryUtil, gpuComputeUtil, gpuTemperature, qapiGpuActive);
             }
 
             List<TimelineEvent> timelineSnapshot = timelineActive.get() ? snapshotTimeline() : List.of();
 
             List<AutoTuningHint> hints = autoHintsActive.get()
-                ? computeHints(totalWork, execRate, gpuMemoryUtil, gpuComputeUtil, gpuTemperature, recentFallbacks, desiredFg, desiredBg, systemLoad, gpuAvailable)
+                ? computeHints(totalWork, execRate, gpuMemoryUtil, gpuComputeUtil, gpuTemperature, recentFallbacks, desiredFg, desiredBg, systemLoad, gpuAvailable, qapiGpuActive)
                 : List.of();
             latestHints.set(hints);
 
@@ -297,7 +300,8 @@ public final class DeveloperOverlayManager {
                                                  int queueDepth,
                                                  double gpuMemoryUtil,
                                                  double gpuComputeUtil,
-                                                 double gpuTemperature) {
+                                                 double gpuTemperature,
+                                                 boolean qapiGpuActive) {
         if (queueDepth > QUEUE_ALERT_THRESHOLD && (now - lastQueueAlertMs) > ALERT_COOLDOWN_MS) {
             lastQueueAlertMs = now;
             recordTimelineEvent(new TimelineEvent(
@@ -310,6 +314,10 @@ public final class DeveloperOverlayManager {
                 gpuTemperature,
                 null
             ));
+        }
+        if (!qapiGpuActive) {
+            lastGpuSafeguardState = GpuSafeguardState.CLEAR;
+            return;
         }
         GpuSafeguardState safeguardState = classifyGpuSafeguard(gpuMemoryUtil, gpuComputeUtil, gpuTemperature);
         GpuSafeguardState previousState = lastGpuSafeguardState;
@@ -376,7 +384,8 @@ public final class DeveloperOverlayManager {
                                                      int desiredFg,
                                                      int desiredBg,
                                                      double systemLoad,
-                                                     boolean gpuAvailable) {
+                                                     boolean gpuAvailable,
+                                                     boolean qapiGpuActive) {
         List<AutoTuningHint> hints = new ArrayList<>();
         if (queueDepth > 512) {
             hints.add(new AutoTuningHint(
@@ -397,7 +406,7 @@ public final class DeveloperOverlayManager {
             ));
         }
 
-        if (gpuMemoryUtil > 0.85 || gpuComputeUtil > 0.85 || gpuTemperature > GPU_ALERT_TEMP) {
+        if (qapiGpuActive && (gpuMemoryUtil > 0.85 || gpuComputeUtil > 0.85 || gpuTemperature > GPU_ALERT_TEMP)) {
             hints.add(new AutoTuningHint(
                 HintSeverity.WARNING,
                 "GPU is under heavy load. Increased fallbacks to CPU are likely."
@@ -426,7 +435,7 @@ public final class DeveloperOverlayManager {
             ));
         }
 
-        if (gpuTemperature > 75.0 && gpuTemperature <= GPU_ALERT_TEMP && execRate == 0.0) {
+        if (qapiGpuActive && gpuTemperature > 75.0 && gpuTemperature <= GPU_ALERT_TEMP && execRate == 0.0) {
             hints.add(new AutoTuningHint(
                 HintSeverity.WARNING,
                 "Tasks are queuing but not being processed - verify worker threads are active and not blocked by long operations or deadlocks."

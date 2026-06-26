@@ -60,6 +60,13 @@ body {
     font-family: var(--font-stack);
 }
 
+html {
+    background:
+        radial-gradient(circle at top left, rgba(95, 111, 138, 0.12), transparent 34rem),
+        linear-gradient(135deg, var(--bg), var(--surface-strong));
+    overscroll-behavior-y: none;
+}
+
 body {
     background:
         radial-gradient(circle at top left, rgba(95, 111, 138, 0.12), transparent 34rem),
@@ -69,6 +76,18 @@ body {
     line-height: 1.4;
     position: relative;
     isolation: isolate;
+    min-height: 100dvh;
+}
+
+body::before {
+    content: "";
+    position: fixed;
+    inset: -20vh 0;
+    z-index: -2;
+    pointer-events: none;
+    background:
+        radial-gradient(circle at top left, rgba(95, 111, 138, 0.12), transparent 34rem),
+        linear-gradient(135deg, var(--bg), var(--surface-strong));
 }
 
 #root {
@@ -1243,6 +1262,8 @@ body {
     border: 1px solid var(--border-soft);
     border-radius: 14px;
     background: var(--surface);
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
 }
 
 .table-scroll.tall {
@@ -1251,6 +1272,35 @@ body {
 
 .mod-metrics-view .table-scroll.tall {
     max-height: 560px;
+}
+
+.table-scroll::-webkit-scrollbar,
+.sidebar-nav::-webkit-scrollbar,
+.log-window::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+.table-scroll::-webkit-scrollbar-track,
+.sidebar-nav::-webkit-scrollbar-track,
+.log-window::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.table-scroll::-webkit-scrollbar-thumb,
+.sidebar-nav::-webkit-scrollbar-thumb,
+.log-window::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+}
+
+.table-scroll::-webkit-scrollbar-thumb:hover,
+.sidebar-nav::-webkit-scrollbar-thumb:hover,
+.log-window::-webkit-scrollbar-thumb:hover {
+    background: var(--accent-1);
+    background-clip: padding-box;
 }
 
 .data-table,
@@ -1829,27 +1879,6 @@ textarea:focus {
 .log-window.wide-log {
     max-height: 760px;
     min-height: 560px;
-}
-
-.log-window::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
-}
-
-.log-window::-webkit-scrollbar-track {
-    background: transparent;
-}
-
-.log-window::-webkit-scrollbar-thumb {
-    background: var(--border-strong);
-    border-radius: 999px;
-    border: 2px solid transparent;
-    background-clip: padding-box;
-}
-
-.log-window::-webkit-scrollbar-thumb:hover {
-    background: var(--accent-1);
-    background-clip: padding-box;
 }
 
 .log-line {

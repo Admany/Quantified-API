@@ -15,7 +15,7 @@ const NAV_ITEMS = [
     { id: "system", label: "System" },
 ];
 
-const REFRESH_INTERVAL_MS = 1000;
+const REFRESH_INTERVAL_MS = 2000;
 const RESOURCE_REFRESH_MS = 5000;
 const HISTORY_LIMIT = 120;
 
@@ -733,37 +733,42 @@ const App = () => {
     );
 
     useEffect(() => {
-        loadAll();
-        const interval = window.setInterval(() => {
-            loadAll();
-            const activeMod = selectedModRef.current;
-            if (activeMod) {
-                loadModStats(activeMod);
+        let cancelled = false;
+        let refreshInFlight = false;
+        const tick = async () => {
+            if (cancelled || refreshInFlight || document.hidden) {
+                return;
             }
-        }, REFRESH_INTERVAL_MS);
+            refreshInFlight = true;
+            try {
+                await loadAll();
+                const activeMod = selectedModRef.current;
+                if (activeMod) {
+                    await loadModStats(activeMod);
+                }
+            } finally {
+                refreshInFlight = false;
+            }
+        };
+
+        tick();
+        const interval = window.setInterval(tick, REFRESH_INTERVAL_MS);
 
         const minLoadingTimer = setTimeout(() => {
             setLoadingState((prev) => ({ ...prev, minElapsed: true }));
-        }, 2000);
-
-        const animationTimer = setTimeout(() => {
-            if (shouldPlay) {
-                localStorage.setItem("quantifiedAnimationCount", (animationCount + 1).toString());
-            }
-            setLoadingState((prev) => ({ ...prev, overlayStage: "fading" }));
-        }, 3000);
+        }, shouldPlay ? 700 : 250);
 
         const deadlineTimer = setTimeout(() => {
             setLoadingState((prev) => ({ ...prev, deadlineHit: true }));
         }, 8000);
 
         return () => {
+            cancelled = true;
             window.clearInterval(interval);
             clearTimeout(minLoadingTimer);
-            clearTimeout(animationTimer);
             clearTimeout(deadlineTimer);
         };
-    }, [loadAll, loadModStats, shouldPlay, animationCount]);
+    }, [loadAll, loadModStats, shouldPlay]);
 
     useEffect(() => {
         if (loadingState.overlayStage === "fading") {
@@ -2504,7 +2509,6 @@ const App = () => {
                 </svg>
             </button>
         </div>
-        ${overlay}
         <div className="toast-stack">
             ${toasts.map((toast) => html`
                 <div className=${`toast toast-${toast.tone || "info"}`} key=${toast.id}>
@@ -2531,6 +2535,7 @@ const App = () => {
                 </div>
             </main>
         </div>
+        ${overlay}
     </div>`;
 };
 

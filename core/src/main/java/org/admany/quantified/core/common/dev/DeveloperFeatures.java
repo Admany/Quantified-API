@@ -198,9 +198,9 @@ public final class DeveloperFeatures {
             f.completeExceptionally(new IllegalStateException("Developer mode is not enabled"));
             return f;
         }
-        if (!org.admany.quantified.core.common.gpu.backend.VulkanRuntime.hasBindings()) {
+        if (!org.admany.quantified.core.common.gpu.backend.VulkanRuntime.hasProbeRuntime()) {
             java.util.concurrent.CompletableFuture<Boolean> f = new java.util.concurrent.CompletableFuture<>();
-            f.completeExceptionally(new IllegalStateException("LWJGL Vulkan classes are not present in this runtime"));
+            f.completeExceptionally(new IllegalStateException("No in-process LWJGL Vulkan classes or embedded Vulkan probe bundle are present"));
             return f;
         }
         return org.admany.quantified.core.common.vulkan.core.VulkanManager.forceProbe();

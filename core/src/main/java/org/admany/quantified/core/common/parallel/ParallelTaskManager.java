@@ -53,6 +53,8 @@ public final class ParallelTaskManager {
         ParallelMetrics.recordSubmission(spec.modId(), slices.size());
         int jobParallelism = Math.max(1, Math.min(spec.maxParallelism(), ParallelConfig.maxThreads()));
         int workerCount = Math.min(jobParallelism, slices.size());
+        // Cheap slice executors are faster on the caller thread until the batch is
+        // large enough to amortize scheduler and backpressure overhead.
         if (slices.size() <= INLINE_SYNC_THRESHOLD || workerCount <= 1) {
             return submitUnifiedInline(spec, slices);
         }

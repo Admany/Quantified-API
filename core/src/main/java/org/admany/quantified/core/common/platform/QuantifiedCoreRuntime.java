@@ -1,6 +1,8 @@
 package org.admany.quantified.core.common.platform;
 
 import org.admany.quantified.api.QuantifiedAPI;
+import org.admany.quantified.core.client.legacy.LegacyApiClientNotifier;
+import org.admany.quantified.core.compat.LegacyModScanner;
 import org.admany.quantified.core.common.async.core.AsyncManager;
 import org.admany.quantified.core.common.async.core.AsyncManagerBootstrap;
 import org.admany.quantified.core.common.cache.CacheManager;
@@ -144,7 +146,7 @@ public final class QuantifiedCoreRuntime {
         registerMod("test-mod", "1.0.0", logger);
 
         QuantifiedAPI.addConnectionListener(new QuantifiedConnectionListener());
-        QuantifiedAPI.register(MODID);
+        QuantifiedAPI.registerV2(MODID);
 
         logger.debug("[Quantified] Quantified API WebPanel starting");
         DeveloperOverlayManager.recordApiLog("[Quantified] Quantified API WebPanel starting");
@@ -157,9 +159,15 @@ public final class QuantifiedCoreRuntime {
 
         logger.info("Quantified API initialized successfully.");
         logRegisteredMods(logger);
+        try {
+            LegacyModScanner.scanLoadedMods();
+        } catch (Throwable t) {
+            logger.warn("Legacy API scan failed", t);
+        }
     }
 
     public static void onClientSetup(Logger logger) {
+        LegacyApiClientNotifier.initialize(logger);
         if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
             if (logger != null) {
                 logger.debug("Quantified client GPU probes skipped because GPU acceleration is disabled.");
@@ -180,6 +188,9 @@ public final class QuantifiedCoreRuntime {
         if (!clientWorldProbeTriggered) {
             triggerClientWorldProbe();
         }
+    }
+
+    public static void onClientTickEnd(Logger logger) {
     }
 
     public static void onServerStarting(Executor mainThreadExecutor) {
@@ -322,19 +333,28 @@ public final class QuantifiedCoreRuntime {
             logger.info("OpenCL acceleration not available: {}", e.getMessage());
             DeveloperOverlayManager.recordApiLog("[Quantified] OpenCL not available: " + e.getMessage());
         }
-        if (VulkanRuntime.hasBindings()) {
+        if (VulkanRuntime.hasProbeRuntime()) {
             try {
                 VulkanProbeScheduler.scheduleBackgroundProbe();
-                logger.info("Vulkan initialization deferred to background probe.");
-                DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan probe deferred (background)");
+                VulkanRuntime.RuntimeMode runtimeMode = VulkanRuntime.runtimeMode();
+                if (runtimeMode == VulkanRuntime.RuntimeMode.IN_PROCESS) {
+                    logger.info("Vulkan initialization deferred to background probe (in-process runtime).");
+                    DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan probe deferred (background, native runtime)");
+                } else if (runtimeMode == VulkanRuntime.RuntimeMode.ISOLATED) {
+                    logger.info("Vulkan initialization deferred to background probe (isolated bundled runtime for legacy Minecraft).");
+                    DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan probe deferred (background, isolated legacy runtime)");
+                } else {
+                    logger.info("Vulkan initialization deferred to background probe.");
+                    DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan probe deferred (background)");
+                }
                 DeveloperOverlayManager.recordApiLog("[Vulkan] Probe scheduler armed");
             } catch (Throwable e) {
                 logger.info("Vulkan acceleration not available: {}", e.getMessage());
                 DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan not available: " + e.getMessage());
             }
         } else {
-            logger.info("Vulkan acceleration not available: LWJGL Vulkan classes are missing from the runtime");
-            DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan not available: LWJGL Vulkan classes missing");
+            logger.info("Vulkan acceleration not available: no in-process LWJGL Vulkan classes or embedded probe bundle present");
+            DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan not available: no Vulkan probe runtime");
         }
     }
 
@@ -455,8 +475,8 @@ public final class QuantifiedCoreRuntime {
     }
 
     private static void forceInitializeVulkanClasses(Logger logger) {
-        if (!VulkanRuntime.hasBindings()) {
-            logger.info("Vulkan core classes not available: LWJGL Vulkan classes are missing from the runtime");
+        if (!VulkanRuntime.hasProbeRuntime()) {
+            logger.info("Vulkan core classes not available: no in-process LWJGL Vulkan classes or embedded probe bundle present");
             DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan core classes missing - Vulkan backend unavailable");
             return;
         }
@@ -464,10 +484,19 @@ public final class QuantifiedCoreRuntime {
             Class.forName("org.admany.quantified.api.vulkan.QuantifiedVulkan");
             Class.forName("org.admany.quantified.core.common.gpu.backend.VulkanRuntime");
             Class.forName("org.admany.quantified.core.common.gpu.backend.VulkanProbeScheduler");
-            Class.forName("org.admany.quantified.core.common.vulkan.core.VulkanManager");
-            Class.forName("org.admany.quantified.core.common.vulkan.core.VulkanContext");
-            logger.debug("Vulkan core classes loaded successfully.");
-            DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan core classes loaded");
+            if (VulkanRuntime.hasBindings()) {
+                Class.forName("org.admany.quantified.core.common.vulkan.core.VulkanManager");
+                Class.forName("org.admany.quantified.core.common.vulkan.core.VulkanContext");
+                logger.debug("Vulkan core classes loaded successfully.");
+                DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan core classes loaded");
+            } else if (VulkanRuntime.runtimeMode() == VulkanRuntime.RuntimeMode.ISOLATED) {
+                Class.forName("org.admany.quantified.core.common.vulkan.core.VulkanIsolatedExecutor");
+                logger.info("Vulkan isolated runtime classes loaded successfully for legacy Minecraft.");
+                DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan isolated runtime loaded for legacy Minecraft");
+            } else {
+                logger.info("Vulkan probe bundle loaded, but no executable Vulkan runtime is currently available.");
+                DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan probe bundle loaded without executable runtime");
+            }
         } catch (Throwable e) {
             logger.info("Vulkan core classes not available: {}", e.getMessage());
             DeveloperOverlayManager.recordApiLog("[Quantified] Vulkan core classes missing - Vulkan backend unavailable");

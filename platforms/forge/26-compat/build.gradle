@@ -1,0 +1,454 @@
+plugins {
+    id 'java'
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '[7.0.17,8)'
+    id 'com.gradleup.shadow' version '8.3.6'
+}
+
+def rootProps = new Properties()
+file('../../../gradle.properties').withInputStream { rootProps.load(it) }
+['mod_id', 'mod_name', 'mod_license', 'mod_version', 'mod_group_id', 'mod_authors', 'mod_description',
+ 'minecraft_version_forge_26x', 'minecraft_version_range_wide_forge_26', 'forge_version_forge_26x',
+ 'forge_version_range_forge_26x', 'loader_version_range_forge_26x', 'mapping_version_forge_26x'].each { key ->
+    ext.set(key, rootProps.getProperty(key))
+}
+
+def minecraft_version = project.property('minecraft_version_forge_26x')
+def minecraft_version_range = project.property('minecraft_version_range_wide_forge_26')
+def forge_version = project.property('forge_version_forge_26x')
+def forge_version_range = project.property('forge_version_range_forge_26x')
+def loader_version_range = project.property('loader_version_range_forge_26x')
+def mapping_version = project.property('mapping_version_forge_26x')
+version = project.property('mod_version')
+group = project.property('mod_group_id')
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+def archiveBase = "${mod_name}-forge-26".toLowerCase()
+
+println "Java: ${System.getProperty 'java.version'}, JVM: ${System.getProperty 'java.vm.version'} (${System.getProperty 'java.vendor'}), Arch: ${System.getProperty 'os.arch'}"
+
+def lwjglVersion = "3.3.3"
+def lwjglNatives = org.gradle.internal.os.OperatingSystem.current().isWindows() ? "natives-windows" :
+    (org.gradle.internal.os.OperatingSystem.current().isMacOsX() ? "natives-macos" : "natives-linux")
+def repoRootDir = file("${rootDir}/../../..")
+def openclProbeResourcesDir = layout.buildDirectory.dir('generated/openclProbeResources')
+def vulkanProbeResourcesDir = layout.buildDirectory.dir('generated/vulkanProbeResources')
+def spirvResourcesDir = new File(repoRootDir, 'build/shared/spirvResources')
+def shaderSourceDir = new File(repoRootDir, 'shared/shaders/src/vulkan')
+def shadercLwjglVersion = "3.3.3"
+
+def gzipProbeBinaries = { File root ->
+    if (root == null || !root.exists()) {
+        return
+    }
+    root.eachFileRecurse { File file ->
+        if (!file.isFile() || !file.name.endsWith('.bin')) {
+            return
+        }
+        byte[] raw = file.bytes
+        file.withOutputStream { output ->
+            new java.util.zip.GZIPOutputStream(output).withCloseable { gzip ->
+                gzip.write(raw)
+            }
+        }
+    }
+}
+
+configurations {
+    gpuBindings
+}
+
+minecraft {
+    mappings channel: 'official', version: mapping_version
+
+    runs {
+        configureEach {
+            workingDir = layout.projectDirectory.dir('run')
+            systemProperty 'forge.logging.markers', 'REGISTRIES'
+            systemProperty 'forge.logging.console.level', 'debug'
+            systemProperty 'forge.enabledGameTestNamespaces', mod_id
+            jvmArgs '-Dquantified.probeThreadStackBytes=8388608'
+
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+
+        register('client')
+
+        register('server') {
+            args '--nogui'
+        }
+
+        register('gameTestServer')
+
+        register('data') {
+            workingDir = layout.projectDirectory.dir('run-data')
+            args '--mod', mod_id, '--all', '--output', layout.projectDirectory.dir('src/generated/resources'), '--existing', layout.projectDirectory.dir('../../../core/src/main/resources')
+        }
+    }
+}
+
+sourceSets {
+    main {
+        java {
+            srcDirs = [
+                'src/main/java',
+                '../26.x/src/main/java/org/admany/quantified/core/forge/commands',
+                '../omni-base/src/main/java/org/lwjgl',
+                '../../../core/src/main/java'
+            ]
+        }
+        resources {
+            srcDirs = [
+                '../26.x/src/main/resources',
+                '../../../core/src/main/resources',
+                'src/generated/resources'
+            ]
+            srcDir(openclProbeResourcesDir)
+            srcDir(vulkanProbeResourcesDir)
+            srcDir(spirvResourcesDir)
+        }
+    }
+    test {
+        java {
+            srcDirs = ['src/test/java', '../../../core/src/test/java']
+        }
+        resources {
+            srcDirs = ['src/test/resources', '../../../core/src/test/resources']
+        }
+    }
+    openclProbe {
+        java {
+            srcDirs = ['../omni-base/src/openclProbe/java']
+        }
+        resources {
+            srcDirs = ['../omni-base/src/openclProbe/resources']
+        }
+    }
+    vulkanProbe {
+        java {
+            srcDirs = ['../26.x/src/vulkanProbe/java']
+        }
+        resources {
+            srcDirs = ['../26.x/src/vulkanProbe/resources']
+        }
+    }
+    shaderCompiler {
+        java {
+            srcDirs = ['../../../shader-compiler/src/main/java']
+        }
+    }
+}
+
+repositories {
+    minecraft.mavenizer(it)
+    maven fg.forgeMaven
+    maven fg.minecraftLibsMaven
+    mavenCentral()
+}
+
+dependencies {
+    implementation minecraft.dependency("net.minecraftforge:forge:${minecraft_version}-${forge_version}")
+    implementation "com.github.ben-manes.caffeine:caffeine:3.2.2"
+    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'net.java.dev.jna:jna:5.13.0'
+    implementation 'com.github.oshi:oshi-core:6.9.1'
+    compileOnly 'org.slf4j:slf4j-api:2.0.9'
+
+    compileOnly("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
+    compileOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    compileOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+    gpuBindings("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    gpuBindings("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.0'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.0'
+    testImplementation 'org.mockito:mockito-core:5.5.0'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.5.0'
+    testImplementation 'org.assertj:assertj-core:3.24.2'
+    testCompileOnly("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
+    testCompileOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    testCompileOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+    testRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
+    testRuntimeOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    testRuntimeOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+    testRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${lwjglNatives}") { transitive = false }
+
+    openclProbeImplementation("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
+    openclProbeCompileOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    openclProbeRuntimeOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
+    openclProbeRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${lwjglNatives}") { transitive = false }
+
+    vulkanProbeImplementation("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
+    vulkanProbeCompileOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+    vulkanProbeRuntimeOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
+    vulkanProbeRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${lwjglNatives}") { transitive = false }
+
+    shaderCompilerImplementation("org.lwjgl:lwjgl:${shadercLwjglVersion}") { transitive = false }
+    shaderCompilerImplementation("org.lwjgl:lwjgl-shaderc:${shadercLwjglVersion}") { transitive = false }
+    shaderCompilerRuntimeOnly("org.lwjgl:lwjgl:${shadercLwjglVersion}:${lwjglNatives}") { transitive = false }
+    shaderCompilerRuntimeOnly("org.lwjgl:lwjgl-shaderc:${shadercLwjglVersion}:${lwjglNatives}") { transitive = false }
+}
+
+tasks.register('compileVulkanShaders', JavaExec) {
+    dependsOn tasks.named(sourceSets.shaderCompiler.classesTaskName)
+    inputs.dir(shaderSourceDir)
+    outputs.dir(spirvResourcesDir)
+    classpath = sourceSets.shaderCompiler.runtimeClasspath
+    mainClass.set('org.admany.quantified.build.SpirvCompilerEntrypoint')
+    args shaderSourceDir.absolutePath,
+        new File(spirvResourcesDir, 'quantified/shaders/vulkan').absolutePath
+    jvmArgs '-Xmx256m', '-Dorg.lwjgl.system.stackSize=16384'
+}
+
+tasks.register('vulkanProbeJar', Jar) {
+    archiveBaseName.set('quantified-vulkan-probe')
+    archiveClassifier.set('')
+    archiveVersion.set('')
+    from sourceSets.vulkanProbe.output
+    manifest {
+        attributes(
+            'Main-Class': 'org.admany.quantified.vulkan.probe.VulkanProbeEntrypoint',
+            'Enable-Native-Access': 'ALL-UNNAMED'
+        )
+    }
+}
+
+tasks.register('openclProbeJar', Jar) {
+    archiveBaseName.set('quantified-opencl-probe')
+    archiveClassifier.set('')
+    archiveVersion.set('')
+    from sourceSets.openclProbe.output
+    manifest {
+        attributes(
+            'Main-Class': 'org.admany.quantified.opencl.probe.OpenCLProbeEntrypoint',
+            'Enable-Native-Access': 'ALL-UNNAMED'
+        )
+    }
+}
+
+tasks.register('prepareOpenClProbeResource') {
+    dependsOn tasks.named('openclProbeJar')
+    inputs.files(tasks.named('openclProbeJar'))
+    inputs.files(configurations.openclProbeRuntimeClasspath)
+    outputs.dir(openclProbeResourcesDir)
+    doLast {
+        def openclProbeLibs = configurations.openclProbeRuntimeClasspath.files.findAll { file ->
+            !(file.name.startsWith('lwjgl-opencl-') && file.name.contains('natives'))
+        }
+        def embeddedDir = openclProbeResourcesDir.get().dir('quantified/embedded').asFile
+        def rootDir = new File(embeddedDir, 'openclProbe')
+        project.delete(embeddedDir)
+        rootDir.mkdirs()
+
+        copy {
+            from(tasks.named('openclProbeJar'))
+            into(rootDir)
+            rename { 'quantified-opencl-probe.jar.bin' }
+        }
+
+        def libDir = new File(rootDir, 'lib')
+        libDir.mkdirs()
+        copy {
+            from(openclProbeLibs)
+            into(libDir)
+            include('*.jar')
+            rename { String originalName -> originalName.endsWith('.jar') ? originalName + '.bin' : originalName }
+        }
+
+        def classpathEntries = ['quantified-opencl-probe.jar']
+        classpathEntries.addAll(openclProbeLibs.collect { "lib/${it.name}" }.sort())
+        new File(rootDir, 'classpath.index').text = classpathEntries.join(System.lineSeparator()) + System.lineSeparator()
+        gzipProbeBinaries(rootDir)
+    }
+}
+
+tasks.register('prepareVulkanProbeResource') {
+    dependsOn tasks.named('vulkanProbeJar')
+    inputs.files(tasks.named('vulkanProbeJar'))
+    inputs.files(configurations.vulkanProbeRuntimeClasspath)
+    outputs.dir(vulkanProbeResourcesDir)
+    doLast {
+        def vulkanProbeLibs = configurations.vulkanProbeRuntimeClasspath.files.findAll { file ->
+            !(file.name.startsWith('lwjgl-vulkan-') && file.name.contains('natives'))
+        }
+        def embeddedDir = vulkanProbeResourcesDir.get().dir('quantified/embedded').asFile
+        def rootDir = new File(embeddedDir, 'vulkanProbe')
+        project.delete(embeddedDir)
+        rootDir.mkdirs()
+
+        copy {
+            from(tasks.named('vulkanProbeJar'))
+            into(rootDir)
+            rename { 'quantified-vulkan-probe.jar.bin' }
+        }
+
+        def libDir = new File(rootDir, 'lib')
+        libDir.mkdirs()
+        copy {
+            from(vulkanProbeLibs)
+            into(libDir)
+            include('*.jar')
+            rename { String originalName -> originalName.endsWith('.jar') ? originalName + '.bin' : originalName }
+        }
+
+        def classpathEntries = ['quantified-vulkan-probe.jar']
+        classpathEntries.addAll(vulkanProbeLibs.collect { "lib/${it.name}" }.sort())
+        new File(rootDir, 'classpath.index').text = classpathEntries.join(System.lineSeparator()) + System.lineSeparator()
+        gzipProbeBinaries(rootDir)
+    }
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    dependsOn tasks.named('compileVulkanShaders')
+    dependsOn tasks.named('prepareOpenClProbeResource')
+    dependsOn tasks.named('prepareVulkanProbeResource')
+    var replaceProperties = [
+            minecraft_version: minecraft_version, minecraft_version_range: minecraft_version_range,
+            forge_version: forge_version, forge_version_range: forge_version_range,
+            loader_version_range: loader_version_range,
+            mod_id: mod_id, mod_name: mod_name, mod_license: mod_license, mod_version: mod_version,
+            mod_authors: mod_authors, mod_description: mod_description,
+    ]
+    inputs.properties replaceProperties
+    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties + [project: project]
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    enabled = false
+}
+
+tasks.named('shadowJar', Jar).configure {
+    manifest {
+        attributes([
+                'Specification-Title'     : mod_id,
+                'Specification-Vendor'    : mod_authors,
+                'Specification-Version'   : '1',
+                'Implementation-Title'    : project.name,
+                'Implementation-Version'  : project.jar.archiveVersion,
+                'Implementation-Vendor'   : mod_authors,
+                'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+        ])
+    }
+    if (tasks.findByName('reobfJar') != null) {
+        finalizedBy 'reobfJar'
+    }
+}
+
+shadowJar {
+    archiveBaseName.set(archiveBase)
+    archiveClassifier.set("")
+    from sourceSets.main.output
+    dependencies {
+        include(dependency('com.github.ben-manes.caffeine:caffeine'))
+        include(dependency('org.bouncycastle:bcprov-jdk15on'))
+        include(dependency('org.bouncycastle:bcpkix-jdk15on'))
+    }
+    exclude 'net/minecraftforge/**'
+    exclude 'net/minecraft/**'
+    exclude 'org/lwjgl/system/**'
+    exclude 'org/lwjgl/*.class'
+    exclude 'windows/**'
+    exclude 'linux/**'
+    exclude 'macos/**'
+}
+
+afterEvaluate {
+    if (tasks.findByName('reobfJar') != null) {
+        tasks.named('reobfJar').configure {
+            input.set shadowJar.archiveFile
+        }
+    }
+}
+
+publishing {
+    publications {
+        register('mavenJava', MavenPublication) {
+            artifact shadowJar
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 25
+}
+
+tasks.named('test', Test).configure {
+    useJUnitPlatform()
+    exclude '**/*Benchmark*.class'
+    exclude '**/*Soak*.class'
+}
+
+def forwardBenchmarkProperty = { Test task, String propertyName, String defaultValue = null, String envName = null ->
+    def value = System.getProperty(propertyName)
+    if (value == null && envName != null) {
+        value = System.getenv(envName)
+    }
+    if (value != null) {
+        task.systemProperty propertyName, value
+    } else if (defaultValue != null) {
+        task.systemProperty propertyName, defaultValue
+    }
+}
+
+tasks.register('benchmarkOpenClRuntime', Test) {
+    group = 'verification'
+    description = 'Runs the manual legacy vs modern OpenCL runtime comparison benchmark.'
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    include '**/OpenClKernelRuntimeComparisonBenchmarkTest.class'
+    environment 'QUANTIFIED_BENCHMARKS', System.getenv('QUANTIFIED_BENCHMARKS') ?: 'true'
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks', 'true', 'QUANTIFIED_BENCHMARKS')
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks.gpu.runtime.warmups', null, 'QUANTIFIED_BENCHMARKS_GPU_RUNTIME_WARMUPS')
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks.gpu.runtime.iterations', null, 'QUANTIFIED_BENCHMARKS_GPU_RUNTIME_ITERATIONS')
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks.gpu.runtime.vectorLength', null, 'QUANTIFIED_BENCHMARKS_GPU_RUNTIME_VECTOR_LENGTH')
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks.gpu.runtime.matrixSize', null, 'QUANTIFIED_BENCHMARKS_GPU_RUNTIME_MATRIX_SIZE')
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks.gpu.runtime.samples', null, 'QUANTIFIED_BENCHMARKS_GPU_RUNTIME_SAMPLES')
+    testLogging {
+        events "passed", "skipped", "failed"
+        exceptionFormat "full"
+        showStandardStreams = true
+    }
+}
+
+tasks.register('benchmarkGpuBackends', Test) {
+    group = 'verification'
+    description = 'Runs the manual OpenCL vs Vulkan backend comparison benchmark.'
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    include '**/GpuBackendComparisonBenchmarkTest.class'
+    environment 'QUANTIFIED_BENCHMARKS', System.getenv('QUANTIFIED_BENCHMARKS') ?: 'true'
+    environment 'QUANTIFIED_BENCHMARKS_GPU_COMPARE_MIXED',
+        System.getenv('QUANTIFIED_BENCHMARKS_GPU_COMPARE_MIXED') ?: 'true'
+    environment 'VK_LOADER_LAYERS_DISABLE', System.getenv('VK_LOADER_LAYERS_DISABLE') ?: '~implicit~'
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks', 'true', 'QUANTIFIED_BENCHMARKS')
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks.gpu.compare.mixed', 'true', 'QUANTIFIED_BENCHMARKS_GPU_COMPARE_MIXED')
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks.gpu.compare.warmups', null, 'QUANTIFIED_BENCHMARKS_GPU_COMPARE_WARMUPS')
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks.gpu.compare.iterations', null, 'QUANTIFIED_BENCHMARKS_GPU_COMPARE_ITERATIONS')
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks.gpu.compare.vectorLength', null, 'QUANTIFIED_BENCHMARKS_GPU_COMPARE_VECTOR_LENGTH')
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks.gpu.compare.matrixSize', null, 'QUANTIFIED_BENCHMARKS_GPU_COMPARE_MATRIX_SIZE')
+    forwardBenchmarkProperty(delegate, 'quantified.benchmarks.gpu.compare.samples', null, 'QUANTIFIED_BENCHMARKS_GPU_COMPARE_SAMPLES')
+    systemProperty 'org.lwjgl.system.stackSize',
+        System.getProperty('org.lwjgl.system.stackSize',
+            System.getProperty('quantified.lwjgl.stackSizeKb', '32768'))
+    testLogging {
+        events "passed", "skipped", "failed"
+        exceptionFormat "full"
+        showStandardStreams = true
+    }
+}

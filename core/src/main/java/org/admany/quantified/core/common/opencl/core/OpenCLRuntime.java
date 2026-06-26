@@ -1,6 +1,7 @@
 package org.admany.quantified.core.common.opencl.core;
 
 import java.lang.reflect.Method;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
@@ -12,6 +13,8 @@ public final class OpenCLRuntime {
     private static final AtomicBoolean INITIALISED = new AtomicBoolean(false);
     private static final AtomicReference<String> LAST_ERROR = new AtomicReference<>(null);
     private static final AtomicReference<Binding> BINDING = new AtomicReference<>(Binding.UNKNOWN);
+    private static final AtomicReference<Boolean> PROBE_RUNTIME_PRESENT = new AtomicReference<>(null);
+    private static final AtomicReference<ProbeSnapshot> LAST_PROBE_SNAPSHOT = new AtomicReference<>(null);
 
     private enum Binding {
         UNKNOWN,
@@ -85,6 +88,64 @@ public final class OpenCLRuntime {
         return new AvailabilitySnapshot(available, available ? null : LAST_ERROR.get());
     }
 
+    public static boolean hasBindings() {
+        Binding binding = BINDING.get();
+        if (binding == Binding.UNKNOWN) {
+            binding = probeBinding();
+            BINDING.set(binding);
+        }
+        return binding == Binding.LWJGL;
+    }
+
+    public static boolean hasProbeRuntime() {
+        Boolean cached = PROBE_RUNTIME_PRESENT.get();
+        if (cached != null) {
+            return cached.booleanValue();
+        }
+        boolean present = hasBindings() || embeddedProbePresent();
+        PROBE_RUNTIME_PRESENT.compareAndSet(null, present);
+        return present;
+    }
+
+    public static ProbeSnapshot probeSnapshot() {
+        ProbeSnapshot cached = LAST_PROBE_SNAPSHOT.get();
+        if (cached != null) {
+            return cached;
+        }
+        ProbeSnapshot snapshot;
+        boolean bindingsPresent = hasBindings();
+        boolean embeddedProbePresent = embeddedProbePresent();
+        if (!bindingsPresent && !embeddedProbePresent) {
+            snapshot = ProbeSnapshot.failed("No OpenCL probe runtime is bundled with this build", List.of());
+        } else if (bindingsPresent && snapshot().available()) {
+            snapshot = ProbeSnapshot.failed("In-process OpenCL runtime is available; isolated probe not required", List.of());
+        } else if (!embeddedProbePresent) {
+            snapshot = ProbeSnapshot.failed("Isolated OpenCL probe bundle is not present in this build", List.of());
+        } else {
+            OpenCLSubprocessProbe.Result result = OpenCLSubprocessProbe.run(org.slf4j.LoggerFactory.getLogger(OpenCLRuntime.class), 1);
+            List<ProbeDeviceInfo> devices = result.devices().stream()
+                .map(device -> new ProbeDeviceInfo(
+                    device.id(),
+                    device.name(),
+                    device.vendor(),
+                    device.type(),
+                    device.vramBytes(),
+                    device.computeUnits(),
+                    device.supportsOpenCL32(),
+                    device.supportsOpenCL12()))
+                .toList();
+            snapshot = result.ok()
+                ? ProbeSnapshot.success(devices)
+                : ProbeSnapshot.failed(result.failureReason(), devices);
+        }
+        LAST_PROBE_SNAPSHOT.compareAndSet(null, snapshot);
+        return LAST_PROBE_SNAPSHOT.get();
+    }
+
+    public static ProbeSnapshot cachedProbeSnapshot() {
+        return LAST_PROBE_SNAPSHOT.get();
+    }
+
     public static String lastError() {
         return LAST_ERROR.get();
     }
@@ -105,6 +166,12 @@ public final class OpenCLRuntime {
         }
 
         return Binding.NONE;
+    }
+
+    private static boolean embeddedProbePresent() {
+        ClassLoader loader = OpenCLRuntime.class.getClassLoader();
+        return loader.getResource("quantified/embedded/openclProbe/classpath.index") != null
+            && loader.getResource("quantified/embedded/openclProbe/quantified-opencl-probe.jar.bin") != null;
     }
 
     private static boolean isClassPresent(String className) {
@@ -167,6 +234,99 @@ public final class OpenCLRuntime {
 
         public String failureReason() {
             return failureReason;
+        }
+    }
+
+    public static final class ProbeSnapshot {
+        private final boolean success;
+        private final String failureReason;
+        private final List<ProbeDeviceInfo> devices;
+
+        private ProbeSnapshot(boolean success, String failureReason, List<ProbeDeviceInfo> devices) {
+            this.success = success;
+            this.failureReason = failureReason;
+            this.devices = devices != null ? List.copyOf(devices) : List.of();
+        }
+
+        public static ProbeSnapshot success(List<ProbeDeviceInfo> devices) {
+            return new ProbeSnapshot(true, null, devices);
+        }
+
+        public static ProbeSnapshot failed(String failureReason, List<ProbeDeviceInfo> devices) {
+            return new ProbeSnapshot(false, failureReason, devices);
+        }
+
+        public boolean success() {
+            return success;
+        }
+
+        public String failureReason() {
+            return failureReason;
+        }
+
+        public List<ProbeDeviceInfo> devices() {
+            return devices;
+        }
+    }
+
+    public static final class ProbeDeviceInfo {
+        private final String id;
+        private final String name;
+        private final String vendor;
+        private final String type;
+        private final long vramBytes;
+        private final int computeUnits;
+        private final boolean supportsOpenCL32;
+        private final boolean supportsOpenCL12;
+
+        private ProbeDeviceInfo(String id,
+                                String name,
+                                String vendor,
+                                String type,
+                                long vramBytes,
+                                int computeUnits,
+                                boolean supportsOpenCL32,
+                                boolean supportsOpenCL12) {
+            this.id = id;
+            this.name = name;
+            this.vendor = vendor;
+            this.type = type;
+            this.vramBytes = vramBytes;
+            this.computeUnits = computeUnits;
+            this.supportsOpenCL32 = supportsOpenCL32;
+            this.supportsOpenCL12 = supportsOpenCL12;
+        }
+
+        public String id() {
+            return id;
+        }
+
+        public String name() {
+            return name;
+        }
+
+        public String vendor() {
+            return vendor;
+        }
+
+        public String type() {
+            return type;
+        }
+
+        public long vramBytes() {
+            return vramBytes;
+        }
+
+        public int computeUnits() {
+            return computeUnits;
+        }
+
+        public boolean supportsOpenCL32() {
+            return supportsOpenCL32;
+        }
+
+        public boolean supportsOpenCL12() {
+            return supportsOpenCL12;
         }
     }
 }

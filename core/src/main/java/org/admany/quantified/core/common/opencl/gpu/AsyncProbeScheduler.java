@@ -12,6 +12,7 @@ import java.util.logging.Logger;
 import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
+import org.admany.quantified.core.common.opencl.core.OpenCLRuntime;
 import org.admany.quantified.core.common.util.LwjglRuntimeTuning;
 
 public class AsyncProbeScheduler {
@@ -37,6 +38,11 @@ public class AsyncProbeScheduler {
             markDisabled();
             return;
         }
+        if (probeAlreadyResolved()) {
+            succeeded = true;
+            LOGGER.fine("OpenCL background probe skipped because a successful probe snapshot is already cached");
+            return;
+        }
         if (scheduled) {
             LOGGER.fine("OpenCL background probe already scheduled");
             return;
@@ -57,6 +63,10 @@ public class AsyncProbeScheduler {
         if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
             markDisabled();
             reset();
+            return;
+        }
+        if (probeAlreadyResolved()) {
+            succeeded = true;
             return;
         }
         if (succeeded) {
@@ -88,6 +98,10 @@ public class AsyncProbeScheduler {
             return;
         }
         if (succeeded) {
+            return;
+        }
+        if (probeAlreadyResolved()) {
+            succeeded = true;
             return;
         }
         long delayMs = Math.max(0, delay.toMillis());
@@ -156,5 +170,11 @@ public class AsyncProbeScheduler {
             return;
         }
         scheduleProbe(RETRY_DELAY, "retry:" + reason);
+    }
+
+    private static boolean probeAlreadyResolved() {
+        OpenCLRuntime.ProbeSnapshot snapshot = OpenCLRuntime.cachedProbeSnapshot();
+        return OpenCLManager.isAvailable()
+            || (snapshot != null && snapshot.success() && !snapshot.devices().isEmpty());
     }
 }

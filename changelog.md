@@ -1,18 +1,23 @@
 # Quantified API Update Changelogs 
 
-## V2 is here, with large changes, and FINALLY Official Documentation at `https://admany.dev` :]
+## V2 is here, with large changes, and FINALLY Official Documentation at `https://www.admany.dev` :]
 
-## v2.0.0 - Released on 2026-05-18
+## v2.0.0 - Released on 2026-05-18 (The TRUE V2 Release xd)
 
 ### Quick summary :]
 
-- Quantified API V2 is a large release. The CPU runtime internals were heavily reworked so tiny tasks, duplicate bursts, parallel work, and DAG execution tasks are way cheaper to compute.
+- Quantified API V2 is now the TRUE V2 release, with the new API, runtime rework, platform restructure, GPU backend fixes, loader support, compatibility system, docs, and omni packaging all finished in one proper release.
+- The CPU runtime internals were heavily reworked so tiny tasks, duplicate bursts, parallel work, and DAG execution tasks are way cheaper to compute.
 - The public API was cleaned up around the new V2 builder first style, so compute, parallel, graph, and cache flows are more obvious and cleaner then V1.
-- Auto-register support is now built in for Fabric, Forge, and NeoForge through loader metadata detection (Manual registering was kept as a Legacy option).
+- The old flat platform layout was fully replaced with a loader first structure under `platforms/fabric`, `platforms/forge`, and `platforms/neoforge`.
+- Support was added for Fabric, Forge, and NeoForge from Minecraft `1.20.1`, `1.21.X`, all the way to `1.26.X`.
+- The platform and compatibility systems were updated so mods depending on the V1 API can still work under V2.
+- Vulkan and OpenCL runtime handling was heavily reworked so probing, initialization, execution, routing, and fallback behavior is much more stable.
+- The root Gradle and omni build system was updated to work with the new platform split and generate the merged omni jar correctly again.
+- Auto-register support is built in for Fabric, Forge, and NeoForge through loader metadata detection (Manual registering was kept as a Legacy option).
 - The caching system was upgraded.
-- GPU routing is now cleaner, Vulkan junk that was no longer useful got removed, and backend preference API options are easier to use.
-- Official Quantified API docs are here! Can be found at `https://admany.dev` and it includes API docs, examples, migration info, and LC2H code examples.
-- Benchmark tool was added to compare V2 VS `v1.4.4`. V2 wins by a BIG margin. 
+- Official Quantified API docs are here! Can be found at `https://admany.dev`, with the docs source and even more updated info at `https://github.com/Admany/Quantified-Docs`.
+- Benchmark tool was added to compare V2 VS `v1.4.4`. V2 wins by a BIG margin.
 
 ---
 
@@ -66,7 +71,17 @@
   - Fabric auto-register support
   - Forge metadata resolution
   - NeoForge metadata resolution
-  - caller-based auto-detection on first API call
+  - caller based auto-detection on first API call
+- New platform layout:
+  - `platforms/fabric`
+  - `platforms/forge`
+  - `platforms/neoforge`
+  - loader specific Minecraft version modules under each platform
+- New loader/version support:
+  - Fabric from `1.20.1` to `1.26.X`
+  - Forge from `1.20.1` to `1.26.X`
+  - NeoForge from `1.20.1` to `1.26.X`
+- V1 API compatibility support under the new V2 platform system.
 
 ---
 
@@ -85,15 +100,99 @@
   - better persistent cache disk behavior
   - cleaner save/load handling
   - better async/persistent lifecycle handling
-- GPU routing was cleaned up more:
-  - clearer backend prefferencing
-  - better Vulkan/OpenCL preference API
-  - removed the Vulkan MC density path fully (useless)
 - Auto-registration now resolves:
   - mod id
   - display name
   - version
   - all from loader metadata when possible (worst case depends on manual LEGACY registration)
+
+---
+
+### Platform layout / build rework
+
+- Replaced the old flat platform layout with the new loader first structure under:
+  - `platforms/fabric`
+  - `platforms/forge`
+  - `platforms/neoforge`
+- Removed stale legacy platform trees for the old `1.20.1` and `1.21.1` paths that are now replaced by the new per loader version layout.
+- Reworked the root Gradle orchestration so the omni build targets the new platform directories.
+- Updated the omni build so it produces the merged omni jar from the new module split.
+- Updated the platform discovery and module wiring so new Minecraft versions can be added much cleaner.
+- Cleaned up leftover generated wrappers, nested build junk, temporary omni extraction folders, and other repo noise that should not be in source control xd.
+- Updated platform/runtime paths used by dashboard and dev tooling.
+- Shrunk and cleaned bundled dashboard/runtime assets where the new packaging layout made it possible.
+
+---
+
+### Loader and Minecraft version support
+
+- Quantified API now supports all 3 main mod loaders:
+  - Fabric
+  - Forge
+  - NeoForge
+- Platform modules were added/updated for Minecraft:
+  - `1.20.1`
+  - `1.21.X`
+  - `1.26.X`
+- The new loader first system is made so additional versions can be added without rebuilding the whole repo layout every single time.
+- Shared code and platform bridges were cleaned up so behavior stays more consistent across loaders and versions.
+- The platform compatibility system was updated so V1 API dependent mods can keep working with V2 instead of instantly exploding xd.
+
+---
+
+### Vulkan runtime rework
+
+- Vulkan runtime plumbing was overhauled with a newer execution path split between:
+  - probe
+  - runtime availability checks
+  - isolated execution
+  - in-process support
+- Vulkan probe, initialization, and execution behavior is now more controlled under real Minecraft startup and workload conditions.
+- Added Vulkan runtime tuning and scheduler changes so initialization is less spammy and less likely to fight with the game startup.
+- Runtime state handling was cleaned up so failed or half initialized Vulkan paths don't stay marked as ready.
+- Vulkan task execution now falls back cleaner instead of leaving broken runtime states behind.
+- Vulkan facing API hooks and common compute/task graph plumbing were updated for the newer execution model.
+- Logging around Vulkan probing, startup, runtime availability, and fallback behavior was cleaned up so debugging is much less painful.
+- Old useless Vulkan runtime junk and stale paths were removed.
+
+---
+
+### OpenCL and GPU routing rework
+
+- OpenCL runtime handling was improved in the same pass so GPU backend routing is more consistent across loaders and Minecraft versions.
+- OpenCL availability, initialization, execution, and fallback states were cleaned up.
+- GPU backend routing and task dispatch behavior was updated so Vulkan and OpenCL fall back more cleanly.
+- Broken or half ready GPU runtimes no longer stay selected and hold tasks hostage.
+- Backend preference routing is now more consistent for:
+  - `preferGpu()`
+  - `preferVulkan()`
+  - `preferOpenCL()`
+  - `requireVulkan()`
+  - `requireOpenCL()`
+  - `cpuOnly()`
+- If Vulkan fails, it can cleanly move to OpenCL.
+- If OpenCL also isn't available, it can cleanly move to CPU without the task getting nuked.
+- GPU runtime behavior is now much more aligned across Fabric, Forge, NeoForge, and all supported MC versions.
+
+---
+
+### V1 API compatibility
+
+- The V2 platform and runtime systems were updated so mods made against the V1 API can still work.
+- Existing mods do not have to instantly rewrite their full integration to the V2 builder system.
+- Legacy/manual registration is still supported when automatic loader metadata detection cannot resolve everything.
+- V1 compatibility works through the new loader first platform structure.
+- New mods should still use the V2 API, but old mods are not being tortured into migrating instantly xd.
+
+---
+
+### Dashboard / dev tooling
+
+- Dashboard and developer tooling paths were updated for the new platform layout.
+- Runtime and platform information was updated to work across the new loader/version split.
+- Vulkan/OpenCL status and backend routing diagnostics were cleaned up.
+- Bundled dashboard/runtime assets were shrunk and cleaned where possible.
+- Dev tooling and packaging helpers were updated so they no longer depend on the removed legacy platform paths.
 
 ---
 
@@ -129,20 +228,44 @@ V2 reduces the amount of real work time, latency, and how long it takes to proce
 
 ### Docs / site release
 
-- Official Quantified API docs are now live at:
+- Official Quantified API docs are live at:
   - `https://admany.dev`
+- The full docs source and latest documentation updates can be found at:
+  - `https://github.com/Admany/Quantified-Docs`
 - The docs now include:
   - getting started
+  - installation for Fabric, Forge, and NeoForge
+  - supported Minecraft versions
   - full V2 API docs
   - compute docs
   - parallel docs
   - graph / DAG docs
   - caching docs
   - keys / affinity docs
+  - Vulkan and OpenCL routing
+  - loader/platform information
+  - V1 compatibility
+  - migration info from V1 API
   - troubleshooting
   - examples
   - LC2H V2 examples
-  - migration info from V1 API
+- Docs were also cleaned up and improved so the platform layout, version support, API compatibility, and GPU backend behavior actually make sense without having to read the source code like a maniac xd.
+
+---
+
+### Final V2 notes
+
+- This release lands the new V2 API and CPU runtime.
+- It lands the full loader first platform restructure.
+- It adds Fabric, Forge, and NeoForge support from `1.20.1` to `1.26.X`.
+- It keeps V1 API dependent mods working.
+- It hardens Vulkan and OpenCL runtime paths.
+- It fixes GPU routing and fallback behavior.
+- It updates the root Gradle and omni packaging system.
+- It cleans the repo and removed old platform junk.
+- It updates the dashboard, runtime assets, dev tooling, and docs.
+
+So yh, this is the TRUE Quantified API V2.0 release now xd.
 
 ---
 
