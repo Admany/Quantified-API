@@ -66,15 +66,15 @@ platformCompile('compileFabric1201', 'platforms/fabric/1.20.1', 'fabric-1201')
 platformCompile('compileFabric121x', 'platforms/fabric/1.21.x', 'fabric-121x')
 platformCompile('compileFabric26x', 'platforms/fabric/26.x', 'fabric-26x')
 
-platformBuild('buildNeoForge121x', 'platforms/neoforge/1.21.x', 'build', 'neoforge-121x')
+platformBuild('buildNeoForge121x', 'platforms/neoforge/1.21.x', 'shadowJar', 'neoforge-121x')
 platformCompile('compileNeoForge121x', 'platforms/neoforge/1.21.x', 'neoforge-121x')
 
 platformBuild('buildForgeWide', 'platforms/forge/omni-base', 'shadowJar', 'forge-omni-base')
 platformBuild('buildFabricWide', 'platforms/fabric/omni-base', 'build', 'fabric-omni-base')
 platformBuild('buildFabric26', 'platforms/fabric/26-compat', 'build', 'fabric-26-compat')
-platformBuild('buildNeoForgeWide', 'platforms/neoforge/omni-base', 'build', 'neoforge-omni-base')
+platformBuild('buildNeoForgeWide', 'platforms/neoforge/omni-base', 'shadowJar', 'neoforge-omni-base')
 platformBuild('buildForge26', 'platforms/forge/26-compat', 'shadowJar', 'forge-26-compat')
-platformBuild('buildNeoForge26', 'platforms/neoforge/26-compat', 'build', 'neoforge-26-compat')
+platformBuild('buildNeoForge26', 'platforms/neoforge/26-compat', 'shadowJar', 'neoforge-26-compat')
 
 tasks.register('buildAllPlatforms') {
     group = 'build'
@@ -96,7 +96,7 @@ tasks.register('buildAllPlatforms') {
 tasks.register('buildOmniJar', Jar) {
     group = 'build'
     description = 'Builds a single distributable omni jar for Fabric, Forge, and NeoForge (1.20.1 through 26.x).'
-    dependsOn 'buildForgeWide', 'buildFabricWide', 'buildNeoForgeWide', 'buildFabric26', 'buildForge26', 'buildForge1201', 'buildForge121x', 'buildFabric1201', 'buildNeoForge121x', 'buildNeoForge26'
+    dependsOn 'buildForgeWide', 'buildFabricWide', 'buildNeoForgeWide', 'buildFabric26', 'buildForge26', 'buildForge1201', 'buildForge121x', 'buildFabric1201', 'buildFabric121x', 'buildNeoForge121x', 'buildNeoForge26'
 
     archiveFileName.set("quantified api-omni-${project.findProperty('mod_version') ?: 'dev'}.jar")
     destinationDirectory.set(file('libs'))

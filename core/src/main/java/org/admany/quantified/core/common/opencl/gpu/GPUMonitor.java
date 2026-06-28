@@ -56,6 +56,7 @@ public final class GPUMonitor {
     private static final double MEMORY_ACCEPTANCE_LIMIT = 0.95d;
     private static final double COMPUTE_ACCEPTANCE_LIMIT = 0.99d;
     private static final long MIN_SAFETY_BYTES = 64L * 1024L * 1024L;
+    private static final long API_ACTIVITY_GRACE_MS = 3_500L;
 
 	private final AtomicReference<GPUStatus> lastStatus = new AtomicReference<>();
 	private final AtomicBoolean gpuStatusLogged = new AtomicBoolean();
@@ -86,6 +87,10 @@ public final class GPUMonitor {
 
     public int activeComputeUnits() {
         return getInstance().taskTracker.getActiveComputeUnits();
+    }
+
+    public long lastTaskActivityMs() {
+        return getInstance().taskTracker.getLastTaskActivityMs();
     }
 
     public synchronized void configure(long detectedVramBytes, int detectedComputeUnits, String deviceName) {
@@ -306,14 +311,18 @@ public final class GPUMonitor {
         long apiBudgetBytes = Math.max(1L, budget.apiBudgetBytes());
         long cappedUsage = Math.min(apiUsageBytes, apiBudgetBytes);
 
-        double computeUtil = telemetrySample.computeUtilization();
         int activeCompute = Math.max(0, taskTracker.getActiveComputeUnits());
-        if ((Double.isNaN(computeUtil) || computeUtil <= 0.0d) && activeCompute > 0) {
-            computeUtil = Math.min(1.0d, activeCompute / (double) Math.max(1, totalComputeUnits));
-        }
-        if (Double.isNaN(computeUtil) || computeUtil < 0.0d) {
-            computeUtil = Math.min(1.0d, Math.max(0.0d,
-                taskTracker.getActiveComputeUnits() / (double) Math.max(1, totalComputeUnits)));
+        double telemetryComputeUtil = normalizeRatio(telemetrySample.computeUtilization());
+        double activeComputeUtil = normalizeRatio(activeCompute / (double) Math.max(1, totalComputeUnits));
+        long nowMs = System.currentTimeMillis();
+        boolean recentlyActive = nowMs - taskTracker.getLastTaskActivityMs() < API_ACTIVITY_GRACE_MS;
+        double computeUtil;
+        if (activeCompute > 0) {
+            computeUtil = Math.max(activeComputeUtil, telemetryComputeUtil);
+        } else if (recentlyActive) {
+            computeUtil = Math.min(Math.max(activeComputeUtil, telemetryComputeUtil), 0.35d);
+        } else {
+            computeUtil = 0.0d;
         }
 
         double finalTemperature = !Double.isNaN(resolvedTemp) ? resolvedTemp : 0.0d;
@@ -374,6 +383,16 @@ public final class GPUMonitor {
         public double memoryUtilization() {
             return totalVramBytes == 0 ? 0.0d : (double) usedVramBytes / totalVramBytes;
         }
+    }
+
+    private static double normalizeRatio(double value) {
+        if (!Double.isFinite(value) || value <= 0.0d) {
+            return 0.0d;
+        }
+        if (value > 1.5d) {
+            return Math.min(1.0d, value / 100.0d);
+        }
+        return Math.min(1.0d, value);
     }
 }
 

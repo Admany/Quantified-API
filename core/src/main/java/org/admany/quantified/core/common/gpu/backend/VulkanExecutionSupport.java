@@ -1,9 +1,11 @@
 package org.admany.quantified.core.common.gpu.backend;
 
 import org.admany.quantified.core.common.vulkan.core.VulkanIsolatedExecutor;
+import org.admany.quantified.core.common.vulkan.core.VulkanRuntimeActivityTracker;
 
 import java.lang.reflect.Method;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Safe Vulkan runtime facade for mixed Minecraft/LWJGL environments.
@@ -112,9 +114,49 @@ public final class VulkanExecutionSupport {
         }
     }
 
+    public static void trimInProcessResources(String reason, boolean aggressive) {
+        if (!canUseInProcessManager()) {
+            return;
+        }
+        try {
+            Class<?> manager = Class.forName(VULKAN_MANAGER, false, VulkanExecutionSupport.class.getClassLoader());
+            manager.getMethod("trimIdleResources", String.class, boolean.class).invoke(null, reason, aggressive);
+        } catch (ReflectiveOperationException | LinkageError ignored) {
+        }
+    }
+
+    public static Map<?, ?> residencySnapshot() {
+        if (canUseInProcessManager()) {
+            Object value = invoke("residencySnapshot");
+            return value instanceof Map<?, ?> map ? map : Map.of();
+        }
+        return VulkanIsolatedExecutor.residencySnapshot();
+    }
+
+    public static long activeTaskVramBytes() {
+        if (!hasExecutableRuntime()) {
+            return 0L;
+        }
+        return VulkanRuntimeActivityTracker.activeVramBytes();
+    }
+
+    public static int activeTaskComputeUnits() {
+        if (!hasExecutableRuntime()) {
+            return 0;
+        }
+        return VulkanRuntimeActivityTracker.activeComputeUnits();
+    }
+
+    public static long lastTaskActivityMs() {
+        if (!hasExecutableRuntime()) {
+            return 0L;
+        }
+        return VulkanRuntimeActivityTracker.lastTaskActivityMs();
+    }
+
     public static boolean canUseInProcessManager() {
         try {
-            return VulkanRuntime.runtimeMode() == VulkanRuntime.RuntimeMode.IN_PROCESS && VulkanRuntime.hasBindings();
+            return VulkanRuntime.runtimeMode() == VulkanRuntime.RuntimeMode.IN_PROCESS;
         } catch (Throwable ignored) {
             return false;
         }
@@ -128,6 +170,11 @@ public final class VulkanExecutionSupport {
     private static String invokeString(String method, String fallback) {
         Object value = invoke(method);
         return value instanceof String string ? string : fallback;
+    }
+
+    private static long invokeLong(String method, long fallback) {
+        Object value = invoke(method);
+        return value instanceof Number number ? number.longValue() : fallback;
     }
 
     private static Object invoke(String method) {

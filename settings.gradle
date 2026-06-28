@@ -21,3 +21,5 @@ plugins {
 }
 
 rootProject.name = 'quantified-api'
+
+include 'core'

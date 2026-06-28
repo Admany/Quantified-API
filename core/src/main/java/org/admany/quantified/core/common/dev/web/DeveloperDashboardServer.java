@@ -878,12 +878,14 @@ public final class DeveloperDashboardServer {
         summary.addProperty("cacheDiskBytes", usage.diskBytes());
         long vramTelemetryBytes = Math.max(0L, diagnostics.snapshot().gpuVramUsedBytes());
         long vramCacheBytes = Math.max(0L, OpenCLManager.cacheVramUsageBytes());
-        long vramTaskBytes = Math.max(0L, OpenCLManager.activeTaskVramBytes());
+        long vramTaskBytes = Math.max(0L, OpenCLManager.activeTaskVramBytes())
+            + Math.max(0L, VulkanExecutionSupport.activeTaskVramBytes());
         long vramContextBytes = Math.max(0L, vramTelemetryBytes - vramCacheBytes - vramTaskBytes);
         long vramEffectiveBytes = Math.max(vramTelemetryBytes, vramCacheBytes + vramTaskBytes);
         summary.addProperty("vramUsedBytes", vramEffectiveBytes);
         summary.addProperty("vramContextBytes", Math.max(0L, vramContextBytes));
         summary.addProperty("vramBudgetBytes", Math.max(0L, diagnostics.snapshot().gpuVramBudgetBytes()));
+        summary.add("vulkanResidency", buildVulkanResidencyPayload());
         payload.add("summary", summary);
 
         List<CacheFileDescriptor> diskFiles = DiskCacheManager.listCacheFiles();
@@ -992,6 +994,7 @@ public final class DeveloperDashboardServer {
             case "vram" -> {
                 try {
                     OpenCLTaskManager.handleVramSaturation("Manual dashboard flush");
+                    VulkanExecutionSupport.trimInProcessResources("manual-dashboard-flush", true);
                     response.addProperty("message", "VRAM flush requested");
                 } catch (Throwable t) {
                     LOGGER.log(Level.FINE, "VRAM flush failed", t);
@@ -1208,6 +1211,44 @@ public final class DeveloperDashboardServer {
     private static String invokeVulkanDeviceString(Object device, String methodName, String fallback) {
         Object value = invokeVulkanDeviceMethod(device, methodName);
         return value instanceof String string ? string : fallback;
+    }
+
+    private static JsonObject buildVulkanResidencyPayload() {
+        Map<?, ?> residency = VulkanExecutionSupport.residencySnapshot();
+        JsonObject payload = new JsonObject();
+        payload.addProperty("available", !residency.isEmpty());
+        if (residency.isEmpty()) {
+            return payload;
+        }
+        payload.addProperty("reservedBytes", mapLong(residency, "reservedBytes"));
+        payload.addProperty("localMemoryBytes", mapLong(residency, "localMemoryBytes"));
+        payload.addProperty("softLimitBytes", mapLong(residency, "softLimitBytes"));
+        payload.addProperty("hardLimitBytes", mapLong(residency, "hardLimitBytes"));
+        payload.addProperty("slabCount", mapLong(residency, "slabCount"));
+        payload.addProperty("workspacePoolCount", mapLong(residency, "workspacePoolCount"));
+        payload.addProperty("workspacePoolBytes", mapLong(residency, "workspacePoolBytes"));
+        payload.addProperty("cooldownActive", mapBoolean(residency, "cooldownActive"));
+        payload.addProperty("cooldownRemainingMs", mapLong(residency, "cooldownRemainingMs"));
+        payload.addProperty("trimEvents", mapLong(residency, "trimEvents"));
+        payload.addProperty("trimmedBytes", mapLong(residency, "trimmedBytes"));
+        payload.addProperty("trimmedWorkspacePools", mapLong(residency, "trimmedWorkspacePools"));
+        payload.addProperty("trimmedWorkspaceBytes", mapLong(residency, "trimmedWorkspaceBytes"));
+        payload.addProperty("trimmedSlabs", mapLong(residency, "trimmedSlabs"));
+        payload.addProperty("trimmedSlabBytes", mapLong(residency, "trimmedSlabBytes"));
+        payload.addProperty("pressureCooldowns", mapLong(residency, "pressureCooldowns"));
+        payload.addProperty("pressureCooldownHits", mapLong(residency, "pressureCooldownHits"));
+        payload.addProperty("pressureRejects", mapLong(residency, "pressureRejects"));
+        return payload;
+    }
+
+    private static long mapLong(Map<?, ?> values, String key) {
+        Object value = values.get(key);
+        return value instanceof Number number ? number.longValue() : 0L;
+    }
+
+    private static boolean mapBoolean(Map<?, ?> values, String key) {
+        Object value = values.get(key);
+        return value instanceof Boolean bool && bool;
     }
 
     private static int invokeVulkanDeviceInt(Object device, String methodName, int fallback) {
@@ -1544,6 +1585,7 @@ public final class DeveloperDashboardServer {
         GPUMonitor.GPUStatus gpuStatus = OpenCLManager.getGPUStatus();
         payload.addProperty("openclDeviceName", gpuStatus != null ? gpuStatus.deviceName() : "");
         payload.addProperty("vulkanDeviceName", vulkanProbeAvailable ? VulkanExecutionSupport.deviceName() : "");
+        payload.add("vulkanResidency", buildVulkanResidencyPayload());
         GpuBackendPreference configuredPreference = GpuBackendRouter.getDefaultPreference();
         payload.addProperty("configuredGpuBackendPreference", configuredPreference.name());
         GpuBackendType activeBackend = resolveDashboardGpuBackend(configuredPreference);
@@ -1639,7 +1681,8 @@ public final class DeveloperDashboardServer {
         payload.add("snapshot", snapshotJson);
         long vramTelemetryBytes = Math.max(0L, diagnostics.snapshot().gpuVramUsedBytes());
         long vramCacheBytes = Math.max(0L, OpenCLManager.cacheVramUsageBytes());
-        long vramTaskBytes = Math.max(0L, OpenCLManager.activeTaskVramBytes());
+        long vramTaskBytes = Math.max(0L, OpenCLManager.activeTaskVramBytes())
+            + Math.max(0L, VulkanExecutionSupport.activeTaskVramBytes());
         long vramContextBytes = Math.max(0L, vramTelemetryBytes - vramCacheBytes - vramTaskBytes);
         long vramEffectiveBytes = Math.max(vramTelemetryBytes, vramCacheBytes + vramTaskBytes);
         payload.addProperty("gpuVramBudgetBytes", diagnostics.snapshot().gpuVramBudgetBytes());

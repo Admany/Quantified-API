@@ -324,6 +324,17 @@ function normalizeLoadRatio(value) {
     return Math.min(1, numeric);
 }
 
+function normalizePercentRatio(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+        return 0;
+    }
+    if (numeric > 1.5) {
+        return Math.min(1, numeric / 100);
+    }
+    return Math.min(1, numeric);
+}
+
 function escapeRegex(value) {
     return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -657,7 +668,7 @@ const App = () => {
                 parallelActiveSlices: Number(snapshot.parallelActiveSlices ?? 0),
                 totalWork: Number(snapshot.totalWork ?? 0),
                 cpuCompute: normalizeLoadRatio(snapshot.cpuComputeUtil ?? snapshot.cpuSystemLoad ?? 0),
-                gpuCompute: Number(snapshot.gpuComputeUtil ?? 0),
+                gpuCompute: normalizePercentRatio(snapshot.gpuComputeUtil ?? 0),
                 gpuMemory: gpuMemoryRatio,
                 gpuTemperature: Number(snapshot.gpuTemperature ?? 0),
                 stressCacheSize,
@@ -1247,7 +1258,7 @@ const App = () => {
     const parallelActiveSlices = Number(snapshot.parallelActiveSlices ?? 0);
     const totalWork = Number(snapshot.totalWork ?? (queueDepth + parallelActiveSlices));
     const queueWarning = queueThreshold * 0.7;
-    const gpuCompute = Number(snapshot.gpuComputeUtil ?? 0);
+    const gpuCompute = normalizePercentRatio(snapshot.gpuComputeUtil ?? 0);
     const gpuMemory = Number(snapshot.gpuMemoryUtil ?? 0);
     const gpuTemperature = Number(snapshot.gpuTemperature ?? state?.systemInfo?.gpuTemperature ?? 0);
     const activeGpuBackend = String(state?.activeGpuBackend ?? "CPU").toUpperCase();
@@ -1450,6 +1461,7 @@ const App = () => {
     const modMetricRows = modMetrics?.mods ?? [];
     const modMetricTasks = modMetrics?.tasks ?? [];
     const resourceSummary = resourceData?.summary ?? null;
+    const vulkanResidency = resourceSummary?.vulkanResidency ?? state?.vulkanResidency ?? null;
     const selectedCount = selectedFilePayload.length;
     const modColorMap = useMemo(
         () => ({
@@ -1602,7 +1614,7 @@ const App = () => {
                                                   <td>${event.type || "-"}</td>
                                                   <td>${event.message || "-"}</td>
                                                   <td>${formatTime(event.timestamp)}</td>
-                                                  <td><${StatusPill} label=${formatPercent(event.gpuComputeUtil ?? 0)} variant=${(event.gpuComputeUtil ?? 0) > 0.8 ? "warn" : "ok"} /></td>
+                                                  <td><${StatusPill} label=${formatPercent(normalizePercentRatio(event.gpuComputeUtil ?? 0))} variant=${normalizePercentRatio(event.gpuComputeUtil ?? 0) > 0.8 ? "warn" : "ok"} /></td>
                                                   <td>${formatNumber(event.queueDepth ?? 0)}</td>
                                               </tr>`
                                           )
@@ -1674,6 +1686,35 @@ const App = () => {
                   { label: "RAM Cache", value: formatBytes(resourceSummary.cacheRamBytes ?? 0), sub: "Heap usage" },
                   { label: "Disk Cache", value: formatBytes(resourceSummary.cacheDiskBytes ?? 0), sub: "Persistent usage" },
                 ]
+            : [];
+        const residencyMetrics = vulkanResidency?.available
+            ? [
+                  {
+                      label: "Reserved",
+                      value: formatBytes(vulkanResidency.reservedBytes ?? 0),
+                      sub: `Allocator reserve • ${formatPercent(normalizePercentRatio((vulkanResidency.reservedBytes || 0) / Math.max(1, vulkanResidency.hardLimitBytes || 1)))} of hard limit`,
+                  },
+                  {
+                      label: "Allocator Slabs",
+                      value: formatNumber(vulkanResidency.slabCount ?? 0),
+                      sub: "Preallocated GPU memory blocks",
+                  },
+                  {
+                      label: "Workspace Payload",
+                      value: formatBytes(vulkanResidency.workspacePoolBytes ?? 0),
+                      sub: `${formatNumber(vulkanResidency.workspacePoolCount ?? 0)} workspace pools`,
+                  },
+                  {
+                      label: "Trimmed",
+                      value: formatBytes(vulkanResidency.trimmedBytes ?? 0),
+                      sub: `${formatNumber(vulkanResidency.trimEvents ?? 0)} trim events`,
+                  },
+                  {
+                      label: "Pressure",
+                      value: formatNumber(vulkanResidency.pressureRejects ?? 0),
+                      sub: `${formatNumber(vulkanResidency.pressureCooldownHits ?? 0)} cooldown hits`,
+                  },
+              ]
             : [];
         const modNameById = new Map(
             (resourceData?.mods ?? []).map((mod) => [mod.modId, mod.displayName || mod.modId])
@@ -1783,6 +1824,38 @@ const App = () => {
                                   </table>
                               </div>`
                             : html`<p className="text-muted">No mods reported resource usage yet.</p>`}
+                    </${Card}>
+                    <${Card}
+                        title="Vulkan Residency"
+                        actions=${html`<span className="card-note">${vulkanResidency?.available ? "Live runtime" : "Not active"}</span>`}
+                    >
+                        ${vulkanResidency?.available
+                            ? html`
+                                  <p className="text-muted">
+                                      Reserved VRAM is allocator-owned memory held by Quantified API. Workspace payload is only the live pooled dispatch footprint,
+                                      so it can stay tiny while reserved memory remains much larger due to slab allocation.
+                                  </p>
+                                  <div className="metrics-row">
+                                      ${residencyMetrics.map((metric, idx) => html`<${Metric} key=${idx} label=${metric.label} value=${metric.value} sub=${metric.sub} />`)}
+                                  </div>
+                                  <div className="table-scroll">
+                                      <table className="data-table">
+                                          <tbody>
+                                              <tr><th>Soft Limit</th><td>${formatBytes(vulkanResidency.softLimitBytes ?? 0)}</td></tr>
+                                              <tr><th>Hard Limit</th><td>${formatBytes(vulkanResidency.hardLimitBytes ?? 0)}</td></tr>
+                                              <tr><th>Allocator Slabs</th><td>${formatNumber(vulkanResidency.slabCount ?? 0)}</td></tr>
+                                              <tr><th>Workspace Pools</th><td>${formatNumber(vulkanResidency.workspacePoolCount ?? 0)}</td></tr>
+                                              <tr><th>Workspace Payload Bytes</th><td>${formatBytes(vulkanResidency.workspacePoolBytes ?? 0)}</td></tr>
+                                              <tr><th>Trimmed Workspace Bytes</th><td>${formatBytes(vulkanResidency.trimmedWorkspaceBytes ?? 0)}</td></tr>
+                                              <tr><th>Trimmed Slab Bytes</th><td>${formatBytes(vulkanResidency.trimmedSlabBytes ?? 0)}</td></tr>
+                                              <tr><th>Trimmed Slabs</th><td>${formatNumber(vulkanResidency.trimmedSlabs ?? 0)}</td></tr>
+                                              <tr><th>Pressure Cooldowns</th><td>${formatNumber(vulkanResidency.pressureCooldowns ?? 0)}</td></tr>
+                                              <tr><th>Cooldown Active</th><td>${vulkanResidency.cooldownActive ? `Yes • ${formatMillis(vulkanResidency.cooldownRemainingMs ?? 0)}` : "No"}</td></tr>
+                                          </tbody>
+                                      </table>
+                                  </div>
+                              `
+                            : html`<p className="text-muted">Vulkan residency metrics appear when the in-process Vulkan runtime is active.</p>`}
                     </${Card}>
                     <${Card}
                         title="Disk Cache Manager"
@@ -2003,7 +2076,7 @@ const App = () => {
                                       <p>${event.message}</p>
                                       <div className="timeline-meta">
                                           <span>Queue ${formatNumber(event.queueDepth ?? 0)}</span>
-                                          <span>GPU ${formatPercent(event.gpuComputeUtil)}</span>
+                                          <span>GPU ${formatPercent(normalizePercentRatio(event.gpuComputeUtil))}</span>
                                       </div>
                                   </div>`
                               )

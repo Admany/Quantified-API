@@ -2,6 +2,7 @@ package org.admany.quantified.core.common.dev;
 
 import org.admany.quantified.api.model.QuantifiedStats;
 import org.admany.quantified.core.common.async.core.AsyncManager;
+import org.admany.quantified.core.common.gpu.backend.VulkanExecutionSupport;
 import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.opencl.gpu.GPUMonitor;
 import org.admany.quantified.core.common.parallel.metrics.ParallelMetrics;
@@ -58,6 +59,7 @@ public final class DeveloperOverlayManager {
     private static final AtomicLong LAST_VALID_GPU_TEMP_BITS = new AtomicLong(Double.doubleToLongBits(Double.NaN));
 
     private static final int TIMELINE_CAPACITY = 180; // roughly three minutes at 1s cadence
+    private static final long GPU_ACTIVITY_GRACE_MS = 3_500L;
     private static final int REPLAY_CAPACITY = 120;   // two minutes of snapshots
     private static final int API_LOG_CAPACITY = 16_384;  // number of recent API log lines to retain
     // Async writer for persisting logs
@@ -202,9 +204,24 @@ public final class DeveloperOverlayManager {
                 gpuVramUsedBytes = Math.max(0L, gpuStatus.usedVramBytes());
                 gpuSystemUsageRatio = Math.max(0.0d, gpuStatus.systemUsageRatio());
             }
-            boolean gpuAvailable = gpuStatusPresent && OpenCLManager.isAvailable();
-            // Fallbacks for temp and VRAM even if OpenCL not available
-            String deviceName = gpuStatusPresent ? gpuStatus.deviceName() : "Unknown GPU";
+            boolean openclRuntimeAvailable = OpenCLManager.hasExecutableRuntime();
+            boolean vulkanRuntimeAvailable = VulkanExecutionSupport.hasExecutableRuntime();
+            boolean gpuAvailable = (gpuStatusPresent && openclRuntimeAvailable) || vulkanRuntimeAvailable;
+            String deviceName = gpuStatusPresent ? gpuStatus.deviceName() : "";
+            if ((deviceName == null || deviceName.isBlank()) && vulkanRuntimeAvailable) {
+                deviceName = VulkanExecutionSupport.deviceName();
+            }
+            if (deviceName == null || deviceName.isBlank()) {
+                deviceName = "Unknown GPU";
+            }
+
+            long openclActiveGpuTaskBytes = Math.max(0L, OpenCLManager.activeTaskVramBytes());
+            int openclActiveGpuComputeUnits = Math.max(0, OpenCLManager.activeTaskComputeUnits());
+            long vulkanActiveGpuTaskBytes = Math.max(0L, VulkanExecutionSupport.activeTaskVramBytes());
+            int vulkanActiveGpuComputeUnits = Math.max(0, VulkanExecutionSupport.activeTaskComputeUnits());
+            long activeGpuTaskBytes = openclActiveGpuTaskBytes + vulkanActiveGpuTaskBytes;
+            int activeGpuComputeUnits = openclActiveGpuComputeUnits + vulkanActiveGpuComputeUnits;
+            long lastGpuActivityMs = Math.max(OpenCLManager.lastTaskActivityMs(), VulkanExecutionSupport.lastTaskActivityMs());
 
             GpuTelemetryService.TelemetrySample telemetrySample = GpuTelemetryService.getInstance().latestSample();
             if (telemetrySample != null) {
@@ -215,9 +232,18 @@ public final class DeveloperOverlayManager {
                 if ((deviceName == null || deviceName.isBlank()) && telemetrySample.deviceName() != null && !telemetrySample.deviceName().isBlank()) {
                     deviceName = telemetrySample.deviceName();
                 }
-                double telemetryUtil = telemetrySample.computeUtilization();
-                if (gpuComputeUtil <= 0.0d && !Double.isNaN(telemetryUtil) && telemetryUtil > 0.0d) {
-                    gpuComputeUtil = telemetryUtil;
+            }
+
+            java.util.Map<?, ?> vulkanResidency = vulkanRuntimeAvailable ? VulkanExecutionSupport.residencySnapshot() : java.util.Map.of();
+            if (gpuMemoryUtil <= 0.0d && !vulkanResidency.isEmpty()) {
+                long reservedBytes = mapLong(vulkanResidency, "reservedBytes");
+                long hardLimitBytes = mapLong(vulkanResidency, "hardLimitBytes");
+                long localMemoryBytes = mapLong(vulkanResidency, "localMemoryBytes");
+                long limitBytes = hardLimitBytes > 0L ? hardLimitBytes : localMemoryBytes;
+                if (reservedBytes > 0L && limitBytes > 0L) {
+                    gpuMemoryUtil = Math.min(1.0d, reservedBytes / (double) limitBytes);
+                    gpuVramUsedBytes = Math.max(gpuVramUsedBytes, reservedBytes);
+                    gpuVramBudgetBytes = Math.max(gpuVramBudgetBytes, limitBytes);
                 }
             }
             if (gpuVramBudgetBytes == 0L) {
@@ -241,9 +267,16 @@ public final class DeveloperOverlayManager {
 
             long totalFallbacks = fallbackEventsTotal.get();
             long recentFallbacks = fallbackEventsRecent.getAndSet(0L);
-            long activeGpuTaskBytes = Math.max(0L, OpenCLManager.activeTaskVramBytes());
-            int activeGpuComputeUnits = Math.max(0, OpenCLManager.activeTaskComputeUnits());
             boolean qapiGpuActive = activeGpuTaskBytes > 0L || activeGpuComputeUnits > 0 || recentFallbacks > 0L;
+            double telemetryUtil = telemetrySample != null ? normalizeGpuRatio(telemetrySample.computeUtilization()) : 0.0d;
+            gpuComputeUtil = normalizeDashboardGpuComputeUtil(
+                gpuComputeUtil,
+                telemetryUtil,
+                qapiGpuActive,
+                lastGpuActivityMs,
+                openclRuntimeAvailable,
+                vulkanRuntimeAvailable
+            );
 
             if (timelineActive.get()) {
                 maybeEmitAutomaticAlerts(now, totalWork, gpuMemoryUtil, gpuComputeUtil, gpuTemperature, qapiGpuActive);
@@ -340,6 +373,46 @@ public final class DeveloperOverlayManager {
                 null
             ));
         }
+    }
+
+    private static double normalizeDashboardGpuComputeUtil(double currentUtil,
+                                                           double telemetryUtil,
+                                                           boolean qapiGpuActive,
+                                                           long lastGpuActivityMs,
+                                                           boolean openclRuntimeAvailable,
+                                                           boolean vulkanRuntimeAvailable) {
+        double normalizedCurrent = normalizeGpuRatio(currentUtil);
+        double normalizedTelemetry = normalizeGpuRatio(telemetryUtil);
+        if (qapiGpuActive) {
+            if (normalizedCurrent > 0.0d) {
+                return Math.max(normalizedCurrent, normalizedTelemetry);
+            }
+            if (openclRuntimeAvailable || vulkanRuntimeAvailable) {
+                return normalizedTelemetry;
+            }
+            return 0.0d;
+        }
+        long now = System.currentTimeMillis();
+        boolean recentlyActive = lastGpuActivityMs > 0L && now - lastGpuActivityMs < GPU_ACTIVITY_GRACE_MS;
+        if (recentlyActive) {
+            return Math.min(Math.max(normalizedCurrent, normalizedTelemetry), 0.35d);
+        }
+        return 0.0d;
+    }
+
+    private static double normalizeGpuRatio(double value) {
+        if (!Double.isFinite(value) || value <= 0.0d) {
+            return 0.0d;
+        }
+        if (value > 1.5d) {
+            return Math.min(1.0d, value / 100.0d);
+        }
+        return Math.min(1.0d, value);
+    }
+
+    private static long mapLong(java.util.Map<?, ?> values, String key) {
+        Object value = values.get(key);
+        return value instanceof Number number ? number.longValue() : 0L;
     }
 
     private static GpuSafeguardState classifyGpuSafeguard(double gpuMemoryUtil,

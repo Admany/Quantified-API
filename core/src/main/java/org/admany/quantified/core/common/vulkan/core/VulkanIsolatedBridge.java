@@ -1,6 +1,3 @@
-/*
- * Decompiled with CFR 0.152.
- */
 package org.admany.quantified.core.common.vulkan.core;
 
 import java.lang.reflect.Field;
@@ -65,6 +62,13 @@ public final class VulkanIsolatedBridge {
             }
         }
         return results;
+    }
+
+    public static Map<String, Object> residencySnapshot() {
+        if (!VulkanIsolatedBridge.ensureRuntimeReady()) {
+            return Map.of();
+        }
+        return VulkanInProcessManager.residencySnapshot();
     }
 
     private static Object executeApiTask(Object parentApiTask, ExecutionBinding binding, Map<Class<?>, Method> executeMethods) throws Exception {

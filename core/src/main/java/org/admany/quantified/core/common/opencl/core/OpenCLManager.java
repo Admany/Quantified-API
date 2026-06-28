@@ -151,6 +151,11 @@ public final class OpenCLManager {
         return current != null ? current.activeComputeUnits() : 0;
     }
 
+    public static long lastTaskActivityMs() {
+        GPUMonitor current = monitor;
+        return current != null ? current.lastTaskActivityMs() : 0L;
+    }
+
     public static void cacheRemove(String modId, String key) {
         TieredGpuCache cache = tieredCache;
         if (cache != null) cache.remove(modId, key);

@@ -1,60 +1,3 @@
-/*
- * Decompiled with CFR 0.152.
- * 
- * Could not load the following classes:
- *  org.lwjgl.PointerBuffer
- *  org.lwjgl.system.CustomBuffer
- *  org.lwjgl.system.MemoryStack
- *  org.lwjgl.system.MemoryUtil
- *  org.lwjgl.system.Struct
- *  org.lwjgl.vulkan.VK10
- *  org.lwjgl.vulkan.VK11
- *  org.lwjgl.vulkan.VK12
- *  org.lwjgl.vulkan.VkApplicationInfo
- *  org.lwjgl.vulkan.VkBufferCopy
- *  org.lwjgl.vulkan.VkBufferCopy$Buffer
- *  org.lwjgl.vulkan.VkBufferCreateInfo
- *  org.lwjgl.vulkan.VkBufferMemoryBarrier
- *  org.lwjgl.vulkan.VkBufferMemoryBarrier$Buffer
- *  org.lwjgl.vulkan.VkCommandBuffer
- *  org.lwjgl.vulkan.VkCommandBufferAllocateInfo
- *  org.lwjgl.vulkan.VkCommandBufferBeginInfo
- *  org.lwjgl.vulkan.VkCommandPoolCreateInfo
- *  org.lwjgl.vulkan.VkDescriptorBufferInfo
- *  org.lwjgl.vulkan.VkDescriptorBufferInfo$Buffer
- *  org.lwjgl.vulkan.VkDescriptorPoolCreateInfo
- *  org.lwjgl.vulkan.VkDescriptorPoolSize
- *  org.lwjgl.vulkan.VkDescriptorPoolSize$Buffer
- *  org.lwjgl.vulkan.VkDescriptorSetAllocateInfo
- *  org.lwjgl.vulkan.VkDevice
- *  org.lwjgl.vulkan.VkDeviceCreateInfo
- *  org.lwjgl.vulkan.VkDeviceQueueCreateInfo
- *  org.lwjgl.vulkan.VkDeviceQueueCreateInfo$Buffer
- *  org.lwjgl.vulkan.VkFenceCreateInfo
- *  org.lwjgl.vulkan.VkInstance
- *  org.lwjgl.vulkan.VkInstanceCreateInfo
- *  org.lwjgl.vulkan.VkMemoryAllocateInfo
- *  org.lwjgl.vulkan.VkMemoryRequirements
- *  org.lwjgl.vulkan.VkPhysicalDevice
- *  org.lwjgl.vulkan.VkPhysicalDeviceFeatures2
- *  org.lwjgl.vulkan.VkPhysicalDeviceFloatControlsProperties
- *  org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties
- *  org.lwjgl.vulkan.VkPhysicalDeviceProperties
- *  org.lwjgl.vulkan.VkPhysicalDeviceProperties2
- *  org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features
- *  org.lwjgl.vulkan.VkQueue
- *  org.lwjgl.vulkan.VkQueueFamilyProperties
- *  org.lwjgl.vulkan.VkQueueFamilyProperties$Buffer
- *  org.lwjgl.vulkan.VkSemaphoreCreateInfo
- *  org.lwjgl.vulkan.VkSemaphoreTypeCreateInfo
- *  org.lwjgl.vulkan.VkSemaphoreWaitInfo
- *  org.lwjgl.vulkan.VkSubmitInfo
- *  org.lwjgl.vulkan.VkTimelineSemaphoreSubmitInfo
- *  org.lwjgl.vulkan.VkWriteDescriptorSet
- *  org.lwjgl.vulkan.VkWriteDescriptorSet$Buffer
- *  org.slf4j.Logger
- *  org.slf4j.LoggerFactory
- */
 package org.admany.quantified.core.common.vulkan.core;
 
 import java.io.IOException;
@@ -156,6 +99,7 @@ public final class VulkanInProcessManager {
     private static final long DEFAULT_SLAB_BYTES = 0x10000000L;
     private static final long MIN_SLAB_BYTES = 0x1000000L;
     private static final String SLAB_BYTES_PROPERTY = "quantified.vulkan.slabBytes";
+    private static final String INLINE_EXECUTION_PROPERTY = "quantified.vulkan.allowInlineExecution";
     private static final int VECTOR_LOCAL_SIZE_X = 256;
     private static final int VECTOR_ELEMENTS_PER_INVOCATION = 8;
     private static final int MONTE_CARLO_SAMPLES_PER_INVOCATION = 32;
@@ -181,6 +125,8 @@ public final class VulkanInProcessManager {
     private static final AtomicReference<CompletableFuture<Boolean>> ACTIVE_INIT = new AtomicReference();
     private static final AtomicBoolean VULKAN_PROBING = new AtomicBoolean(false);
     private static final AtomicBoolean DEFERRED_RUNTIME_INIT_LOGGED = new AtomicBoolean(false);
+    private static final AtomicLong VRAM_PRESSURE_COOLDOWN_UNTIL_MS = new AtomicLong(0L);
+    private static final AtomicLong LAST_PRESSURE_LOG_MS = new AtomicLong(0L);
     private static volatile State state;
     private static volatile RuntimeStatus lastStatus;
     private static volatile long nextInitRetryMs;
@@ -220,6 +166,66 @@ public final class VulkanInProcessManager {
     public static boolean isRuntimeWarmupRunning() {
         CompletableFuture<Boolean> active = ACTIVE_INIT.get();
         return active != null && !active.isDone();
+    }
+
+    public static boolean isInVramPressureCooldown() {
+        long now = System.currentTimeMillis();
+        long until = VRAM_PRESSURE_COOLDOWN_UNTIL_MS.get();
+        if (until <= now) {
+            return false;
+        }
+        VulkanResidencyManager.notePressureCooldownHit();
+        long lastLog = LAST_PRESSURE_LOG_MS.get();
+        if (now - lastLog > VulkanResidencyManager.pressureLogIntervalMs() && LAST_PRESSURE_LOG_MS.compareAndSet(lastLog, now)) {
+            long seconds = Math.max(1L, (until - now) / 1000L);
+            DeveloperOverlayManager.recordApiLog("[Vulkan] VRAM spike - routing GPU work to CPU for ~" + seconds + "s");
+        }
+        return true;
+    }
+
+    public static Map<String, Object> residencySnapshot() {
+        State local = state;
+        long reservedBytes = 0L;
+        long localMemoryBytes = 0L;
+        int slabCount = 0;
+        int workspacePoolCount = 0;
+        long workspacePoolBytes = 0L;
+        if (local != null) {
+            reservedBytes = local.memoryAllocator.reservedBytes();
+            localMemoryBytes = local.localMemoryBytes;
+            slabCount = local.memoryAllocator.slabCount();
+            synchronized (local.workspaceMutex) {
+                workspacePoolCount = local.workspaces.size();
+                for (DispatchWorkspacePool pool : local.workspaces.values()) {
+                    workspacePoolBytes += pool.totalBytes();
+                }
+            }
+        }
+        long now = System.currentTimeMillis();
+        long cooldownUntil = VRAM_PRESSURE_COOLDOWN_UNTIL_MS.get();
+        boolean cooldownActive = cooldownUntil > now;
+        long cooldownRemainingMs = cooldownActive ? Math.max(0L, cooldownUntil - now) : 0L;
+        return VulkanResidencyManager.snapshot(
+            reservedBytes,
+            localMemoryBytes,
+            slabCount,
+            workspacePoolCount,
+            workspacePoolBytes,
+            cooldownActive,
+            cooldownRemainingMs
+        ).toMap();
+    }
+
+    public static long activeTaskVramBytes() {
+        return VulkanRuntimeActivityTracker.activeVramBytes();
+    }
+
+    public static int activeTaskComputeUnits() {
+        return VulkanRuntimeActivityTracker.activeComputeUnits();
+    }
+
+    public static long lastTaskActivityMs() {
+        return VulkanRuntimeActivityTracker.lastTaskActivityMs();
     }
 
     private static void queueAutomaticWarmup(String reason) {
@@ -541,7 +547,7 @@ public final class VulkanInProcessManager {
                 if (!VulkanInProcessManager.ensureInitialised()) {
                     return CompletableFuture.completedFuture(task.cpuFallback().get());
                 }
-                return CompletableFuture.completedFuture(task.executeOnGPU(VulkanManagerHolder.CONTEXT));
+                return CompletableFuture.completedFuture(VulkanInProcessManager.executeTracked(task, () -> task.executeOnGPU(VulkanManagerHolder.CONTEXT)));
             }
             catch (Throwable throwable) {
                 LOGGER.debug("Inline Vulkan execution failed, falling back to async for task {}", (Object)task.name(), (Object)throwable);
@@ -551,15 +557,39 @@ public final class VulkanInProcessManager {
             if (!VulkanInProcessManager.ensureInitialised()) {
                 return task.cpuFallback().get();
             }
-            return task.executeOnGPU(VulkanManagerHolder.CONTEXT);
+            return VulkanInProcessManager.executeTracked(task, () -> task.executeOnGPU(VulkanManagerHolder.CONTEXT));
         }, EXECUTOR);
     }
 
+    private static <T> T executeTracked(VulkanTask<?> task, CheckedSupplier<T> supplier) {
+        VulkanRuntimeActivityTracker.TaskSample sample = VulkanRuntimeActivityTracker.beginTask(
+            task.estimatedVramBytes(),
+            task.estimatedComputeUnits()
+        );
+        try {
+            return supplier.get();
+        } catch (RuntimeException runtimeException) {
+            throw runtimeException;
+        } catch (Error error) {
+            throw error;
+        } catch (Throwable throwable) {
+            throw new RuntimeException("Vulkan workload execution failed", throwable);
+        } finally {
+            VulkanRuntimeActivityTracker.endTask(sample);
+        }
+    }
+
     private static boolean shouldExecuteInline(VulkanTask<?> task) {
+        if (!Boolean.parseBoolean(System.getProperty(INLINE_EXECUTION_PROPERTY, "false"))) {
+            return false;
+        }
         if (task.timeout().isPresent()) {
             return false;
         }
         if (Thread.currentThread().getName().startsWith("Quantified-Vulkan")) {
+            return false;
+        }
+        if (VulkanResidencyManager.isFrameSensitiveThread(Thread.currentThread())) {
             return false;
         }
         if (task.estimatedVramBytes() > 0x2000000L) {
@@ -568,11 +598,19 @@ public final class VulkanInProcessManager {
         return task.estimatedComputeUnits() <= 1500000;
     }
 
+    @FunctionalInterface
+    private interface CheckedSupplier<T> {
+        T get() throws Throwable;
+    }
+
     public static boolean canAcceptTask(VulkanTask<?> task) {
         if (task == null) {
             return false;
         }
         if (task.estimatedVramBytes() > 0x20000000L) {
+            return false;
+        }
+        if (VulkanInProcessManager.isInVramPressureCooldown()) {
             return false;
         }
         if (!INITIALIZED.get() || state == null) {
@@ -588,6 +626,10 @@ public final class VulkanInProcessManager {
             return false;
         }
         if (!VulkanInProcessManager.isAvailable()) {
+            return false;
+        }
+        State local = state;
+        if (local != null && !VulkanInProcessManager.ensureCapacityForTask(local, task)) {
             return false;
         }
         ExecutorService executorService = EXECUTOR;
@@ -620,8 +662,32 @@ public final class VulkanInProcessManager {
             state = null;
             INITIALIZED.set(false);
             nextInitRetryMs = 0L;
+            VRAM_PRESSURE_COOLDOWN_UNTIL_MS.set(0L);
             lastStatus = RuntimeStatus.failed("Vulkan shutdown");
             VulkanRuntime.invalidate();
+        }
+    }
+
+    public static void trimIdleResources(String reason, boolean aggressive) {
+        State local = state;
+        if (local == null) {
+            return;
+        }
+        long before = local.memoryAllocator.reservedBytes();
+        VulkanResidencyManager.TrimResult trimResult;
+        synchronized (INIT_MUTEX) {
+            if (state != local) {
+                return;
+            }
+            VulkanResidencyManager.TrimLevel trimLevel = VulkanResidencyManager.trimLevel(aggressive);
+            trimResult = VulkanInProcessManager.trimIdleWorkspacePools(local, trimLevel)
+                .merge(local.memoryAllocator.trimFreeSlabs(trimLevel));
+        }
+        long after = local.memoryAllocator.reservedBytes();
+        VulkanResidencyManager.noteTrim(trimResult);
+        if (after < before) {
+            LOGGER.info("Trimmed Vulkan idle resources (reason={}, aggressive={}, freed={} bytes)", reason, aggressive, before - after);
+            DeveloperOverlayManager.recordApiLog("[Vulkan] Trimmed idle resources (" + reason + "), freed " + ((before - after) / (1024 * 1024)) + " MiB");
         }
     }
 
@@ -762,7 +828,7 @@ public final class VulkanInProcessManager {
                 LongBuffer poolPtr = stack.mallocLong(1);
                 VkCommandPoolCreateInfo poolInfo = VkCommandPoolCreateInfo.calloc((MemoryStack)stack).sType(39).queueFamilyIndex(selection.computeQueueFamily).flags(2);
                 VulkanInProcessManager.checkVk(VK10.vkCreateCommandPool((VkDevice)device, (VkCommandPoolCreateInfo)poolInfo, null, (LongBuffer)poolPtr), "vkCreateCommandPool");
-                State created = new State(instance, physicalDevice, device, queue, poolPtr.get(0), selection.deviceName, selection.deviceType == 2, new VulkanMemoryAllocator(device), timelineSemaphoreSupported ? VulkanInProcessManager.createTimelineSemaphore(device, stack) : 0L);
+                State created = new State(instance, physicalDevice, device, queue, poolPtr.get(0), selection.deviceName, selection.localMemoryBytes, selection.deviceType == 2, new VulkanMemoryAllocator(device), timelineSemaphoreSupported ? VulkanInProcessManager.createTimelineSemaphore(device, stack) : 0L);
                 created.programs.put("vector_add", VulkanInProcessManager.createProgram(created, "vector_add", VECTOR_ADD_SHADER_RESOURCE, 3, 4));
                 created.programs.put("matrix_multiply", VulkanInProcessManager.createProgram(created, "matrix_multiply", MATRIX_MULTIPLY_SHADER_RESOURCE, 3, 12));
                 created.programs.put("monte_carlo_pi", VulkanInProcessManager.createProgram(created, "monte_carlo_pi", MONTE_CARLO_PI_SHADER_RESOURCE, 1, 4));
@@ -1238,17 +1304,28 @@ public final class VulkanInProcessManager {
     }
 
     private static WorkspaceLease acquireWorkspace(State state, Program program, String workspaceKey, WorkloadProfile workloadProfile, int groupCountX, int groupCountY, int groupCountZ, int inputBufferCount, int[] pushConstants, long ... bufferSizes) {
-        DispatchWorkspacePool pool = state.workspaces.computeIfAbsent(workspaceKey, ignored -> VulkanInProcessManager.createWorkspacePool(state, program, workloadProfile, groupCountX, groupCountY, groupCountZ, inputBufferCount, pushConstants, bufferSizes));
+        DispatchWorkspacePool pool;
+        synchronized (state.workspaceMutex) {
+            pool = state.workspaces.get(workspaceKey);
+            if (pool == null || pool.isClosed()) {
+                pool = VulkanInProcessManager.createWorkspacePool(state, program, workloadProfile, groupCountX, groupCountY, groupCountZ, inputBufferCount, pushConstants, bufferSizes);
+                state.workspaces.put(workspaceKey, pool);
+            }
+        }
         return new WorkspaceLease(pool, pool.borrow());
     }
 
     private static DispatchWorkspacePool createWorkspacePool(State state, Program program, WorkloadProfile workloadProfile, int groupCountX, int groupCountY, int groupCountZ, int inputBufferCount, int[] pushConstants, long ... bufferSizes) {
         DispatchWorkspace[] workspaces = new DispatchWorkspace[3];
+        long workspaceBytes = 0L;
+        for (long bufferSize : bufferSizes) {
+            workspaceBytes += Math.max(0L, bufferSize);
+        }
         try {
             for (int i = 0; i < workspaces.length; ++i) {
                 workspaces[i] = VulkanInProcessManager.createWorkspace(state, program, workloadProfile, groupCountX, groupCountY, groupCountZ, inputBufferCount, pushConstants, bufferSizes);
             }
-            return new DispatchWorkspacePool(workspaces);
+            return new DispatchWorkspacePool(workspaces, workspaceBytes * workspaces.length);
         }
         catch (Throwable throwable) {
             for (DispatchWorkspace workspace : workspaces) {
@@ -1876,20 +1953,23 @@ public final class VulkanInProcessManager {
         private final Object computeQueueLock = new Object();
         private final long commandPool;
         private final String deviceName;
+        private final long localMemoryBytes;
         private final boolean prefersDeviceLocalTransfers;
         private final VulkanMemoryAllocator memoryAllocator;
         private final long timelineSemaphore;
         private final AtomicLong nextTimelineValue = new AtomicLong(0L);
         private final Map<String, Program> programs = new ConcurrentHashMap<String, Program>();
         private final Map<String, DispatchWorkspacePool> workspaces = new ConcurrentHashMap<String, DispatchWorkspacePool>();
+        private final Object workspaceMutex = new Object();
 
-        private State(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, VkQueue computeQueue, long commandPool, String deviceName, boolean prefersDeviceLocalTransfers, VulkanMemoryAllocator memoryAllocator, long timelineSemaphore) {
+        private State(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, VkQueue computeQueue, long commandPool, String deviceName, long localMemoryBytes, boolean prefersDeviceLocalTransfers, VulkanMemoryAllocator memoryAllocator, long timelineSemaphore) {
             this.instance = instance;
             this.physicalDevice = physicalDevice;
             this.device = device;
             this.computeQueue = computeQueue;
             this.commandPool = commandPool;
             this.deviceName = deviceName;
+            this.localMemoryBytes = localMemoryBytes;
             this.prefersDeviceLocalTransfers = prefersDeviceLocalTransfers;
             this.memoryAllocator = memoryAllocator;
             this.timelineSemaphore = timelineSemaphore;
@@ -1996,6 +2076,7 @@ public final class VulkanInProcessManager {
     private static final class VulkanMemoryAllocator {
         private final VkDevice device;
         private final List<MemorySlab> slabs = new ArrayList<MemorySlab>();
+        private long reservedBytes;
 
         private VulkanMemoryAllocator(VkDevice device) {
             this.device = device;
@@ -2040,6 +2121,7 @@ public final class VulkanInProcessManager {
                     }
                 }
                 MemoryAllocation memoryAllocation = new MemoryAllocation(null, memory, 0L, size, mappedBase, true);
+                this.reservedBytes += size;
                 return memoryAllocation;
             }
         }
@@ -2079,6 +2161,7 @@ public final class VulkanInProcessManager {
                     }
                 }
                 MemorySlab memorySlab = new MemorySlab(this.device, memoryType, memory, size, mappedBase, mapped);
+                this.reservedBytes += size;
                 return memorySlab;
             }
         }
@@ -2093,9 +2176,43 @@ public final class VulkanInProcessManager {
                     VK10.vkUnmapMemory((VkDevice)this.device, (long)allocation.memory);
                 }
                 VK10.vkFreeMemory((VkDevice)this.device, (long)allocation.memory, null);
+                this.reservedBytes = Math.max(0L, this.reservedBytes - allocation.size);
                 return;
             }
             allocation.slab.free(allocation.offset, allocation.size);
+        }
+
+        private synchronized VulkanResidencyManager.TrimResult trimFreeSlabs(VulkanResidencyManager.TrimLevel trimLevel) {
+            Map<String, Integer> retained = new LinkedHashMap<String, Integer>();
+            long slabsFreed = 0L;
+            long bytesFreed = 0L;
+            Iterator<MemorySlab> iterator = this.slabs.iterator();
+            while (iterator.hasNext()) {
+                MemorySlab slab = iterator.next();
+                if (!slab.isCompletelyFree() || !slab.canTrim(trimLevel)) {
+                    continue;
+                }
+                String key = slab.memoryType + ":" + slab.mapped;
+                int kept = retained.getOrDefault(key, 0);
+                if (kept >= trimLevel.keepFreeSlabsPerClass()) {
+                    slab.destroy();
+                    this.reservedBytes = Math.max(0L, this.reservedBytes - slab.size);
+                    ++slabsFreed;
+                    bytesFreed += slab.size;
+                    iterator.remove();
+                    continue;
+                }
+                retained.put(key, kept + 1);
+            }
+            return VulkanResidencyManager.TrimResult.of(0L, 0L, slabsFreed, bytesFreed);
+        }
+
+        private synchronized long reservedBytes() {
+            return this.reservedBytes;
+        }
+
+        private synchronized int slabCount() {
+            return this.slabs.size();
         }
 
         private synchronized void destroy() {
@@ -2103,39 +2220,88 @@ public final class VulkanInProcessManager {
                 slab.destroy();
             }
             this.slabs.clear();
+            this.reservedBytes = 0L;
         }
     }
 
     private static final class DispatchWorkspacePool {
         private final DispatchWorkspace[] workspaces;
         private final BlockingQueue<DispatchWorkspace> available;
+        private final long totalBytes;
+        private boolean closed;
+        private int borrowedCount;
+        private volatile long lastBorrowedNanos;
+        private volatile long lastReleasedNanos;
 
-        private DispatchWorkspacePool(DispatchWorkspace[] workspaces) {
+        private DispatchWorkspacePool(DispatchWorkspace[] workspaces, long totalBytes) {
             this.workspaces = workspaces;
+            this.totalBytes = totalBytes;
             this.available = new ArrayBlockingQueue<DispatchWorkspace>(workspaces.length);
             for (DispatchWorkspace workspace : workspaces) {
                 this.available.add(workspace);
             }
+            long now = System.nanoTime();
+            this.lastBorrowedNanos = now;
+            this.lastReleasedNanos = now;
         }
 
         private DispatchWorkspace borrow() {
+            synchronized (this) {
+                if (this.closed) {
+                    throw new IllegalStateException("Vulkan workspace pool is closed");
+                }
+                ++this.borrowedCount;
+                this.lastBorrowedNanos = System.nanoTime();
+            }
             try {
                 return this.available.take();
             }
             catch (InterruptedException e) {
+                synchronized (this) {
+                    --this.borrowedCount;
+                }
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Interrupted while waiting for Vulkan workspace", e);
             }
         }
 
         private void release(DispatchWorkspace workspace) {
-            if (workspace != null) {
-                this.available.offer(workspace);
+            if (workspace == null) {
+                return;
             }
+            synchronized (this) {
+                --this.borrowedCount;
+                if (this.closed) {
+                    return;
+                }
+                this.lastReleasedNanos = System.nanoTime();
+            }
+            this.available.offer(workspace);
         }
 
         private DispatchWorkspace[] workspaces() {
             return this.workspaces;
+        }
+
+        private synchronized boolean isClosed() {
+            return this.closed;
+        }
+
+        private synchronized DispatchWorkspace[] closeIfIdle(VulkanResidencyManager.TrimLevel trimLevel) {
+            if (this.closed || this.borrowedCount != 0 || this.available.size() != this.workspaces.length) {
+                return null;
+            }
+            long idleNanos = System.nanoTime() - Math.max(this.lastBorrowedNanos, this.lastReleasedNanos);
+            if (idleNanos < trimLevel.workspaceIdleNanos()) {
+                return null;
+            }
+            this.closed = true;
+            this.available.clear();
+            return this.workspaces;
+        }
+
+        private long totalBytes() {
+            return this.totalBytes;
         }
     }
 
@@ -2196,6 +2362,7 @@ public final class VulkanInProcessManager {
         private final long mappedBase;
         private final boolean mapped;
         private final List<FreeRange> freeRanges = new ArrayList<FreeRange>();
+        private volatile long lastTouchedNanos;
 
         private MemorySlab(VkDevice device, int memoryType, long memory, long size, long mappedBase, boolean mapped) {
             this.device = device;
@@ -2205,6 +2372,7 @@ public final class VulkanInProcessManager {
             this.mappedBase = mappedBase;
             this.mapped = mapped;
             this.freeRanges.add(new FreeRange(0L, size));
+            this.lastTouchedNanos = System.nanoTime();
         }
 
         private MemoryAllocation tryAllocate(long requestSize, long alignment) {
@@ -2227,6 +2395,7 @@ public final class VulkanInProcessManager {
                 } else {
                     this.freeRanges.remove(i);
                 }
+                this.lastTouchedNanos = System.nanoTime();
                 return new MemoryAllocation(this, this.memory, alignedOffset, requestSize, this.mappedBase, false);
             }
             return null;
@@ -2244,6 +2413,15 @@ public final class VulkanInProcessManager {
                 this.freeRanges.remove(i + 1);
                 --i;
             }
+            this.lastTouchedNanos = System.nanoTime();
+        }
+
+        private boolean isCompletelyFree() {
+            return this.freeRanges.size() == 1 && this.freeRanges.get(0).offset == 0L && this.freeRanges.get(0).size == this.size;
+        }
+
+        private boolean canTrim(VulkanResidencyManager.TrimLevel trimLevel) {
+            return System.nanoTime() - this.lastTouchedNanos >= trimLevel.slabIdleNanos();
         }
 
         private void destroy() {
@@ -2252,5 +2430,73 @@ public final class VulkanInProcessManager {
             }
             VK10.vkFreeMemory((VkDevice)this.device, (long)this.memory, null);
         }
+    }
+
+    private static boolean ensureCapacityForTask(State state, VulkanTask<?> task) {
+        long localMemoryBytes = state.localMemoryBytes;
+        if (localMemoryBytes <= 0L) {
+            return true;
+        }
+        long reservedBytes = state.memoryAllocator.reservedBytes();
+        long projectedBytes = reservedBytes + Math.max(0L, task.estimatedVramBytes());
+        long softLimit = VulkanResidencyManager.softLimitBytes(localMemoryBytes, DEFAULT_SLAB_BYTES);
+        if (projectedBytes <= softLimit) {
+            return true;
+        }
+        VulkanInProcessManager.trimIdleResources("capacity-check", false);
+        reservedBytes = state.memoryAllocator.reservedBytes();
+        projectedBytes = reservedBytes + Math.max(0L, task.estimatedVramBytes());
+        long hardLimit = VulkanResidencyManager.hardLimitBytes(localMemoryBytes, DEFAULT_SLAB_BYTES);
+        if (projectedBytes <= hardLimit) {
+            return true;
+        }
+        VulkanInProcessManager.trimIdleResources("capacity-check-aggressive", true);
+        reservedBytes = state.memoryAllocator.reservedBytes();
+        projectedBytes = reservedBytes + Math.max(0L, task.estimatedVramBytes());
+        if (projectedBytes <= hardLimit) {
+            return true;
+        }
+        VulkanResidencyManager.notePressureReject();
+        VulkanInProcessManager.enterVramPressureCooldown(state, reservedBytes, task.estimatedVramBytes());
+        return false;
+    }
+
+    private static void enterVramPressureCooldown(State state, long reservedBytes, long requestedBytes) {
+        VulkanResidencyManager.notePressureCooldown();
+        long until = System.currentTimeMillis() + VulkanResidencyManager.pressureCooldownMs();
+        VRAM_PRESSURE_COOLDOWN_UNTIL_MS.set(until);
+        long lastLog = LAST_PRESSURE_LOG_MS.get();
+        long now = System.currentTimeMillis();
+        if (now - lastLog > VulkanResidencyManager.pressureLogIntervalMs() && LAST_PRESSURE_LOG_MS.compareAndSet(lastLog, now)) {
+            long localMiB = Math.max(1L, state.localMemoryBytes / (1024 * 1024));
+            long reservedMiB = Math.max(0L, reservedBytes / (1024 * 1024));
+            long requestedMiB = Math.max(0L, requestedBytes / (1024 * 1024));
+            String detail = "Vulkan VRAM pressure detected - trimmed idle resources and paused new GPU work briefly"
+                + " (reserved=" + reservedMiB + " MiB, requested=" + requestedMiB + " MiB, device=" + localMiB + " MiB)";
+            LOGGER.warn(detail);
+            DeveloperOverlayManager.recordApiLog("[Vulkan] " + detail);
+        }
+    }
+
+    private static VulkanResidencyManager.TrimResult trimIdleWorkspacePools(State state, VulkanResidencyManager.TrimLevel trimLevel) {
+        long poolsFreed = 0L;
+        long bytesFreed = 0L;
+        synchronized (state.workspaceMutex) {
+            Iterator<Map.Entry<String, DispatchWorkspacePool>> iterator = state.workspaces.entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<String, DispatchWorkspacePool> entry = iterator.next();
+                DispatchWorkspace[] idle = entry.getValue().closeIfIdle(trimLevel);
+                if (idle == null) {
+                    continue;
+                }
+                iterator.remove();
+                ++poolsFreed;
+                bytesFreed += entry.getValue().totalBytes();
+                for (DispatchWorkspace workspace : idle) {
+                    VulkanInProcessManager.destroyWorkspace(state, workspace);
+                }
+            }
+        }
+        return VulkanResidencyManager.TrimResult.of(poolsFreed, bytesFreed, 0L, 0L);
     }
 }

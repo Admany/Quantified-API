@@ -13,6 +13,8 @@ public final class VulkanRuntime {
     private static final AtomicReference<AvailabilitySnapshot> SNAPSHOT = new AtomicReference<>();
     private static final AtomicReference<Boolean> BINDINGS_PRESENT = new AtomicReference<>();
     private static final AtomicReference<Boolean> PROBE_RUNTIME_PRESENT = new AtomicReference<>();
+    private static final AtomicReference<Boolean> EMBEDDED_PROBE_BUNDLE_PRESENT = new AtomicReference<>();
+    private static final AtomicReference<RuntimeMode> RUNTIME_MODE = new AtomicReference<>();
     private static final AtomicInteger PROBE_SEQUENCE = new AtomicInteger(0);
 
     private VulkanRuntime() {
@@ -29,10 +31,11 @@ public final class VulkanRuntime {
         if (cached != null) {
             return cached;
         }
-        // Never probe lazily from an arbitrary thread — vkCreateInstance consumes several MB
-        // of native stack space (NVIDIA DXGI/DX12 initialisation) and is only safe to run on
-        // threads with a large stack (e.g. PROBE_EXECUTOR / SCHEDULER at 64 MB).
-        // Use reprobe() from the probe executor to populate the cache.
+    // Never run the probe lazily from an arbitrary thread. vkCreateInstance may use
+    // several MB of native stack during NVIDIA DXGI/DX12 initialisation, so it must
+    // only run on large-stack threads such as PROBE_EXECUTOR or SCHEDULER (64 MB).
+    // Call reprobe() from the probe executor to populate the cached result.
+
         return new AvailabilitySnapshot(false, false, false, 0, 0, "Vulkan probe not yet run", List.of());
     }
 
@@ -61,20 +64,27 @@ public final class VulkanRuntime {
     }
 
     public static RuntimeMode runtimeMode() {
+        RuntimeMode cached = RUNTIME_MODE.get();
+        if (cached != null) {
+            return cached;
+        }
+        RuntimeMode resolved;
         if (hasBindings()) {
-            return RuntimeMode.IN_PROCESS;
+            resolved = RuntimeMode.IN_PROCESS;
+        } else if (hasEmbeddedProbeBundle()) {
+            resolved = RuntimeMode.ISOLATED;
+        } else {
+            resolved = RuntimeMode.NONE;
         }
-        if (hasEmbeddedProbeBundle()) {
-            return RuntimeMode.ISOLATED;
-        }
-        return RuntimeMode.NONE;
+        RUNTIME_MODE.compareAndSet(null, resolved);
+        return RUNTIME_MODE.get();
     }
 
     /**
-     * Runs a fresh availability probe on the current thread and atomically updates the
-     * cached snapshot.  Must only be called from a thread with a sufficiently large stack
-     * (e.g. PROBE_EXECUTOR or SCHEDULER — both created with 64 MB stacks).
+    * Runs a synchronous Vulkan availability probe and atomically replaces the cached snapshot.
+    * Must execute on a large-stack probe thread, such as PROBE_EXECUTOR or SCHEDULER.
      */
+
     public static AvailabilitySnapshot reprobe() {
         Thread current = Thread.currentThread();
         int probeId = PROBE_SEQUENCE.incrementAndGet();
@@ -220,9 +230,15 @@ public final class VulkanRuntime {
     }
 
     private static boolean hasEmbeddedProbeBundle() {
+        Boolean cached = EMBEDDED_PROBE_BUNDLE_PRESENT.get();
+        if (cached != null) {
+            return cached;
+        }
         ClassLoader loader = VulkanRuntime.class.getClassLoader();
-        return loader.getResource("quantified/embedded/vulkanProbe/classpath.index") != null
+        boolean present = loader.getResource("quantified/embedded/vulkanProbe/classpath.index") != null
             && loader.getResource("quantified/embedded/vulkanProbe/quantified-vulkan-probe.jar.bin") != null;
+        EMBEDDED_PROBE_BUNDLE_PRESENT.compareAndSet(null, present);
+        return present;
     }
 
     public static final class AvailabilitySnapshot {

@@ -1,6 +1,3 @@
-/*
- * Decompiled with CFR 0.152.
- */
 package org.admany.quantified.core.common.vulkan.core;
 
 import java.io.ByteArrayInputStream;
@@ -25,6 +22,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -62,12 +60,20 @@ public final class VulkanIsolatedExecutor {
 
     public static <T> T executeApiTask(QuantifiedVulkan.ApiVulkanTask<T> apiTask) {
         try {
+            VulkanRuntimeActivityTracker.TaskSample sample = VulkanRuntimeActivityTracker.beginTask(
+                apiTask.estimatedVramBytes(),
+                apiTask.estimatedComputeUnits()
+            );
+            try {
             T result = VulkanIsolatedExecutor.runOnRuntimeThread(() -> {
                 BridgeHandle handle = VulkanIsolatedExecutor.handle();
                 return (T)handle.executeApiTask().invoke(null, apiTask);
             });
             VulkanIsolatedExecutor.clearCooldown();
             return result;
+            } finally {
+                VulkanRuntimeActivityTracker.endTask(sample);
+            }
         }
         catch (RuntimeException runtimeException) {
             VulkanIsolatedExecutor.recordFailure(runtimeException);
@@ -81,6 +87,20 @@ public final class VulkanIsolatedExecutor {
 
     public static Object[] executeApiTasks(List<? extends QuantifiedVulkan.ApiVulkanTask<?>> apiTasks) {
         try {
+            long estimatedVramBytes = 0L;
+            int estimatedComputeUnits = 0;
+            for (QuantifiedVulkan.ApiVulkanTask<?> apiTask : apiTasks) {
+                if (apiTask == null) {
+                    continue;
+                }
+                estimatedVramBytes += Math.max(0L, apiTask.estimatedVramBytes());
+                estimatedComputeUnits += Math.max(0, apiTask.estimatedComputeUnits());
+            }
+            VulkanRuntimeActivityTracker.TaskSample sample = VulkanRuntimeActivityTracker.beginTask(
+                estimatedVramBytes,
+                estimatedComputeUnits
+            );
+            try {
             Object[] results = VulkanIsolatedExecutor.runOnRuntimeThread(() -> {
                 BridgeHandle handle = VulkanIsolatedExecutor.handle();
                 return (Object[])handle.executeApiTasks().invoke(null, apiTasks);
@@ -96,6 +116,9 @@ public final class VulkanIsolatedExecutor {
                 VulkanIsolatedExecutor.clearCooldown();
             }
             return results;
+            } finally {
+                VulkanRuntimeActivityTracker.endTask(sample);
+            }
         }
         catch (RuntimeException runtimeException) {
             VulkanIsolatedExecutor.recordFailure(runtimeException);
@@ -104,6 +127,21 @@ public final class VulkanIsolatedExecutor {
         catch (Throwable throwable) {
             VulkanIsolatedExecutor.recordFailure(throwable);
             throw new RuntimeException("Isolated Vulkan batch execution failed", throwable);
+        }
+    }
+
+    public static Map<?, ?> residencySnapshot() {
+        if (!VulkanIsolatedExecutor.canExecute()) {
+            return Map.of();
+        }
+        try {
+            return VulkanIsolatedExecutor.runOnRuntimeThread(() -> {
+                BridgeHandle handle = VulkanIsolatedExecutor.handle();
+                Object value = handle.residencySnapshot().invoke(null);
+                return value instanceof Map<?, ?> map ? map : Map.of();
+            });
+        } catch (Throwable ignored) {
+            return Map.of();
         }
     }
 
@@ -196,7 +234,8 @@ public final class VulkanIsolatedExecutor {
         Method isAvailable = bridgeClass.getMethod("isAvailable", new Class[0]);
         Method executeApiTask = bridgeClass.getMethod("executeApiTask", Object.class);
         Method executeApiTasks = bridgeClass.getMethod("executeApiTasks", List.class);
-        return new BridgeHandle(loader, bridgeClass, isAvailable, executeApiTask, executeApiTasks);
+        Method residencySnapshot = bridgeClass.getMethod("residencySnapshot", new Class[0]);
+        return new BridgeHandle(loader, bridgeClass, isAvailable, executeApiTask, executeApiTasks, residencySnapshot);
     }
 
     private static URL resolveCurrentCodeSource() throws IOException {
@@ -236,7 +275,12 @@ public final class VulkanIsolatedExecutor {
         Files.write(destination, payload, new OpenOption[0]);
     }
 
-    private record BridgeHandle(ClassLoader loader, Class<?> bridgeClass, Method isAvailable, Method executeApiTask, Method executeApiTasks) {
+    private record BridgeHandle(ClassLoader loader,
+                                Class<?> bridgeClass,
+                                Method isAvailable,
+                                Method executeApiTask,
+                                Method executeApiTasks,
+                                Method residencySnapshot) {
     }
 
     private static final class ChildFirstPackageClassLoader
