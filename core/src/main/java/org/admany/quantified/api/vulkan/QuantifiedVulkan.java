@@ -4,12 +4,15 @@ import org.admany.quantified.api.compute.GpuBackendPreference;
 import org.admany.quantified.api.opencl.QuantifiedOpenCL;
 import org.admany.quantified.core.common.gpu.backend.VulkanExecutionSupport;
 import org.admany.quantified.core.common.util.TaskScheduler;
+import org.admany.quantified.core.common.vulkan.core.VulkanPreparedDispatcher;
 
 import java.lang.reflect.Method;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Supplier;
 
 public final class QuantifiedVulkan {
@@ -39,6 +42,40 @@ public final class QuantifiedVulkan {
         float[][] matrixMultiply(float[][] a, float[][] b);
         double monteCarloPi(int samples);
         float[] terrainGeneration(float[] inputCoords);
+        float[] dispatchSpirv(String programKey,
+                              byte[] spirv,
+                              int storageBufferCount,
+                              int pushConstantBytes,
+                              float[][] inputBuffers,
+                              int outputFloatCount,
+                              int[] pushConstants,
+                              int groupCountX,
+                              int groupCountY,
+                              int groupCountZ);
+
+        default float[] dispatch(SpirvComputeProgram program,
+                                 float[][] inputBuffers,
+                                 int outputFloatCount,
+                                 int[] pushConstants,
+                                 int groupCountX) {
+            Objects.requireNonNull(program, "program");
+            return dispatchSpirv(program.key(), program.spirvUnsafe(), program.storageBufferCount(),
+                program.pushConstantBytes(), inputBuffers, outputFloatCount, pushConstants,
+                groupCountX, 1, 1);
+        }
+
+        default float[] dispatch(SpirvComputeProgram program,
+                                 float[][] inputBuffers,
+                                 int outputFloatCount,
+                                 int[] pushConstants,
+                                 int groupCountX,
+                                 int groupCountY,
+                                 int groupCountZ) {
+            Objects.requireNonNull(program, "program");
+            return dispatchSpirv(program.key(), program.spirvUnsafe(), program.storageBufferCount(),
+                program.pushConstantBytes(), inputBuffers, outputFloatCount, pushConstants,
+                groupCountX, groupCountY, groupCountZ);
+        }
         String deviceName();
     }
 
@@ -50,6 +87,172 @@ public final class QuantifiedVulkan {
 
     public static <T> Builder<T> builder(String modId, String taskName, long taskKey) {
         return new Builder<>(modId, taskName, taskKey);
+    }
+
+    /**
+     * Prepares a stable SPIR-V program for explicitly coalesced, latency-sensitive
+     * batches. This lane avoids the generic scheduler's collection window and
+     * registry bridge; it is intended for region-sized work, never tiny per-cell
+     * dispatches.
+     */
+    public static PreparedProgram prepare(String modId, String taskName, SpirvComputeProgram program) {
+        return new PreparedProgram(modId, taskName, program);
+    }
+
+    public static final class PreparedProgram implements AutoCloseable {
+        private final String modId;
+        private final String taskName;
+        private final SpirvComputeProgram program;
+        private final LongAdder submitted = new LongAdder();
+        private final LongAdder completed = new LongAdder();
+        private final LongAdder fallbacks = new LongAdder();
+        private final LongAdder failures = new LongAdder();
+        private final LongAdder uploadedBytes = new LongAdder();
+        private final LongAdder readbackBytes = new LongAdder();
+        private volatile boolean closed;
+
+        private PreparedProgram(String modId, String taskName, SpirvComputeProgram program) {
+            this.modId = Objects.requireNonNull(modId, "modId");
+            this.taskName = Objects.requireNonNull(taskName, "taskName");
+            this.program = Objects.requireNonNull(program, "program");
+        }
+
+        public CompletableFuture<float[]> submit(long taskKey,
+                                                  Dispatch dispatch,
+                                                  Duration timeout,
+                                                  Supplier<float[]> cpuFallback) {
+            return submitInternal(taskKey, dispatch, timeout).handle((result, failure) -> {
+                if (failure == null) {
+                    return result;
+                }
+                fallbacks.increment();
+                return cpuFallback.get();
+            });
+        }
+
+        /**
+         * Submits through the prepared Vulkan lane without disguising a failed
+         * GPU dispatch as a successful CPU result. The caller remains responsible
+         * for its exact fallback and can therefore report truthful GPU counters.
+         */
+        public CompletableFuture<float[]> submitRequired(long taskKey,
+                                                          Dispatch dispatch,
+                                                          Duration timeout) {
+            return submitInternal(taskKey, dispatch, timeout);
+        }
+
+        private CompletableFuture<float[]> submitInternal(long taskKey,
+                                                           Dispatch dispatch,
+                                                           Duration timeout) {
+            Objects.requireNonNull(dispatch, "dispatch");
+            if (closed) {
+                return CompletableFuture.failedFuture(new IllegalStateException("Prepared Vulkan program is closed"));
+            }
+            long inputBytes = dispatch.inputBytes();
+            long outputBytes = (long) dispatch.outputFloatCount() * Float.BYTES;
+            Workload<float[]> workload = new PreparedDispatchWorkload(program, dispatch, inputBytes + outputBytes);
+            Builder<float[]> builder = QuantifiedVulkan.<float[]>builder(modId, taskName, taskKey)
+                .cpuFallback(() -> {
+                    throw new IllegalStateException("Prepared Vulkan required dispatch has no implicit CPU fallback");
+                })
+                .workload(workload)
+                .dataSizeBytes(inputBytes + outputBytes)
+                .parallelUnits(dispatch.computeUnits(program))
+                .timeout(timeout)
+                .allowMainThreadRerouting(false);
+            ApiVulkanTask<float[]> task = new ApiVulkanTask<>(builder);
+            submitted.increment();
+            uploadedBytes.add(inputBytes);
+            readbackBytes.add(outputBytes);
+            return VulkanPreparedDispatcher.submit(task, timeout)
+                .handle((result, failure) -> {
+                    if (failure == null) {
+                        completed.increment();
+                        return result;
+                    }
+                    failures.increment();
+                    if (failure instanceof CompletionException completionException) {
+                        throw completionException;
+                    }
+                    throw new CompletionException(failure);
+                });
+        }
+
+        public Snapshot snapshot() {
+            return new Snapshot(submitted.sum(), completed.sum(), fallbacks.sum(), failures.sum(),
+                uploadedBytes.sum(), readbackBytes.sum());
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+        }
+
+        public record Snapshot(long submitted, long completed, long fallbacks, long failures,
+                               long uploadedBytes, long readbackBytes) {
+        }
+    }
+
+    /** Public so the isolated legacy-Minecraft Vulkan bridge can invoke it without illegal access. */
+    public static final class PreparedDispatchWorkload implements Workload<float[]> {
+        private final SpirvComputeProgram program;
+        private final Dispatch dispatch;
+        private final long vramBytes;
+
+        public PreparedDispatchWorkload(SpirvComputeProgram program, Dispatch dispatch, long vramBytes) {
+            this.program = Objects.requireNonNull(program, "program");
+            this.dispatch = Objects.requireNonNull(dispatch, "dispatch");
+            this.vramBytes = vramBytes;
+        }
+
+        @Override
+        public long estimatedVramBytes() {
+            return vramBytes;
+        }
+
+        @Override
+        public int estimatedComputeUnits() {
+            return dispatch.computeUnits(program);
+        }
+
+        @Override
+        public float[] execute(Context context) {
+            return context.dispatch(program, dispatch.inputBuffers(), dispatch.outputFloatCount(),
+                dispatch.pushConstants(), dispatch.groupCountX(), dispatch.groupCountY(), dispatch.groupCountZ());
+        }
+    }
+
+    public record Dispatch(float[][] inputBuffers,
+                           int outputFloatCount,
+                           int[] pushConstants,
+                           int groupCountX,
+                           int groupCountY,
+                           int groupCountZ) {
+        public Dispatch {
+            Objects.requireNonNull(inputBuffers, "inputBuffers");
+            Objects.requireNonNull(pushConstants, "pushConstants");
+            if (inputBuffers.length == 0 || outputFloatCount < 0
+                || groupCountX < 1 || groupCountY < 1 || groupCountZ < 1) {
+                throw new IllegalArgumentException("Invalid prepared Vulkan dispatch dimensions");
+            }
+            for (float[] input : inputBuffers) {
+                Objects.requireNonNull(input, "input buffer");
+            }
+        }
+
+        long inputBytes() {
+            long floats = 0L;
+            for (float[] input : inputBuffers) {
+                floats += input.length;
+            }
+            return floats * Float.BYTES;
+        }
+
+        int computeUnits(SpirvComputeProgram program) {
+            long groups = (long) groupCountX * groupCountY * groupCountZ;
+            long localSize = (long) program.localSizeX() * program.localSizeY() * program.localSizeZ();
+            return (int) Math.min(Integer.MAX_VALUE, Math.max(1L, groups * localSize));
+        }
     }
 
     public static boolean isGpuReady() {
@@ -254,6 +457,7 @@ public final class QuantifiedVulkan {
         private final Method matrixMultiply;
         private final Method monteCarloPi;
         private final Method terrainGeneration;
+        private final Method dispatchSpirv;
         private final Method deviceName;
 
         private ApiContext(Object delegate) {
@@ -263,6 +467,8 @@ public final class QuantifiedVulkan {
             this.matrixMultiply = method(type, "matrixMultiply", float[][].class, float[][].class);
             this.monteCarloPi = method(type, "monteCarloPi", int.class);
             this.terrainGeneration = method(type, "terrainGeneration", float[].class);
+            this.dispatchSpirv = method(type, "dispatchSpirv", String.class, byte[].class, int.class, int.class,
+                float[][].class, int.class, int[].class, int.class, int.class, int.class);
             this.deviceName = method(type, "deviceName");
         }
 
@@ -284,6 +490,21 @@ public final class QuantifiedVulkan {
         @Override
         public float[] terrainGeneration(float[] inputCoords) {
             return invoke(terrainGeneration, float[].class, inputCoords);
+        }
+
+        @Override
+        public float[] dispatchSpirv(String programKey,
+                                     byte[] spirv,
+                                     int storageBufferCount,
+                                     int pushConstantBytes,
+                                     float[][] inputBuffers,
+                                     int outputFloatCount,
+                                     int[] pushConstants,
+                                     int groupCountX,
+                                     int groupCountY,
+                                     int groupCountZ) {
+            return invoke(dispatchSpirv, float[].class, programKey, spirv, storageBufferCount, pushConstantBytes,
+                inputBuffers, outputFloatCount, pushConstants, groupCountX, groupCountY, groupCountZ);
         }
 
         @Override

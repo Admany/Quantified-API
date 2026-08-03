@@ -12,18 +12,20 @@ import java.util.concurrent.Executors;
 
 import org.admany.quantified.core.common.async.core.AsyncManager;
 import org.admany.quantified.core.common.async.core.AsyncManagerBootstrap;
+import org.admany.quantified.core.common.async.gpu.GpuWorkloadRegistry;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 public class QuantifiedOpenCLUtilitiesTest {
 
     private static final String TEST_MOD_ID = "test-mod";
-    private static final long TEST_TASK_KEY = 12345L;
+    private static final long TEST_TASK_KEY = 0x2_0000L;
 
     private static ScheduledExecutorService testExecutor;
 
     @BeforeAll
     static void setUpAll() {
+        GpuWorkloadRegistry.clear();
         testExecutor = Executors.newScheduledThreadPool(2);
         AsyncManagerBootstrap bootstrap = AsyncManagerBootstrap.defaults(Runtime.getRuntime().availableProcessors());
         AsyncManager.initialise(bootstrap, testExecutor);
@@ -31,6 +33,7 @@ public class QuantifiedOpenCLUtilitiesTest {
 
     @AfterAll
     static void tearDownAll() {
+        GpuWorkloadRegistry.clear();
         AsyncManager.shutdown();
         if (testExecutor != null) {
             testExecutor.shutdownNow();
@@ -44,7 +47,7 @@ public class QuantifiedOpenCLUtilitiesTest {
         float[] b = {0.5f, 1.5f, 2.5f, 3.5f, 4.5f};
 
         CompletableFuture<float[]> future = QuantifiedOpenCL.parallelVectorAdd(
-            TEST_MOD_ID, "vector-add-test", TEST_TASK_KEY, a, b);
+            TEST_MOD_ID, "vector-add-test", TEST_TASK_KEY + 1L, a, b);
 
         float[] result = future.get();
 
@@ -97,7 +100,7 @@ public class QuantifiedOpenCLUtilitiesTest {
         int samples = 10000;
 
         CompletableFuture<Double> future = QuantifiedOpenCL.parallelMonteCarloPi(
-            TEST_MOD_ID, "monte-carlo-pi-test", TEST_TASK_KEY, samples);
+            TEST_MOD_ID, "monte-carlo-pi-test", TEST_TASK_KEY + 2L, samples);
 
         Double piEstimate = future.get();
 

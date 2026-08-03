@@ -12,6 +12,8 @@ import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.opencl.core.OpenCLTask;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
 import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -22,6 +24,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.*;
@@ -29,11 +32,18 @@ import static org.mockito.Answers.CALLS_REAL_METHODS;
 import static org.mockito.Mockito.withSettings;
 
 @ExtendWith(MockitoExtension.class)
+@Execution(ExecutionMode.SAME_THREAD)
 class TaskSchedulerTest {
+
+    @Test
+    void requiredVulkanIsNeverAdaptivelyReroutedToCpu() {
+        assertThat(TaskScheduler.shouldAdaptivelyRerouteVulkanToCpu(true, Integer.MAX_VALUE)).isFalse();
+    }
 
     private static final String TEST_MOD_ID = "test_mod";
     private static final String TEST_TASK_NAME = "test_task";
-    private static final long TEST_TASK_KEY = 12345L;
+    private static final AtomicLong NEXT_TASK_KEY = new AtomicLong(0x1_0000L);
+    private long taskKey;
 
     private static ScheduledExecutorService testExecutor;
 
@@ -54,6 +64,7 @@ class TaskSchedulerTest {
 
     @BeforeEach
     void setUp() {
+        taskKey = NEXT_TASK_KEY.getAndIncrement();
         if (MultithreadingConfig.CONFIG == null) {
             MultithreadingConfig.CONFIG = new MultithreadingConfig.Config();
         }
@@ -61,6 +72,7 @@ class TaskSchedulerTest {
         MultithreadingConfig.CONFIG.openclForced = false;
         MultithreadingConfig.CONFIG.preferredGpuBackend = "VULKAN_PREFERRED";
         GpuBackendRouter.resetForTesting();
+        GpuWorkloadRegistry.clear();
         TaskScheduler.resetStats();
         TaskScheduler.setGpuWorkloadForTesting(new TestGpuBatchWorkload());
     }
@@ -72,6 +84,7 @@ class TaskSchedulerTest {
             MultithreadingConfig.CONFIG.preferredGpuBackend = "VULKAN_PREFERRED";
         }
         GpuBackendRouter.resetForTesting();
+        GpuWorkloadRegistry.clear();
         TaskScheduler.resetStats();
         TaskScheduler.setGpuWorkloadForTesting(null);
     }
@@ -83,7 +96,7 @@ class TaskSchedulerTest {
 
         // When
         CompletableFuture<String> future = TaskScheduler.submitCpuTask(
-            TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY, cpuTask, Duration.ofSeconds(30));
+            TEST_MOD_ID, TEST_TASK_NAME, taskKey, cpuTask, Duration.ofSeconds(30));
 
         // Then
         assertThat(future).isNotNull();
@@ -102,7 +115,7 @@ class TaskSchedulerTest {
 
         // When
         CompletableFuture<String> future = TaskScheduler.submitComputeTask(
-            TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+            TEST_MOD_ID, TEST_TASK_NAME, taskKey,
             cpuTask, null, // No GPU task
             1024L, 100, TaskScheduler.TaskComplexity.MODERATE, TaskScheduler.TaskType.GENERAL, null, true);
 
@@ -120,7 +133,7 @@ class TaskSchedulerTest {
     void testSubmitComputeTaskSmallDataSize() throws ExecutionException, InterruptedException {
         // Given - small data size, should prefer CPU
         Supplier<String> cpuTask = () -> "CPU result";
-        OpenCLTask<String> gpuTask = createGpuTask(TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+        OpenCLTask<String> gpuTask = createGpuTask(TEST_MOD_ID, TEST_TASK_NAME, taskKey,
             cpuTask, () -> "GPU result");
 
         try (MockedStatic<OpenCLManager> openCLMock = Mockito.mockStatic(OpenCLManager.class, withSettings().defaultAnswer(CALLS_REAL_METHODS))) {
@@ -128,7 +141,7 @@ class TaskSchedulerTest {
 
             // When
             CompletableFuture<String> future = TaskScheduler.submitComputeTask(
-                TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+                TEST_MOD_ID, TEST_TASK_NAME, taskKey,
                 cpuTask, gpuTask,
                 100L, // Small data size
                 10, TaskScheduler.TaskComplexity.MODERATE, TaskScheduler.TaskType.GENERAL, null, true);
@@ -148,7 +161,7 @@ class TaskSchedulerTest {
     void testSubmitComputeTaskGpuAvailable() throws ExecutionException, InterruptedException {
         // Given - large data size, should prefer GPU
         Supplier<String> cpuTask = () -> "CPU result";
-        OpenCLTask<String> gpuTask = createGpuTask(TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+        OpenCLTask<String> gpuTask = createGpuTask(TEST_MOD_ID, TEST_TASK_NAME, taskKey,
             cpuTask, () -> "GPU result");
 
         try (MockedStatic<OpenCLManager> openCLMock = Mockito.mockStatic(OpenCLManager.class, withSettings().defaultAnswer(CALLS_REAL_METHODS))) {
@@ -156,7 +169,7 @@ class TaskSchedulerTest {
 
             // When
             CompletableFuture<String> future = TaskScheduler.submitComputeTask(
-                TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+                TEST_MOD_ID, TEST_TASK_NAME, taskKey,
                 cpuTask, gpuTask,
                 1024L * 1024L * 200, // Large data size (200MB)
                 10000, TaskScheduler.TaskComplexity.COMPLEX, TaskScheduler.TaskType.VECTOR_MATH, null, true);
@@ -176,7 +189,7 @@ class TaskSchedulerTest {
     void testSubmitComputeTaskGpuNotAvailable() throws ExecutionException, InterruptedException {
         // Given - GPU not available, should fallback to CPU
         Supplier<String> cpuTask = () -> "CPU result";
-        OpenCLTask<String> gpuTask = createGpuTask(TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+        OpenCLTask<String> gpuTask = createGpuTask(TEST_MOD_ID, TEST_TASK_NAME, taskKey,
             cpuTask, () -> "GPU result");
 
         try (MockedStatic<OpenCLManager> openCLMock = Mockito.mockStatic(OpenCLManager.class, withSettings().defaultAnswer(CALLS_REAL_METHODS))) {
@@ -185,7 +198,7 @@ class TaskSchedulerTest {
 
             // When
             CompletableFuture<String> future = TaskScheduler.submitComputeTask(
-                TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+                TEST_MOD_ID, TEST_TASK_NAME, taskKey,
                 cpuTask, gpuTask,
                 1024L * 1024L * 200, // Large data size
                 10000, TaskScheduler.TaskComplexity.COMPLEX, TaskScheduler.TaskType.VECTOR_MATH, null, true);
@@ -205,7 +218,7 @@ class TaskSchedulerTest {
     void testSubmitSpatialAnalysisTask() throws ExecutionException, InterruptedException {
         // Given - spatial analysis task with GPU
         Supplier<String> cpuTask = () -> "CPU result";
-        OpenCLTask<String> gpuTask = createGpuTask(TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+        OpenCLTask<String> gpuTask = createGpuTask(TEST_MOD_ID, TEST_TASK_NAME, taskKey,
             cpuTask, () -> "GPU result");
 
         try (MockedStatic<OpenCLManager> openCLMock = Mockito.mockStatic(OpenCLManager.class, withSettings().defaultAnswer(CALLS_REAL_METHODS))) {
@@ -213,7 +226,7 @@ class TaskSchedulerTest {
 
             // When
             CompletableFuture<String> future = TaskScheduler.submitSpatialAnalysisTask(
-                TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+                TEST_MOD_ID, TEST_TASK_NAME, taskKey,
                 cpuTask, gpuTask,
                 1024L * 1024L * 50, // 50MB
                 5000);
@@ -232,7 +245,7 @@ class TaskSchedulerTest {
     void testSubmitMassiveDataTask() throws ExecutionException, InterruptedException {
         // Given - massive data task
         Supplier<String> cpuTask = () -> "CPU result";
-        OpenCLTask<String> gpuTask = createGpuTask(TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+        OpenCLTask<String> gpuTask = createGpuTask(TEST_MOD_ID, TEST_TASK_NAME, taskKey,
             cpuTask, () -> "GPU result");
 
         try (MockedStatic<OpenCLManager> openCLMock = Mockito.mockStatic(OpenCLManager.class, withSettings().defaultAnswer(CALLS_REAL_METHODS))) {
@@ -240,7 +253,7 @@ class TaskSchedulerTest {
 
             // When
             CompletableFuture<String> future = TaskScheduler.submitMassiveDataTask(
-                TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+                TEST_MOD_ID, TEST_TASK_NAME, taskKey,
                 cpuTask, gpuTask,
                 1024L * 1024L * 500, // 500MB
                 50000);
@@ -334,7 +347,7 @@ class TaskSchedulerTest {
     void testSimplifiedSubmitComputeTask() throws ExecutionException, InterruptedException {
         // Test the simplified version of submitComputeTask
         Supplier<String> cpuTask = () -> "CPU result";
-        OpenCLTask<String> gpuTask = createGpuTask(TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+        OpenCLTask<String> gpuTask = createGpuTask(TEST_MOD_ID, TEST_TASK_NAME, taskKey,
             cpuTask, () -> "GPU result");
 
         try (MockedStatic<OpenCLManager> openCLMock = Mockito.mockStatic(OpenCLManager.class, withSettings().defaultAnswer(CALLS_REAL_METHODS))) {
@@ -342,7 +355,7 @@ class TaskSchedulerTest {
 
             // When
             CompletableFuture<String> future = TaskScheduler.submitComputeTask(
-                TEST_MOD_ID, TEST_TASK_NAME, TEST_TASK_KEY,
+                TEST_MOD_ID, TEST_TASK_NAME, taskKey,
                 cpuTask, gpuTask,
                 1024L * 1024L * 200, // Large data
                 10000); // High parallelism

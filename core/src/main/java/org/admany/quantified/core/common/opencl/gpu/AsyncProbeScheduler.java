@@ -173,8 +173,6 @@ public class AsyncProbeScheduler {
     }
 
     private static boolean probeAlreadyResolved() {
-        OpenCLRuntime.ProbeSnapshot snapshot = OpenCLRuntime.cachedProbeSnapshot();
-        return OpenCLManager.isAvailable()
-            || (snapshot != null && snapshot.success() && !snapshot.devices().isEmpty());
+        return OpenCLManager.hasExecutableRuntime();
     }
 }

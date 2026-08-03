@@ -38,6 +38,7 @@ println "Java: ${System.getProperty 'java.version'}, JVM: ${System.getProperty '
 def lwjglVersion = "3.3.1"
 def lwjglNatives = org.gradle.internal.os.OperatingSystem.current().isWindows() ? "natives-windows" :
     (org.gradle.internal.os.OperatingSystem.current().isMacOsX() ? "natives-macos" : "natives-linux")
+def probeNativeClassifiers = ["natives-windows", "natives-linux", "natives-linux-arm64"]
 def repoRootDir = file("${rootDir}/../../..")
 def openclProbeResourcesDir = layout.buildDirectory.dir('generated/openclProbeResources')
 def vulkanProbeResourcesDir = layout.buildDirectory.dir('generated/vulkanProbeResources')
@@ -162,12 +163,14 @@ dependencies {
     openclProbeImplementation("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
     openclProbeCompileOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
     openclProbeRuntimeOnly("org.lwjgl:lwjgl-opencl:${lwjglVersion}") { transitive = false }
-    openclProbeRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${lwjglNatives}") { transitive = false }
 
     vulkanProbeImplementation("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
     vulkanProbeCompileOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
     vulkanProbeRuntimeOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
-    vulkanProbeRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${lwjglNatives}") { transitive = false }
+    probeNativeClassifiers.each { classifier ->
+        openclProbeRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${classifier}") { transitive = false }
+        vulkanProbeRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${classifier}") { transitive = false }
+    }
 
     shaderCompilerImplementation("org.lwjgl:lwjgl:${shadercLwjglVersion}") { transitive = false }
     shaderCompilerImplementation("org.lwjgl:lwjgl-shaderc:${shadercLwjglVersion}") { transitive = false }

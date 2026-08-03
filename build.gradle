@@ -182,6 +182,34 @@ tasks.register('buildOmniJar', Jar) {
     }
 }
 
+tasks.register('verifyOmniGpuNatives') {
+    group = 'verification'
+    description = 'Verifies that the omni jar embeds Windows and Linux LWJGL natives for isolated GPU runtimes.'
+    dependsOn tasks.named('buildOmniJar')
+
+    doLast {
+        def omniJar = tasks.named('buildOmniJar').get().archiveFile.get().asFile
+        def requiredNatives = [
+            'lwjgl-3.3.3-natives-windows.jar.bin',
+            'lwjgl-3.3.3-natives-linux.jar.bin',
+            'lwjgl-3.3.3-natives-linux-arm64.jar.bin'
+        ]
+        def missing = []
+        ['openclProbe', 'vulkanProbe'].each { probe ->
+            requiredNatives.each { nativeJar ->
+                def entry = "quantified/embedded/${probe}/lib/${nativeJar}"
+                if (zipTree(omniJar).matching { include entry }.isEmpty()) {
+                    missing.add(entry)
+                }
+            }
+        }
+        if (!missing.isEmpty()) {
+            throw new GradleException("Omni jar is missing cross-platform GPU natives: ${missing.join(', ')}")
+        }
+        logger.lifecycle("Verified Windows, Linux x64, and Linux ARM64 GPU natives in ${omniJar.name}")
+    }
+}
+
 tasks.register('compileAllPlatforms') {
     group = 'build'
     description = 'Compiles every explicitly versioned Quantified API platform module.'

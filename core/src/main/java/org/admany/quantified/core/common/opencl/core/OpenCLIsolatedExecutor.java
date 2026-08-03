@@ -27,13 +27,44 @@ public final class OpenCLIsolatedExecutor {
     private static final String PROBE_RESOURCE_SUFFIX = ".bin";
     private static final String BRIDGE_CLASS = "org.admany.quantified.core.common.opencl.core.OpenCLIsolatedBridge";
     private static final AtomicReference<BridgeHandle> HANDLE = new AtomicReference<>();
+    private static final AtomicReference<Boolean> RUNTIME_READY = new AtomicReference<>(false);
+    private static final AtomicReference<String> FAILURE_REASON = new AtomicReference<>();
 
     private OpenCLIsolatedExecutor() {
     }
 
     public static boolean canExecute() {
+        return Boolean.TRUE.equals(RUNTIME_READY.get());
+    }
+
+    public static boolean warmup() {
+        if (canExecute()) {
+            return true;
+        }
         OpenCLRuntime.ProbeSnapshot snapshot = OpenCLRuntime.cachedProbeSnapshot();
-        return snapshot != null && snapshot.success() && !snapshot.devices().isEmpty();
+        if (snapshot == null || !snapshot.success() || snapshot.devices().isEmpty()) {
+            FAILURE_REASON.set(snapshot != null ? snapshot.failureReason() : "OpenCL probe has not succeeded");
+            return false;
+        }
+        try {
+            BridgeHandle handle = handle();
+            boolean available = Boolean.TRUE.equals(handle.isAvailable().invoke(null));
+            if (available) {
+                RUNTIME_READY.set(true);
+                FAILURE_REASON.set(null);
+                return true;
+            }
+            Object reason = handle.failureReason().invoke(null);
+            FAILURE_REASON.set(reason == null ? "Isolated OpenCL context creation failed" : String.valueOf(reason));
+            return false;
+        } catch (Throwable throwable) {
+            FAILURE_REASON.set(describeFailure(throwable));
+            return false;
+        }
+    }
+
+    public static String failureReason() {
+        return FAILURE_REASON.get();
     }
 
     @SuppressWarnings("unchecked")
@@ -81,15 +112,22 @@ public final class OpenCLIsolatedExecutor {
             }
             urls.add(destination.toUri().toURL());
         }
+        Set<String> childFirstPackages = new LinkedHashSet<>();
+        childFirstPackages.add("org.lwjgl.opencl.");
+        childFirstPackages.add("org.admany.quantified.core.common.opencl.");
+        if (!parentHasUsableLwjglCore()) {
+            childFirstPackages.add("org.lwjgl.");
+        }
         ChildFirstPackageClassLoader loader = new ChildFirstPackageClassLoader(
             urls.toArray(URL[]::new),
             OpenCLIsolatedExecutor.class.getClassLoader(),
-            Set.of("org.lwjgl.opencl.", "org.admany.quantified.core.common.opencl.")
+            childFirstPackages
         );
         Class<?> bridgeClass = Class.forName(BRIDGE_CLASS, true, loader);
         java.lang.reflect.Method isAvailable = bridgeClass.getMethod("isAvailable");
+        java.lang.reflect.Method failureReason = bridgeClass.getMethod("failureReason");
         java.lang.reflect.Method executeApiTask = bridgeClass.getMethod("executeApiTask", Object.class);
-        return new BridgeHandle(loader, bridgeClass, isAvailable, executeApiTask);
+        return new BridgeHandle(loader, bridgeClass, isAvailable, failureReason, executeApiTask);
     }
 
     private static URL resolveCurrentCodeSource() throws IOException {
@@ -132,8 +170,33 @@ public final class OpenCLIsolatedExecutor {
         ClassLoader loader,
         Class<?> bridgeClass,
         java.lang.reflect.Method isAvailable,
+        java.lang.reflect.Method failureReason,
         java.lang.reflect.Method executeApiTask
     ) {
+    }
+
+    private static boolean parentHasUsableLwjglCore() {
+        try {
+            Class.forName("org.lwjgl.system.MemoryUtil", true, OpenCLIsolatedExecutor.class.getClassLoader());
+            Class.forName("org.lwjgl.PointerBuffer", true, OpenCLIsolatedExecutor.class.getClassLoader());
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static String describeFailure(Throwable throwable) {
+        Throwable root = throwable;
+        while (root != null && root.getCause() != null) {
+            root = root.getCause();
+        }
+        if (root == null) {
+            return "Unknown isolated OpenCL runtime failure";
+        }
+        String message = root.getMessage();
+        return message == null || message.isBlank()
+            ? root.getClass().getSimpleName()
+            : root.getClass().getSimpleName() + ": " + message;
     }
 
     private static final class ChildFirstPackageClassLoader extends URLClassLoader {

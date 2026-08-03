@@ -47,6 +47,7 @@ public final class QuantifiedCompute {
         private Complexity complexity = Complexity.MODERATE;
         private WorkloadKind kind = WorkloadKind.GENERAL;
         private Duration timeout;
+        private boolean threadSafe = true;
         private boolean allowMainThreadRerouting = true;
         private GpuBackendPreference backendPreference = GpuBackendPreference.AUTO;
 
@@ -97,6 +98,19 @@ public final class QuantifiedCompute {
 
         public Builder<T> timeout(Duration timeout) {
             this.timeout = timeout;
+            return this;
+        }
+
+        public Builder<T> threadSafe() {
+            return threadSafe(true);
+        }
+
+        public Builder<T> notThreadSafe() {
+            return threadSafe(false);
+        }
+
+        public Builder<T> threadSafe(boolean threadSafe) {
+            this.threadSafe = threadSafe;
             return this;
         }
 
@@ -168,7 +182,8 @@ public final class QuantifiedCompute {
                 mapSchedulerKind(kind),
                 timeout,
                 allowMainThreadRerouting,
-                backendPreference
+                backendPreference,
+                threadSafe
             );
         }
 

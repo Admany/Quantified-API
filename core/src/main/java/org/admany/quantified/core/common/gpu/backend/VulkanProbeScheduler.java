@@ -3,6 +3,7 @@ package org.admany.quantified.core.common.gpu.backend;
 import org.admany.quantified.core.common.config.MultithreadingConfig;
 import org.admany.quantified.core.common.dev.DeveloperOverlayManager;
 import org.admany.quantified.core.common.util.LwjglRuntimeTuning;
+import org.admany.quantified.core.common.vulkan.core.VulkanIsolatedExecutor;
 
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
@@ -57,6 +58,7 @@ public final class VulkanProbeScheduler {
         if (probeAlreadyResolved()) {
             succeeded = true;
             LOGGER.debug("Vulkan background probe skipped because a successful probe snapshot is already cached");
+            warmIsolatedRuntime("cached-probe");
             return;
         }
         if (scheduled) {
@@ -136,6 +138,7 @@ public final class VulkanProbeScheduler {
                     String deviceName = probeDeviceName();
                     LOGGER.info("Inline Vulkan probe succeeded for " + deviceName + " (" + triggerReason + ")");
                     DeveloperOverlayManager.recordApiLog("[Vulkan] Probe succeeded - " + deviceName + " (inline trigger: " + triggerReason + ")");
+                    warmIsolatedRuntime(triggerReason);
                 } else {
                     String detail = probeFailureReason();
                     DeveloperOverlayManager.recordApiLog("[Vulkan] Inline probe unavailable (" + triggerReason + ") - "
@@ -247,6 +250,7 @@ public final class VulkanProbeScheduler {
             String deviceName = probeDeviceName();
             LOGGER.info("Vulkan probe succeeded on attempt #" + attemptNo + " (" + trigger + ") for " + deviceName);
             DeveloperOverlayManager.recordApiLog("[Vulkan] Probe succeeded - " + deviceName + " (attempt " + attemptNo + ", trigger: " + trigger + ")");
+            warmIsolatedRuntime(trigger);
             return;
         }
         String reason = probeFailureReason();
@@ -268,6 +272,25 @@ public final class VulkanProbeScheduler {
             return;
         }
         scheduleProbe(RETRY_DELAY, "retry:" + reason);
+    }
+
+    private static void warmIsolatedRuntime(String trigger) {
+        if (VulkanRuntime.runtimeMode() != VulkanRuntime.RuntimeMode.ISOLATED) {
+            return;
+        }
+        VulkanIsolatedExecutor.warmupAsync().whenComplete((ready, failure) -> {
+            if (failure != null || !Boolean.TRUE.equals(ready)) {
+                String reason = VulkanIsolatedExecutor.failureReason();
+                String detail = reason != null && !reason.isBlank()
+                    ? reason
+                    : failure != null ? failure.getMessage() : "runtime preflight returned unavailable";
+                LOGGER.warn("Vulkan isolated runtime preflight failed (" + trigger + "): " + detail);
+                DeveloperOverlayManager.recordApiLog("[Vulkan] Isolated runtime unavailable - " + detail);
+                return;
+            }
+            LOGGER.info("Vulkan isolated runtime initialized successfully (" + trigger + ")");
+            DeveloperOverlayManager.recordApiLog("[Vulkan] Isolated runtime ready (" + trigger + ")");
+        });
     }
 
     private static void markDisabled() {

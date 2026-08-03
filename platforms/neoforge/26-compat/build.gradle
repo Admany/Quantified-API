@@ -24,6 +24,7 @@ def loader_version_range = project.property('loader_version_range_neoforge_26')
 def lwjglVersion = "3.3.3"
 def lwjglNatives = org.gradle.internal.os.OperatingSystem.current().isWindows() ? "natives-windows" :
     (org.gradle.internal.os.OperatingSystem.current().isMacOsX() ? "natives-macos" : "natives-linux")
+def probeNativeClassifiers = ["natives-windows", "natives-linux", "natives-linux-arm64"]
 def repoRootDir = file("${rootDir}/../../..")
 def vulkanProbeResourcesDir = layout.buildDirectory.dir('generated/vulkanProbeResources')
 def spirvResourcesDir = new File(repoRootDir, 'build/shared/spirvResources')
@@ -120,7 +121,9 @@ dependencies {
     vulkanProbeImplementation("org.lwjgl:lwjgl:${lwjglVersion}") { transitive = false }
     vulkanProbeCompileOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
     vulkanProbeRuntimeOnly("org.lwjgl:lwjgl-vulkan:${lwjglVersion}") { transitive = false }
-    vulkanProbeRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${lwjglNatives}") { transitive = false }
+    probeNativeClassifiers.each { classifier ->
+        vulkanProbeRuntimeOnly("org.lwjgl:lwjgl:${lwjglVersion}:${classifier}") { transitive = false }
+    }
 
     shaderCompilerImplementation("org.lwjgl:lwjgl:${shadercLwjglVersion}") { transitive = false }
     shaderCompilerImplementation("org.lwjgl:lwjgl-shaderc:${shadercLwjglVersion}") { transitive = false }

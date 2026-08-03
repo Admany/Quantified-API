@@ -274,7 +274,7 @@ public final class QuantifiedCommand {
         if (vulkanProbeRuntimePresent && !vulkanHardwareDetected && !VulkanExecutionSupport.isProbeRunning()) {
             VulkanProbeScheduler.triggerProbe("command:gpu-status");
         }
-        boolean vulkanRuntimeInitialized = VulkanExecutionSupport.hasExecutableRuntime();
+        boolean vulkanRuntimeInitialized = VulkanExecutionSupport.isRuntimeReady();
         String vulkanFailureReason = VulkanExecutionSupport.failureReason();
         if ((vulkanFailureReason == null || vulkanFailureReason.isBlank()) && vulkanRuntimeMode == VulkanRuntime.RuntimeMode.ISOLATED) {
             vulkanFailureReason = "Using isolated bundled Vulkan runtime for this Minecraft version";

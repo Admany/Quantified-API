@@ -45,6 +45,7 @@ V2 cleaned up GPU routing further - the backend preference API is easier to use,
   <li><b>Isolated Vulkan probing</b> so a corrupted driver or a loader issue doesn't instantly brick the game or cause a crash</li>
   <li><b>Explicit fallback routing</b> Vulkan falls to OpenCL if Vulkan isn't available, or is misbehaving. Worst case if both decide to act up, everything heads to the CPU without you even noticing :DDD</li>
   <li><b>Backend diagnostics</b> so you can see probe state, runtime state, active backend, chosen device, and failure reason without digging through 9 years of log spam (Modded logs xd)</li>
+  <li><b>Custom SPIR-V compute</b> through <code>SpirvComputeProgram</code> and <code>QuantifiedVulkan.Context.dispatch(...)</code>, with validated modules, bounded pipeline caching, reusable workspaces, isolated-runtime support, and normal CPU fallback routing</li>
 </ul>
 </div>
 
@@ -58,6 +59,7 @@ Full API docs, examples, and migration info from V1 are at <a href="https://adma
   <li><code>QuantifiedAPI.compute(...)</code> for backend-aware compute submission</li>
   <li><code>QuantifiedAPI.parallel(...)</code> for parallel execution with lower orchestration overhead</li>
   <li><code>QuantifiedAPI.vulkan(...)</code> for explicit Vulkan-targeted workloads</li>
+  <li><code>SpirvComputeProgram.fromResource(...)</code> for precompiled custom Vulkan kernels without runtime shader compilation</li>
   <li><code>QuantifiedAPI.graph(...)</code> for DAG / dependency-aware flows</li>
   <li><code>QuantifiedAPI.cache(...)</code> for caching with TTL, compression, async refresh, and persistence controls</li>
   <li>Backend preferences like <code>preferGpu()</code>, <code>preferVulkan()</code>, <code>preferOpenCL()</code>, <code>requireVulkan()</code>, and <code>cpuOnly()</code></li>

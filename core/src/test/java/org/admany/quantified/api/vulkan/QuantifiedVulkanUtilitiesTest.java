@@ -2,6 +2,7 @@ package org.admany.quantified.api.vulkan;
 
 import org.admany.quantified.core.common.async.core.AsyncManager;
 import org.admany.quantified.core.common.async.core.AsyncManagerBootstrap;
+import org.admany.quantified.core.common.async.gpu.GpuWorkloadRegistry;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -20,12 +21,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class QuantifiedVulkanUtilitiesTest {
 
     private static final String TEST_MOD_ID = "test-mod";
-    private static final long TEST_TASK_KEY = 54321L;
+    private static final long TEST_TASK_KEY = 0x3_0000L;
 
     private static ScheduledExecutorService testExecutor;
 
     @BeforeAll
     static void setUpAll() {
+        GpuWorkloadRegistry.clear();
         testExecutor = Executors.newScheduledThreadPool(2);
         AsyncManagerBootstrap bootstrap = AsyncManagerBootstrap.defaults(Runtime.getRuntime().availableProcessors());
         AsyncManager.initialise(bootstrap, testExecutor);
@@ -33,6 +35,7 @@ public class QuantifiedVulkanUtilitiesTest {
 
     @AfterAll
     static void tearDownAll() {
+        GpuWorkloadRegistry.clear();
         AsyncManager.shutdown();
         if (testExecutor != null) {
             testExecutor.shutdownNow();
@@ -46,7 +49,7 @@ public class QuantifiedVulkanUtilitiesTest {
         float[] b = {0.5f, 1.5f, 2.5f, 3.5f, 4.5f};
 
         CompletableFuture<float[]> future = QuantifiedVulkan.parallelVectorAdd(
-            TEST_MOD_ID, "vector-add-test", TEST_TASK_KEY, a, b);
+            TEST_MOD_ID, "vector-add-test", TEST_TASK_KEY + 1L, a, b);
 
         float[] result = future.get();
         assertNotNull(result);
@@ -87,7 +90,7 @@ public class QuantifiedVulkanUtilitiesTest {
     void testParallelMonteCarloPi() throws Exception {
         int samples = 10_000;
         CompletableFuture<Double> future = QuantifiedVulkan.parallelMonteCarloPi(
-            TEST_MOD_ID, "monte-carlo-pi-test", TEST_TASK_KEY, samples);
+            TEST_MOD_ID, "monte-carlo-pi-test", TEST_TASK_KEY + 2L, samples);
 
         Double estimate = future.get();
         assertNotNull(estimate);

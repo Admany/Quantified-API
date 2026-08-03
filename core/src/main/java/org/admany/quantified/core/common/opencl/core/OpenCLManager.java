@@ -113,7 +113,7 @@ public final class OpenCLManager {
             return;
         }
         availabilityListeners.add(listener);
-        if (isAvailable()) {
+        if (hasExecutableRuntime()) {
             try {
                 listener.run();
             } catch (Throwable ignored) {
@@ -210,13 +210,28 @@ public final class OpenCLManager {
         }
         OpenCLRuntime.AvailabilitySnapshot runtime = OpenCLRuntime.snapshot();
         if (!runtime.available()) {
-            String reason = runtime.failureReason() != null ? runtime.failureReason() : "OpenCL runtime unavailable";
             OpenCLRuntime.ProbeSnapshot probeSnapshot = OpenCLRuntime.probeSnapshot();
-            if (!probeSnapshot.devices().isEmpty()) {
+            if (probeSnapshot.success() && !probeSnapshot.devices().isEmpty()) {
                 OpenCLRuntime.ProbeDeviceInfo device = probeSnapshot.devices().get(0);
-                reason += "; isolated probe detected " + device.vendor() + " " + device.name()
-                    + " but in-process runtime execution is unavailable";
+                if (OpenCLIsolatedExecutor.warmup()) {
+                    lastRuntimeStatus = RuntimeStatus.available();
+                    notifyAvailabilityListeners();
+                    LOGGER.info("Force probe: isolated OpenCL acceleration initialized successfully for: " + device.name());
+                    if (options.recordOverlayLogs()) {
+                        DeveloperOverlayManager.recordApiLog("[OpenCL] Isolated acceleration ready - " + device.name());
+                    }
+                    return true;
+                }
+                String isolatedFailure = OpenCLIsolatedExecutor.failureReason();
+                String failureMsg = "Isolated OpenCL runtime failed for " + device.vendor() + " " + device.name()
+                    + ": " + (isolatedFailure == null ? "context creation failed" : isolatedFailure);
+                lastRuntimeStatus = RuntimeStatus.failed(failureMsg);
+                if (options.recordOverlayLogs()) {
+                    DeveloperOverlayManager.recordApiLog("[OpenCL] " + failureMsg);
+                }
+                return false;
             }
+            String reason = runtime.failureReason() != null ? runtime.failureReason() : "OpenCL runtime unavailable";
             String failureMsg = "OpenCL runtime unavailable: " + reason + " (binding: " + OpenCLRuntime.getBindingName() + ")";
             LOGGER.fine("Force probe: " + failureMsg);
             if (options.recordOverlayLogs()) {
@@ -276,11 +291,7 @@ public final class OpenCLManager {
     }
 
     private static boolean hasCachedExecutableProbe() {
-        if (isAvailable()) {
-            return true;
-        }
-        OpenCLRuntime.ProbeSnapshot snapshot = OpenCLRuntime.cachedProbeSnapshot();
-        return snapshot != null && snapshot.success() && !snapshot.devices().isEmpty();
+        return hasExecutableRuntime();
     }
 
     private static void runTestTask(boolean quiet) {

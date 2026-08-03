@@ -32,6 +32,10 @@ public final class VulkanExecutionSupport {
         return inProcessAvailable() || VulkanIsolatedExecutor.canExecute();
     }
 
+    public static boolean isRuntimeReady() {
+        return inProcessAvailable() || VulkanIsolatedExecutor.isRuntimeReady();
+    }
+
     public static String deviceName() {
         if (inProcessAvailable()) {
             String device = invokeString("deviceName", "");
@@ -60,6 +64,10 @@ public final class VulkanExecutionSupport {
                 }
             }
         }
+        String isolatedFailure = VulkanIsolatedExecutor.failureReason();
+        if (isolatedFailure != null && !isolatedFailure.isBlank()) {
+            return isolatedFailure;
+        }
         VulkanRuntime.AvailabilitySnapshot snapshot = VulkanRuntime.snapshot();
         if (snapshot.failureReason() != null && !snapshot.failureReason().isBlank()) {
             return snapshot.failureReason();
@@ -75,7 +83,9 @@ public final class VulkanExecutionSupport {
     }
 
     public static boolean isRuntimeWarmupRunning() {
-        return canUseInProcessManager() && invokeBoolean("isRuntimeWarmupRunning", false);
+        return canUseInProcessManager()
+            ? invokeBoolean("isRuntimeWarmupRunning", false)
+            : VulkanIsolatedExecutor.isWarmupRunning();
     }
 
     public static List<?> listInProcessDevices() {

@@ -16,6 +16,7 @@ import java.nio.file.attribute.FileAttribute;
 import java.security.CodeSource;
 import java.util.ArrayList;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -24,6 +25,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.GZIPInputStream;
@@ -39,7 +41,11 @@ public final class VulkanIsolatedExecutor {
     private static final String BRIDGE_CLASS = "org.admany.quantified.core.common.vulkan.core.VulkanIsolatedBridge";
     private static final long EXECUTION_FAILURE_COOLDOWN_MS = 300000L;
     private static final AtomicReference<BridgeHandle> HANDLE = new AtomicReference();
+    private static final AtomicReference<CompletableFuture<Boolean>> WARMUP = new AtomicReference();
     private static final AtomicLong DISABLED_UNTIL_MS = new AtomicLong();
+    /** True only after a workload, not telemetry, has successfully brought up the isolated runtime. */
+    private static final AtomicBoolean RUNTIME_READY = new AtomicBoolean();
+    private static final AtomicReference<String> DISABLED_REASON = new AtomicReference();
     private static final ThreadLocal<Boolean> ON_RUNTIME_THREAD = ThreadLocal.withInitial(() -> false);
     private static final ExecutorService RUNTIME_EXECUTOR = Executors.newSingleThreadExecutor(runnable -> LwjglRuntimeTuning.newDaemonThread(
         runnable,
@@ -69,7 +75,7 @@ public final class VulkanIsolatedExecutor {
                 BridgeHandle handle = VulkanIsolatedExecutor.handle();
                 return (T)handle.executeApiTask().invoke(null, apiTask);
             });
-            VulkanIsolatedExecutor.clearCooldown();
+            VulkanIsolatedExecutor.markRuntimeReady();
             return result;
             } finally {
                 VulkanRuntimeActivityTracker.endTask(sample);
@@ -113,7 +119,7 @@ public final class VulkanIsolatedExecutor {
                 break;
             }
             if (!hasFailure) {
-                VulkanIsolatedExecutor.clearCooldown();
+                VulkanIsolatedExecutor.markRuntimeReady();
             }
             return results;
             } finally {
@@ -130,8 +136,91 @@ public final class VulkanIsolatedExecutor {
         }
     }
 
-    public static Map<?, ?> residencySnapshot() {
+    /**
+     * Brings up the isolated Vulkan manager on its dedicated large-stack thread.
+     * Probe success only proves that the driver can enumerate devices; this
+     * preflight proves that QAPI can create the runtime used by real workloads.
+     */
+    public static CompletableFuture<Boolean> warmupAsync() {
+        CompletableFuture<Boolean> current = WARMUP.get();
+        if (current != null && !current.isCompletedExceptionally()) {
+            return current;
+        }
         if (!VulkanIsolatedExecutor.canExecute()) {
+            return CompletableFuture.completedFuture(false);
+        }
+
+        CompletableFuture<Boolean> created = new CompletableFuture<>();
+        if (!WARMUP.compareAndSet(current, created)) {
+            return WARMUP.get();
+        }
+        RUNTIME_EXECUTOR.execute(() -> {
+            ON_RUNTIME_THREAD.set(true);
+            try {
+                BridgeHandle handle = VulkanIsolatedExecutor.handle();
+                boolean available = Boolean.TRUE.equals(handle.isAvailable().invoke(null));
+                if (!available) {
+                    throw new IllegalStateException("Isolated Vulkan manager failed runtime preflight");
+                }
+                VulkanIsolatedExecutor.markRuntimeReady();
+                created.complete(true);
+            } catch (Throwable throwable) {
+                VulkanIsolatedExecutor.recordFailure(throwable);
+                created.completeExceptionally(throwable);
+            } finally {
+                ON_RUNTIME_THREAD.remove();
+            }
+        });
+        return created;
+    }
+
+    public static boolean isRuntimeReady() {
+        return RUNTIME_READY.get() && !VulkanIsolatedExecutor.isCoolingDown();
+    }
+
+    public static boolean isWarmupRunning() {
+        CompletableFuture<Boolean> warmup = WARMUP.get();
+        return warmup != null && !warmup.isDone();
+    }
+
+    public static String failureReason() {
+        return DISABLED_REASON.get();
+    }
+
+    /**
+     * Queues an API task directly on the Vulkan-owned runtime thread without
+     * blocking an intermediate scheduler worker in {@code Future.get()}.
+     */
+    public static <T> CompletableFuture<T> executeApiTaskAsync(QuantifiedVulkan.ApiVulkanTask<T> apiTask) {
+        CompletableFuture<T> future = new CompletableFuture<>();
+        RUNTIME_EXECUTOR.execute(() -> {
+            ON_RUNTIME_THREAD.set(true);
+            try {
+                VulkanRuntimeActivityTracker.TaskSample sample = VulkanRuntimeActivityTracker.beginTask(
+                    apiTask.estimatedVramBytes(), apiTask.estimatedComputeUnits());
+                try {
+                    BridgeHandle handle = VulkanIsolatedExecutor.handle();
+                    @SuppressWarnings("unchecked")
+                    T result = (T) handle.executeApiTask().invoke(null, apiTask);
+                    VulkanIsolatedExecutor.markRuntimeReady();
+                    future.complete(result);
+                } finally {
+                    VulkanRuntimeActivityTracker.endTask(sample);
+                }
+            } catch (Throwable throwable) {
+                VulkanIsolatedExecutor.recordFailure(throwable);
+                future.completeExceptionally(throwable);
+            } finally {
+                ON_RUNTIME_THREAD.remove();
+            }
+        });
+        return future;
+    }
+
+    public static Map<?, ?> residencySnapshot() {
+        // A residency read must not create the bridge or run manager
+        // initialisation. The web panel/overlay polls this path frequently.
+        if (!VulkanIsolatedExecutor.canExecute() || !RUNTIME_READY.get()) {
             return Map.of();
         }
         try {
@@ -140,7 +229,8 @@ public final class VulkanIsolatedExecutor {
                 Object value = handle.residencySnapshot().invoke(null);
                 return value instanceof Map<?, ?> map ? map : Map.of();
             });
-        } catch (Throwable ignored) {
+        } catch (Throwable throwable) {
+            VulkanIsolatedExecutor.recordFailure(throwable);
             return Map.of();
         }
     }
@@ -152,8 +242,6 @@ public final class VulkanIsolatedExecutor {
         Future<T> future = RUNTIME_EXECUTOR.submit(() -> {
             ON_RUNTIME_THREAD.set(true);
             try {
-                LwjglRuntimeTuning.ensureConfigured();
-                LwjglRuntimeTuning.ensureThreadLocalStack();
                 return callable.call();
             } finally {
                 ON_RUNTIME_THREAD.remove();
@@ -188,11 +276,22 @@ public final class VulkanIsolatedExecutor {
         return true;
     }
 
-    private static void clearCooldown() {
+    private static void markRuntimeReady() {
+        RUNTIME_READY.set(true);
         DISABLED_UNTIL_MS.set(0L);
+        DISABLED_REASON.set(null);
     }
 
     private static void recordFailure(Throwable throwable) {
+        RUNTIME_READY.set(false);
+        String reason = VulkanIsolatedExecutor.describeFailure(throwable);
+        DISABLED_REASON.set(reason);
+        // A failed LWJGL native class initializer cannot recover in this JVM.
+        // Retrying it every few minutes only replays the hitch and log spam.
+        if (VulkanIsolatedExecutor.isPermanentNativeLoaderFailure(throwable)) {
+            DISABLED_UNTIL_MS.set(Long.MAX_VALUE);
+            return;
+        }
         DISABLED_UNTIL_MS.set(System.currentTimeMillis() + EXECUTION_FAILURE_COOLDOWN_MS);
     }
 
@@ -229,7 +328,23 @@ public final class VulkanIsolatedExecutor {
             }
             urls.add(destination.toUri().toURL());
         }
-        ChildFirstPackageClassLoader loader = new ChildFirstPackageClassLoader((URL[])urls.toArray(URL[]::new), VulkanIsolatedExecutor.class.getClassLoader(), Set.of("org.lwjgl.vulkan.", "org.admany.quantified.core.common.vulkan.", "org.admany.quantified.core.common.util."));
+        // Prefer Minecraft's already-loaded LWJGL core when the parent exposes
+        // it.  Loading a second lwjgl.dll in a child loader is illegal on
+        // Windows and poisons MemoryUtil for the rest of the session. Older
+        // runtimes that genuinely do not expose core retain the bundled-core
+        // fallback.
+        Set<String> childFirstPackages = new LinkedHashSet<>();
+        childFirstPackages.add("org.lwjgl.vulkan.");
+        childFirstPackages.add("org.admany.quantified.core.common.vulkan.");
+        childFirstPackages.add("org.admany.quantified.core.common.util.");
+        if (!VulkanIsolatedExecutor.parentExposesLwjglCore()) {
+            childFirstPackages.add("org.lwjgl.");
+        }
+        ChildFirstPackageClassLoader loader = new ChildFirstPackageClassLoader(
+            (URL[])urls.toArray(URL[]::new),
+            VulkanIsolatedExecutor.class.getClassLoader(),
+            childFirstPackages
+        );
         Class<?> bridgeClass = Class.forName(BRIDGE_CLASS, true, loader);
         Method isAvailable = bridgeClass.getMethod("isAvailable", new Class[0]);
         Method executeApiTask = bridgeClass.getMethod("executeApiTask", Object.class);
@@ -281,6 +396,43 @@ public final class VulkanIsolatedExecutor {
                                 Method executeApiTask,
                                 Method executeApiTasks,
                                 Method residencySnapshot) {
+    }
+
+    private static boolean parentExposesLwjglCore() {
+        try {
+            Class.forName("org.lwjgl.system.MemoryUtil", true, VulkanIsolatedExecutor.class.getClassLoader());
+            Class.forName("org.lwjgl.PointerBuffer", true, VulkanIsolatedExecutor.class.getClassLoader());
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isPermanentNativeLoaderFailure(Throwable throwable) {
+        for (Throwable current = throwable; current != null; current = current.getCause()) {
+            String message = current.getMessage();
+            if (current instanceof UnsatisfiedLinkError
+                && message != null
+                && message.contains("already loaded in another classloader")) {
+                return true;
+            }
+            if (current instanceof NoClassDefFoundError
+                && message != null
+                && message.contains("org/lwjgl/system/MemoryUtil")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String describeFailure(Throwable throwable) {
+        Throwable root = throwable;
+        while (root != null && root.getCause() != null) {
+            root = root.getCause();
+        }
+        String type = root == null ? "unknown" : root.getClass().getSimpleName();
+        String message = root == null ? "" : root.getMessage();
+        return message == null || message.isBlank() ? type : type + ": " + message;
     }
 
     private static final class ChildFirstPackageClassLoader

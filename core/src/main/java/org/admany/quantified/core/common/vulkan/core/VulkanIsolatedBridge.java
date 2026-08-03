@@ -65,7 +65,10 @@ public final class VulkanIsolatedBridge {
     }
 
     public static Map<String, Object> residencySnapshot() {
-        if (!VulkanIsolatedBridge.ensureRuntimeReady()) {
+        // Telemetry is observational.  In particular, a dashboard refresh must
+        // never initialise an isolated LWJGL runtime on a render/server path:
+        // that turns a one-time native-loader failure into periodic hitches.
+        if (!VulkanInProcessManager.isAvailable()) {
             return Map.of();
         }
         return VulkanInProcessManager.residencySnapshot();
@@ -132,6 +135,7 @@ public final class VulkanIsolatedBridge {
         for (Method method : workloadClass.getMethods()) {
             Class<?> parameter;
             if (!"execute".equals(method.getName()) || method.getParameterCount() != 1 || !(parameter = method.getParameterTypes()[0]).isAssignableFrom(contextType) && !contextType.isAssignableFrom(parameter)) continue;
+            method.setAccessible(true);
             return method;
         }
         throw new IllegalStateException("Unable to resolve Vulkan workload execute(Context) on " + workloadClass.getName());
@@ -149,7 +153,7 @@ public final class VulkanIsolatedBridge {
         }
 
         @Override
-        public Object invoke(Object proxy, Method method, Object[] args) {
+        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
             String name = method.getName();
             if (method.getDeclaringClass() == Object.class) {
                 return switch (name) {
@@ -159,11 +163,25 @@ public final class VulkanIsolatedBridge {
                     default -> null;
                 };
             }
+            if (method.isDefault()) {
+                return InvocationHandler.invokeDefault(proxy, method, args == null ? new Object[0] : args);
+            }
             return switch (name) {
                 case "vectorAdd" -> this.context.vectorAdd((float[])args[0], (float[])args[1]);
                 case "matrixMultiply" -> this.context.matrixMultiply((float[][])args[0], (float[][])args[1]);
                 case "monteCarloPi" -> this.context.monteCarloPi((Integer)args[0]);
                 case "terrainGeneration" -> this.context.terrainGeneration((float[])args[0]);
+                case "dispatchSpirv" -> this.context.dispatchSpirv(
+                    (String) args[0],
+                    (byte[]) args[1],
+                    (Integer) args[2],
+                    (Integer) args[3],
+                    (float[][]) args[4],
+                    (Integer) args[5],
+                    (int[]) args[6],
+                    (Integer) args[7],
+                    (Integer) args[8],
+                    (Integer) args[9]);
                 case "deviceName" -> this.context.deviceName();
                 default -> throw new UnsupportedOperationException("Unsupported isolated Vulkan context method: " + name);
             };

@@ -43,6 +43,7 @@ import org.admany.quantified.core.common.opencl.core.OpenCLManager;
 import org.admany.quantified.core.common.opencl.gpu.AsyncProbeScheduler;
 import org.admany.quantified.core.common.opencl.gpu.GPUDetector;
 import org.admany.quantified.core.common.opencl.gpu.GPUMonitor;
+import org.admany.quantified.core.common.platform.PhysicalEnvironment;
 import org.admany.quantified.core.common.opencl.gpu.probe.GpuTelemetryService;
 import org.admany.quantified.core.common.opencl.task.OpenCLTaskManager;
 import org.admany.quantified.core.common.telemetry.TaskKindTelemetry;
@@ -1566,7 +1567,7 @@ public final class DeveloperDashboardServer {
         boolean vulkanBindingsPresent = VulkanRuntime.hasBindings();
         VulkanRuntime.RuntimeMode vulkanRuntimeMode = VulkanRuntime.runtimeMode();
         boolean vulkanProbeAvailable = VulkanRuntime.isAvailable() || vulkanRuntimeMode == VulkanRuntime.RuntimeMode.ISOLATED;
-        boolean vulkanInitialized = VulkanExecutionSupport.hasExecutableRuntime();
+        boolean vulkanInitialized = VulkanExecutionSupport.isRuntimeReady();
         String vulkanFailureReason = vulkanBindingsPresent
             ? VulkanExecutionSupport.failureReason()
             : "Using isolated bundled Vulkan runtime for this Minecraft version";
@@ -1791,6 +1792,9 @@ public final class DeveloperDashboardServer {
     }
 
     private static String resolveClientPlayerName() {
+        if (!PhysicalEnvironment.isClient()) {
+            return "";
+        }
         try {
             Class<?> minecraftClass = Class.forName("net.minecraft.client.Minecraft");
             Object minecraft = minecraftClass.getMethod("getInstance").invoke(null);

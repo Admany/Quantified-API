@@ -7,6 +7,8 @@ import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.nio.LongBuffer;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -91,6 +93,7 @@ public final class VulkanInProcessManager {
     private static final long EXECUTION_TIMEOUT_NANOS = 30000000000L;
     private static final int MAX_PENDING_TASKS = 256;
     private static final int MAX_IN_FLIGHT_WORKSPACES = 3;
+    private static final int MAX_CUSTOM_PROGRAMS = 64;
     private static final long MAX_ACCEPTED_VRAM_BYTES = 0x20000000L;
     private static final long INLINE_VRAM_BYTES_LIMIT = 0x2000000L;
     private static final int INLINE_COMPUTE_UNITS_LIMIT = 1500000;
@@ -1313,6 +1316,95 @@ public final class VulkanInProcessManager {
             }
         }
         return new WorkspaceLease(pool, pool.borrow());
+    }
+
+    float[] executeSpirv(String programKey, byte[] spirv, int storageBufferCount,
+                         int pushConstantBytes, float[][] inputBuffers, int outputFloatCount,
+                         int[] pushConstants, int groupCountX, int groupCountY, int groupCountZ) {
+        Objects.requireNonNull(programKey, "programKey");
+        Objects.requireNonNull(spirv, "spirv");
+        Objects.requireNonNull(inputBuffers, "inputBuffers");
+        Objects.requireNonNull(pushConstants, "pushConstants");
+        if (programKey.isBlank()) {
+            throw new IllegalArgumentException("programKey must not be blank");
+        }
+        if (spirv.length < 4 || spirv.length > 16 * 1024 * 1024 || (spirv.length & 3) != 0
+                || (spirv[0] & 0xff) != 0x03 || (spirv[1] & 0xff) != 0x02
+                || (spirv[2] & 0xff) != 0x23 || (spirv[3] & 0xff) != 0x07) {
+            throw new IllegalArgumentException("spirv must contain a valid little-endian SPIR-V module");
+        }
+        if (storageBufferCount < 1 || storageBufferCount > 32
+                || storageBufferCount != inputBuffers.length + 1) {
+            throw new IllegalArgumentException("storageBufferCount must equal inputBuffers.length + 1 and be between 1 and 32");
+        }
+        if (pushConstantBytes < 0 || pushConstantBytes > 128 || (pushConstantBytes & 3) != 0
+                || pushConstantBytes != pushConstants.length * Integer.BYTES) {
+            throw new IllegalArgumentException("pushConstantBytes must match pushConstants and be 4-byte aligned");
+        }
+        if (outputFloatCount <= 0 || groupCountX <= 0 || groupCountY <= 0 || groupCountZ <= 0) {
+            throw new IllegalArgumentException("outputFloatCount and dispatch group counts must be positive");
+        }
+
+        long[] bufferSizes = new long[storageBufferCount];
+        long totalBytes = (long) outputFloatCount * Float.BYTES;
+        for (int i = 0; i < inputBuffers.length; ++i) {
+            float[] input = Objects.requireNonNull(inputBuffers[i], "inputBuffers[" + i + "]");
+            if (input.length == 0) {
+                throw new IllegalArgumentException("input buffers must not be empty");
+            }
+            bufferSizes[i] = (long) input.length * Float.BYTES;
+            totalBytes = Math.addExact(totalBytes, bufferSizes[i]);
+        }
+        bufferSizes[storageBufferCount - 1] = (long) outputFloatCount * Float.BYTES;
+        if (totalBytes > MAX_ACCEPTED_VRAM_BYTES) {
+            throw new IllegalArgumentException("custom dispatch buffer footprint exceeds the 512 MiB safety limit");
+        }
+
+        State local = this.requireState();
+        String digest = sha256Hex(spirv);
+        String internalProgramKey = "custom:" + programKey + ':' + digest + ':' + storageBufferCount + ':' + pushConstantBytes;
+        Program program;
+        synchronized (local.workspaceMutex) {
+            program = local.programs.get(internalProgramKey);
+            if (program == null) {
+                long customPrograms = local.programs.keySet().stream().filter(key -> key.startsWith("custom:")).count();
+                if (customPrograms >= MAX_CUSTOM_PROGRAMS) {
+                    throw new IllegalStateException("custom SPIR-V program limit reached (" + MAX_CUSTOM_PROGRAMS + ")");
+                }
+                program = createProgramFromBytes(local, internalProgramKey, spirv, storageBufferCount, pushConstantBytes);
+                local.programs.put(internalProgramKey, program);
+            }
+        }
+
+        StringBuilder workspaceKey = new StringBuilder(internalProgramKey)
+                .append(':').append(groupCountX).append('x').append(groupCountY).append('x').append(groupCountZ)
+                .append(':').append(outputFloatCount).append(':').append(java.util.Arrays.hashCode(pushConstants));
+        for (float[] input : inputBuffers) {
+            workspaceKey.append(':').append(input.length);
+        }
+        try (WorkspaceLease lease = acquireWorkspace(local, program, workspaceKey.toString(), WorkloadProfile.COMPUTE_DENSE,
+                groupCountX, groupCountY, groupCountZ, inputBuffers.length, pushConstants, bufferSizes)) {
+            DispatchWorkspace workspace = lease.workspace();
+            for (int i = 0; i < inputBuffers.length; ++i) {
+                writeFloatArray(workspace.buffers[i], inputBuffers[i]);
+            }
+            dispatch(local, workspace);
+            return readFloatArray(workspace.buffers[storageBufferCount - 1], outputFloatCount);
+        }
+    }
+
+    private static String sha256Hex(byte[] bytes) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(bytes);
+            StringBuilder hex = new StringBuilder(digest.length * 2);
+            for (byte value : digest) {
+                hex.append(Character.forDigit((value >>> 4) & 0xf, 16));
+                hex.append(Character.forDigit(value & 0xf, 16));
+            }
+            return hex.toString();
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is unavailable", impossible);
+        }
     }
 
     private static DispatchWorkspacePool createWorkspacePool(State state, Program program, WorkloadProfile workloadProfile, int groupCountX, int groupCountY, int groupCountZ, int inputBufferCount, int[] pushConstants, long ... bufferSizes) {

@@ -119,6 +119,26 @@ public final class TaskScheduler {
             boolean allowMainThreadRerouting,
             GpuBackendPreference backendPreference) {
 
+        return submitComputeTask(modId, taskName, taskKey, cpuImplementation, gpuTask, dataSizeBytes,
+            parallelUnits, complexity, type, timeout, allowMainThreadRerouting, backendPreference, true);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static <T> CompletableFuture<T> submitComputeTask(
+            String modId,
+            String taskName,
+            long taskKey,
+            Supplier<T> cpuImplementation,
+            Object gpuTask,
+            long dataSizeBytes,
+            int parallelUnits,
+            TaskComplexity complexity,
+            TaskType type,
+            Duration timeout,
+            boolean allowMainThreadRerouting,
+            GpuBackendPreference backendPreference,
+            boolean threadSafe) {
+
         OpenCLTask<T> effectiveOpenClTask = null;
         VulkanTask<T> effectiveVulkanTask = null;
         org.admany.quantified.api.opencl.QuantifiedOpenCL.ApiOpenClTask<T> apiOpenClTask = null;
@@ -219,34 +239,10 @@ public final class TaskScheduler {
         }
 
         if (gpuSelected) {
-            if (backendSelection.backendType() == GpuBackendType.OPENCL && isolatedOpenClEligible) {
-                org.admany.quantified.api.opencl.QuantifiedOpenCL.ApiOpenClTask<T> isolatedTask = apiOpenClTask;
-                Supplier<CompletableFuture<T>> asyncSupplier = () -> executeIsolatedOpenCl(isolatedTask, cpuImplementation);
-                return AsyncManager.submitAsync(
-                    taskKey,
-                    PriorityTaskType.BUILDING,
-                    PriorityTaskType.BUILDING.defaultScore(),
-                    asyncSupplier,
-                    timeout,
-                    allowMainThreadRerouting,
-                    modId,
-                    metadata
-                );
-            }
-            if (backendSelection.backendType() == GpuBackendType.VULKAN && isolatedVulkanEligible) {
-                org.admany.quantified.api.vulkan.QuantifiedVulkan.ApiVulkanTask<T> isolatedTask = apiVulkanTask;
-                Supplier<CompletableFuture<T>> asyncSupplier = () -> executeIsolatedVulkan(isolatedTask, cpuImplementation);
-                return AsyncManager.submitAsync(
-                    taskKey,
-                    PriorityTaskType.BUILDING,
-                    PriorityTaskType.BUILDING.defaultScore(),
-                    asyncSupplier,
-                    timeout,
-                    allowMainThreadRerouting,
-                    modId,
-                    metadata
-                );
-            }
+            // The dispatcher owns execution for both in-process and isolated
+            // runtimes. The original isolated fast path executed the task in
+            // this payload after VulkanIsolatedBatchWorkload had already run
+            // it, doubling every isolated GPU dispatch.
             Supplier<CompletableFuture<T>> asyncSupplier = () -> resolveGpuOrCpu(taskKey, cpuImplementation);
             return AsyncManager.submitAsync(
                 taskKey,
@@ -254,7 +250,7 @@ public final class TaskScheduler {
                 PriorityTaskType.BUILDING.defaultScore(),
                 asyncSupplier,
                 timeout,
-                allowMainThreadRerouting,
+                threadSafe,
                 modId,
                 metadata
             );
@@ -267,7 +263,7 @@ public final class TaskScheduler {
             PriorityTaskType.BUILDING.defaultScore(),
             measuredCpu,
             timeout,
-            allowMainThreadRerouting,
+            threadSafe,
             modId,
             metadata
         );
@@ -475,10 +471,11 @@ public final class TaskScheduler {
         if (gpuTask == null || (!VulkanRuntime.isAvailable() && !isolatedVulkanEligible)) {
             return ExecutionPlatform.CPU;
         }
-        if (!canGpuAcceptTask(analysis, gpuTask, isolatedVulkanEligible)) {
+        boolean required = backendPreference != null && backendPreference.requiresVulkan();
+        if (!canGpuAcceptTask(analysis, gpuTask, isolatedVulkanEligible, required)) {
             return ExecutionPlatform.CPU;
         }
-        if (backendPreference != null && backendPreference.requiresVulkan()) {
+        if (required) {
             return ExecutionPlatform.GPU;
         }
         return decideGpuByAnalysis(analysis);
@@ -584,7 +581,10 @@ public final class TaskScheduler {
         return accepted;
     }
 
-    private static boolean canGpuAcceptTask(TaskAnalysis analysis, VulkanTask<?> gpuTask, boolean isolatedVulkanEligible) {
+    private static boolean canGpuAcceptTask(TaskAnalysis analysis,
+                                            VulkanTask<?> gpuTask,
+                                            boolean isolatedVulkanEligible,
+                                            boolean required) {
         if (gpuTask == null) {
             return false;
         }
@@ -594,12 +594,21 @@ public final class TaskScheduler {
         try {
             org.admany.quantified.core.common.async.core.PriorityScheduler.SchedulerSnapshot schedulerSnapshot = AsyncManager.schedulerSnapshot();
             int queueDepth = Math.max(0, schedulerSnapshot.foregroundQueue() + schedulerSnapshot.backgroundQueue());
-            if (queueDepth > 0 && shouldTemporarilyPreferCpu(queueDepth)) {
+            // A REQUIRED backend is an explicit API contract. The adaptive
+            // latency heuristic may reroute preferred/automatic work, but it
+            // must not silently turn required Vulkan work into CPU work.
+            // Runtime availability and VulkanManager.canAcceptTask still
+            // enforce the hard safety/capacity boundaries below.
+            if (shouldAdaptivelyRerouteVulkanToCpu(required, queueDepth)) {
                 return false;
             }
         } catch (Throwable ignored) {
         }
         return VulkanManager.canAcceptTask(gpuTask);
+    }
+
+    static boolean shouldAdaptivelyRerouteVulkanToCpu(boolean required, int queueDepth) {
+        return !required && queueDepth > 0 && shouldTemporarilyPreferCpu(queueDepth);
     }
 
     private static double calculateExpectedSpeedup(TaskComplexity complexity, TaskType type,

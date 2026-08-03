@@ -201,6 +201,7 @@ public final class ComputeRequest<T> {
             .complexity(complexity)
             .kind(kind)
             .timeout(timeout)
+            .threadSafe(threadSafe)
             .allowMainThreadRerouting(allowMainThreadRerouting)
             .backendPreference(backendPreference);
         if (openclWorkload != null) {

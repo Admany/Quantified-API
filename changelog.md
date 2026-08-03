@@ -1,5 +1,19 @@
 # Quantified API Update Changelogs 
 
+## v2.2.0
+
+- Fixed Linux GPU acceleration by packaging the Linux x64 and ARM64 LWJGL natives inside the isolated Vulkan and OpenCL runtimes.
+- GPU probe bundles are now cross-platform instead of silently inheriting the operating system used to build the release jar.
+- Isolated Vulkan now performs a real background runtime preflight after device detection and reports the exact activation failure instead of stopping at probe success.
+- Added an omni-jar verification task so Windows, Linux x64, and Linux ARM64 GPU natives cannot disappear from a release unnoticed.
+- Dedicated servers no longer touch Minecraft client classes from dashboard polling; Vulkan and OpenCL compute now initialise independently of the client renderer.
+- OpenCL now preflights and activates its isolated bundled runtime on Linux instead of stopping after device discovery, with exact context and native failures exposed in diagnostics.
+
+- Restored the custom Vulkan shader lane that was lost during the V2 rewrite, now as the cleaner `SpirvComputeProgram` API.
+- Mods can package precompiled SPIR-V and dispatch it through `QuantifiedVulkan.Context.dispatch(...)` on both normal and isolated Vulkan runtimes.
+- Custom pipelines are content-addressed, bounded, cached for reuse, and share Quantified API's existing workspace/residency system instead of rebuilding Vulkan objects per call.
+- Added strict shader, descriptor, push-constant, dispatch-size, and VRAM-footprint validation plus focused API tests.
+
 ## V2 is here, with large changes, and FINALLY Official Documentation at `https://www.admany.dev` :]
 
 ## v2.0.0 - Released on 2026-05-18 (The TRUE V2 Release xd)

@@ -359,6 +359,10 @@ public final class QuantifiedCoreRuntime {
     }
 
     private static void updateGpuNameFromOpenGl(Logger logger) {
+        if (!PhysicalEnvironment.isClient()) {
+            gpuNameUpdated = true;
+            return;
+        }
         if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
             gpuNameUpdated = true;
             return;
@@ -389,6 +393,10 @@ public final class QuantifiedCoreRuntime {
     }
 
     private static void triggerClientWorldProbe() {
+        if (!PhysicalEnvironment.isClient()) {
+            clientWorldProbeTriggered = true;
+            return;
+        }
         if (!MultithreadingConfig.isGpuAccelerationEnabled()) {
             clientWorldProbeTriggered = true;
             return;

@@ -24,6 +24,20 @@ public final class VulkanContext {
         return manager.executeTerrainGeneration(inputCoords);
     }
 
+    public float[] dispatchSpirv(String programKey,
+                                 byte[] spirv,
+                                 int storageBufferCount,
+                                 int pushConstantBytes,
+                                 float[][] inputBuffers,
+                                 int outputFloatCount,
+                                 int[] pushConstants,
+                                 int groupCountX,
+                                 int groupCountY,
+                                 int groupCountZ) {
+        return manager.executeSpirv(programKey, spirv, storageBufferCount, pushConstantBytes, inputBuffers,
+            outputFloatCount, pushConstants, groupCountX, groupCountY, groupCountZ);
+    }
+
     public String deviceName() {
         return VulkanManager.deviceName();
     }

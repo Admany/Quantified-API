@@ -9,12 +9,14 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 
 public final class OpenCLIsolatedBridge {
 
     private static final Object LOCK = new Object();
     private static volatile OpenCLContext context;
     private static volatile GPUDetector.GPUCapabilities capabilities;
+    private static final AtomicReference<String> FAILURE_REASON = new AtomicReference<>();
 
     private OpenCLIsolatedBridge() {
     }
@@ -22,10 +24,16 @@ public final class OpenCLIsolatedBridge {
     public static boolean isAvailable() {
         try {
             ensureContext();
+            FAILURE_REASON.set(null);
             return true;
-        } catch (Throwable ignored) {
+        } catch (Throwable throwable) {
+            FAILURE_REASON.set(describeFailure(throwable));
             return false;
         }
+    }
+
+    public static String failureReason() {
+        return FAILURE_REASON.get();
     }
 
     public static Object executeApiTask(Object parentApiTask) throws Exception {
@@ -63,6 +71,20 @@ public final class OpenCLIsolatedBridge {
             context = created;
             return created;
         }
+    }
+
+    private static String describeFailure(Throwable throwable) {
+        Throwable root = throwable;
+        while (root != null && root.getCause() != null) {
+            root = root.getCause();
+        }
+        if (root == null) {
+            return "Unknown isolated OpenCL runtime failure";
+        }
+        String message = root.getMessage();
+        return message == null || message.isBlank()
+            ? root.getClass().getSimpleName()
+            : root.getClass().getSimpleName() + ": " + message;
     }
 
     private static Object extractWorkload(Object parentApiTask) throws Exception {

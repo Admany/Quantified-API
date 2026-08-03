@@ -11,11 +11,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 
 public final class VulkanIsolatedBatchWorkload implements TaskMetadata.GpuBatchWorkload {
 
     private static final Logger LOGGER = Logger.getLogger(VulkanIsolatedBatchWorkload.class.getName());
+    private static final AtomicLong NEXT_TASK_FAILURE_WARNING_MS = new AtomicLong();
 
     public static final VulkanIsolatedBatchWorkload INSTANCE = new VulkanIsolatedBatchWorkload();
 
@@ -74,6 +76,7 @@ public final class VulkanIsolatedBatchWorkload implements TaskMetadata.GpuBatchW
             for (int i = 0; i < limit; i++) {
                 Object result = results[i];
                 if (result instanceof Throwable throwable) {
+                    warnTaskFailure(modId, throwable);
                     GpuWorkloadRegistry.completeExceptionally(taskKeys.get(i), throwable);
                 } else {
                     GpuWorkloadRegistry.complete(taskKeys.get(i), result);
@@ -91,5 +94,20 @@ public final class VulkanIsolatedBatchWorkload implements TaskMetadata.GpuBatchW
                 GpuWorkloadRegistry.completeExceptionally(taskKey, throwable);
             }
         }
+    }
+
+    private static void warnTaskFailure(String modId, Throwable throwable) {
+        long now = System.currentTimeMillis();
+        long next = NEXT_TASK_FAILURE_WARNING_MS.get();
+        if (now < next || !NEXT_TASK_FAILURE_WARNING_MS.compareAndSet(next, now + 60_000L)) {
+            return;
+        }
+        Throwable root = throwable;
+        while (root.getCause() != null && root.getCause() != root) {
+            root = root.getCause();
+        }
+        String message = root.getMessage();
+        LOGGER.warning("Isolated Vulkan task failed for mod " + modId + ": "
+            + root.getClass().getSimpleName() + (message == null || message.isBlank() ? "" : ": " + message));
     }
 }
