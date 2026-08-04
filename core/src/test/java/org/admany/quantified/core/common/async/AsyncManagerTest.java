@@ -5,6 +5,7 @@ import org.admany.quantified.core.common.async.core.AsyncManagerBootstrap;
 import org.admany.quantified.core.common.async.core.PriorityScheduler;
 import org.admany.quantified.core.common.async.metrics.AsyncMetrics;
 import org.admany.quantified.core.common.async.task.PriorityTaskType;
+import org.admany.quantified.core.common.threading.core.MainThreadExecutor;
 import org.admany.quantified.core.common.threading.pool.ThreadPoolStats;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -39,6 +40,7 @@ class AsyncManagerTest {
     @AfterAll
     void tearDownAll() {
         // Clean up AsyncManager
+        MainThreadExecutor.clear();
         AsyncManager.shutdown();
         if (testExecutor != null) {
             testExecutor.shutdownNow();
@@ -206,6 +208,27 @@ class AsyncManagerTest {
     void testInitializationState() {
         // Test that AsyncManager is properly initialized
         if (!AsyncManager.isInitialised()) throw new AssertionError("AsyncManager not initialised");
+    }
+
+    @Test
+    void nonThreadSafeBuildingTaskRunsOnInstalledMainExecutor() throws Exception {
+        String submittingThread = Thread.currentThread().getName();
+        MainThreadExecutor.install(Runnable::run);
+
+        CompletableFuture<String> future = AsyncManager.submitSync(
+            1107L,
+            PriorityTaskType.BUILDING,
+            1.0,
+            Thread::currentThread,
+            Duration.ofSeconds(1),
+            false,
+            "test_mod",
+            org.admany.quantified.core.common.async.task.TaskMetadata.DEFAULT
+        ).thenApply(Thread::getName);
+
+        if (!Objects.equals(future.get(), submittingThread)) {
+            throw new AssertionError("non-thread-safe task was sent to a worker instead of the installed main executor");
+        }
     }
     
     @Test

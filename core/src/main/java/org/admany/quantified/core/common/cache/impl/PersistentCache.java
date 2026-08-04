@@ -92,7 +92,18 @@ public class PersistentCache<K, V> implements ThreadSafeCache<K, V> {
     @Override
     public V get(K key, java.util.function.Function<? super K, ? extends V> mappingFunction) {
         awaitInitialLoad();
-        return delegate.get(key, mappingFunction);
+        AtomicBoolean loaded = new AtomicBoolean(false);
+        V value = delegate.get(key, candidate -> {
+            V computed = mappingFunction.apply(candidate);
+            if (computed != null) {
+                loaded.set(true);
+            }
+            return computed;
+        });
+        if (loaded.get()) {
+            saveToDiskAsync();
+        }
+        return value;
     }
 
     @Override

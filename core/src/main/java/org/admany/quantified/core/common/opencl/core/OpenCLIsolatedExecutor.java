@@ -115,7 +115,13 @@ public final class OpenCLIsolatedExecutor {
         Set<String> childFirstPackages = new LinkedHashSet<>();
         childFirstPackages.add("org.lwjgl.opencl.");
         childFirstPackages.add("org.admany.quantified.core.common.opencl.");
-        if (!parentHasUsableLwjglCore()) {
+        // A dedicated Linux server can expose LWJGL Java classes through the
+        // loader while shipping no liblwjgl.so at all.  Reusing that partial
+        // parent runtime makes LWJGL search the server classpath and prevents
+        // the embedded native jars from ever being considered.  On Linux the
+        // isolated runtime must own both its LWJGL classes and bundled natives.
+        // Windows keeps the shared parent path to avoid loading lwjgl.dll twice.
+        if (mustUseBundledLwjglCore()) {
             childFirstPackages.add("org.lwjgl.");
         }
         ChildFirstPackageClassLoader loader = new ChildFirstPackageClassLoader(
@@ -173,6 +179,14 @@ public final class OpenCLIsolatedExecutor {
         java.lang.reflect.Method failureReason,
         java.lang.reflect.Method executeApiTask
     ) {
+    }
+
+    private static boolean mustUseBundledLwjglCore() {
+        String osName = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+        if (osName.contains("linux")) {
+            return true;
+        }
+        return !parentHasUsableLwjglCore();
     }
 
     private static boolean parentHasUsableLwjglCore() {

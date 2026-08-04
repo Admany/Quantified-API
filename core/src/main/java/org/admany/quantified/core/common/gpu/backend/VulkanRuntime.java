@@ -109,9 +109,11 @@ public final class VulkanRuntime {
             + "' LWJGL-stack=" + (lwjglStackBytes / (1024 * 1024)) + " MiB");
         logProbeEnvironment(probeId, lwjglStackBytes);
         boolean inProcessBindingsPresent = hasBindings();
-        if (!inProcessBindingsPresent && !hasEmbeddedProbeBundle()) {
-            return new AvailabilitySnapshot(false, false, false, 0, 0,
-                "LWJGL Vulkan binding not present and embedded Vulkan probe bundle is missing", List.of());
+        boolean embeddedProbeBundlePresent = hasEmbeddedProbeBundle();
+        if (!inProcessBindingsPresent && !embeddedProbeBundlePresent) {
+            return reportProbe(loggerSnapshot(false, false, false, 0, 0,
+                "LWJGL Vulkan binding not present and embedded Vulkan probe bundle is missing", List.of()),
+                probeId, inProcessBindingsPresent, embeddedProbeBundlePresent);
         }
 
         VulkanSubprocessProbe.Result result = VulkanSubprocessProbe.run(LOGGER, probeId);
@@ -128,26 +130,50 @@ public final class VulkanRuntime {
             if (!inProcessBindingsPresent) {
                 String reason = "Isolated Vulkan probe succeeded; in-process LWJGL Vulkan binding is not present, so execution will use the isolated bundled runtime";
                 LOGGER.info(prefix(probeId) + reason);
-                return new AvailabilitySnapshot(false, true, false,
-                    result.maxApiVersion(), result.selectedApiVersion(), reason, devices);
+                return reportProbe(loggerSnapshot(false, true, false,
+                    result.maxApiVersion(), result.selectedApiVersion(), reason, devices),
+                    probeId, inProcessBindingsPresent, embeddedProbeBundlePresent);
             }
             String conservativeBlockReason = conservativeBlockReason(devices);
             if (conservativeBlockReason != null) {
                 LOGGER.warn(prefix(probeId) + conservativeBlockReason);
-                return new AvailabilitySnapshot(true, true, false,
-                    result.maxApiVersion(), result.selectedApiVersion(), conservativeBlockReason, devices);
+                return reportProbe(loggerSnapshot(true, true, false,
+                    result.maxApiVersion(), result.selectedApiVersion(), conservativeBlockReason, devices),
+                    probeId, inProcessBindingsPresent, embeddedProbeBundlePresent);
             }
             LOGGER.info(prefix(probeId) + "Isolated Vulkan probe succeeded with API "
                 + formatVersion(result.selectedApiVersion()));
-            return new AvailabilitySnapshot(true, true, true,
-                result.maxApiVersion(), result.selectedApiVersion(), null, devices);
+            return reportProbe(loggerSnapshot(true, true, true,
+                result.maxApiVersion(), result.selectedApiVersion(), null, devices),
+                probeId, inProcessBindingsPresent, embeddedProbeBundlePresent);
         }
         String reason = result.failureReason() != null && !result.failureReason().isBlank()
             ? result.failureReason()
             : "Isolated Vulkan probe failed";
         LOGGER.warn(prefix(probeId) + reason);
-        return new AvailabilitySnapshot(inProcessBindingsPresent, true, false,
-            result.maxApiVersion(), result.selectedApiVersion(), reason, devices);
+        return reportProbe(loggerSnapshot(inProcessBindingsPresent, true, false,
+            result.maxApiVersion(), result.selectedApiVersion(), reason, devices),
+            probeId, inProcessBindingsPresent, embeddedProbeBundlePresent);
+    }
+
+    private static AvailabilitySnapshot loggerSnapshot(boolean bindingPresent,
+                                                        boolean shaderCompilerPresent,
+                                                        boolean available,
+                                                        int maxApiVersion,
+                                                        int selectedApiVersion,
+                                                        String failureReason,
+                                                        List<ProbeDeviceInfo> devices) {
+        return new AvailabilitySnapshot(bindingPresent, shaderCompilerPresent, available, maxApiVersion,
+            selectedApiVersion, failureReason, devices);
+    }
+
+    private static AvailabilitySnapshot reportProbe(AvailabilitySnapshot snapshot,
+                                                     int probeId,
+                                                     boolean inProcessBindingsPresent,
+                                                     boolean embeddedProbeBundlePresent) {
+        GpuStartupDiagnostics.reportVulkan(LOGGER, probeId, inProcessBindingsPresent, embeddedProbeBundlePresent,
+            runtimeMode(), snapshot.available(), snapshot.failureReason(), snapshot.devices());
+        return snapshot;
     }
 
     private static String conservativeBlockReason(List<ProbeDeviceInfo> devices) {

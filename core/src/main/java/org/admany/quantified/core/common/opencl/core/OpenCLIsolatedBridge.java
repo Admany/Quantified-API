@@ -52,6 +52,7 @@ public final class OpenCLIsolatedBridge {
     }
 
     private static OpenCLContext ensureContext() {
+        OpenCLLinuxLoaderCompatibility.configureBeforeLwjglOpenCl();
         OpenCLContext existing = context;
         if (existing != null && existing.isHealthy()) {
             return existing;

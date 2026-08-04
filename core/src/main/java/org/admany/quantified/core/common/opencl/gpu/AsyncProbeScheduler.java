@@ -152,7 +152,11 @@ public class AsyncProbeScheduler {
             LOGGER.info("OpenCL probe succeeded on attempt #" + attemptNo + " (" + trigger + ")");
             DeveloperOverlayManager.recordApiLog("[OpenCL] Acceleration ready - attempt " + attemptNo + " (trigger: " + trigger + ")");
         } else {
-            DeveloperOverlayManager.recordApiLog("[OpenCL] Probe unavailable - attempt " + attemptNo + " (" + trigger + ") - GPU acceleration disabled");
+            String reason = OpenCLManager.runtimeStatus().failureReason();
+            String detail = reason != null && !reason.isBlank()
+                ? reason
+                : "OpenCL runtime did not become available";
+            DeveloperOverlayManager.recordApiLog("[OpenCL] Probe unavailable - attempt " + attemptNo + " (" + trigger + ") - " + detail);
         }
     }
 

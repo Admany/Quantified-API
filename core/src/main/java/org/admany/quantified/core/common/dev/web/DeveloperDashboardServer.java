@@ -413,36 +413,9 @@ public final class DeveloperDashboardServer {
                     handleOptions(exchange);
                     return;
                 }
-                try {
-                    String path = exchange.getRequestURI() != null ? exchange.getRequestURI().getPath() : "";
-                    boolean isStaticDashboardAsset = false;
-                    if (path != null) {
-                        if (path.equals("/") || path.equals("/index.html") || path.equals("/favicon.ico")
-                            || path.equals("/dashboard.js") || path.equals("/dashboard.css")
-                            || path.equals("/logo_white.png") || path.equals("/dashboard/logo_white.png")
-                            || path.equals(LOGO_ENDPOINT)
-                            || path.startsWith("/dashboard/")) {
-                            isStaticDashboardAsset = true;
-                        }
-                    }
-                    if (!isStaticDashboardAsset) {
-                        boolean isDashboardApi = path != null && path.startsWith("/api/v1/");
-                        boolean isLoopback = false;
-                        if (exchange.getRemoteAddress() != null && exchange.getRemoteAddress().getAddress() != null) {
-                            isLoopback = exchange.getRemoteAddress().getAddress().isLoopbackAddress();
-                        }
-                        if (!(isDashboardApi && isLoopback)) {
-                            String requestLine = exchange.getRequestMethod() + " " + exchange.getRequestURI().toString() + " from " + exchange.getRemoteAddress();
-                            String ts = new java.text.SimpleDateFormat("MMM dd, yyyy hh:mm:ss a").format(new java.util.Date());
-                            String loggerName = DeveloperDashboardServer.class.getName() + " handle";
-                            String formatted = ts + " " + loggerName + System.lineSeparator() + "INFO: " + requestLine;
-                            DeveloperOverlayManager.recordApiLog(formatted);
-                            LOGGER.fine(() -> "HTTP " + requestLine);
-                        }
-                    }
-                } catch (Throwable t) {
-                    LOGGER.log(Level.FINE, "Failed to record API log", t);
-                }
+                // Dashboard access requests are deliberately not sent to DeveloperOverlayManager.
+                // The panel consumes that stream as Quantified runtime events; recording its own
+                // polling requests there made remote dashboard traffic look like API activity.
                 handler.handle(exchange);
             } catch (Exception ex) {
                 LOGGER.log(Level.FINE, "Dashboard handler error", ex);
@@ -1555,7 +1528,9 @@ public final class DeveloperDashboardServer {
 
     private static JsonObject buildStatePayload(DeveloperOverlayManager.DeveloperDiagnosticsView diagnostics) {
         JsonObject payload = new JsonObject();
-        payload.addProperty("enableGpuAcceleration", MultithreadingConfig.CONFIG != null && MultithreadingConfig.CONFIG.enableGpuAcceleration);
+        boolean gpuAccelerationEnabled = MultithreadingConfig.isGpuAccelerationEnabled();
+        payload.addProperty("enableGpuAcceleration", gpuAccelerationEnabled);
+        payload.addProperty("gpuConfigurationState", gpuAccelerationEnabled ? "ENABLED" : "DISABLED");
         payload.addProperty("developerMode", DeveloperFeatures.isDeveloperModeEnabled());
         payload.addProperty("dashboardEnabled", DeveloperFeatures.isDashboardEnabled());
         payload.addProperty("timelineEnabled", DeveloperFeatures.isTimelineEnabled());
@@ -1578,6 +1553,15 @@ public final class DeveloperDashboardServer {
         payload.addProperty("vulkanAvailable", vulkanProbeAvailable);
         payload.addProperty("vulkanInitialized", vulkanInitialized);
         payload.addProperty("vulkanRuntimeMode", vulkanRuntimeMode.name());
+        payload.addProperty("vulkanRuntimeState", !gpuAccelerationEnabled
+            ? "DISABLED_BY_CONFIG"
+            : vulkanInitialized ? "READY"
+            : vulkanProbeAvailable ? "PROBE_READY_RUNTIME_PENDING"
+            : "UNAVAILABLE");
+        payload.addProperty("openclRuntimeState", !gpuAccelerationEnabled
+            ? "DISABLED_BY_CONFIG"
+            : openclStatus.isAvailable() ? "READY"
+            : "UNAVAILABLE");
         if (!vulkanProbeAvailable) {
             payload.addProperty("vulkanFailureReason", vulkanFailureReason);
         } else if (vulkanFailureReason != null) {

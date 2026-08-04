@@ -6,6 +6,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import org.admany.quantified.core.common.gpu.backend.GpuStartupDiagnostics;
 
 public final class OpenCLRuntime {
 
@@ -29,6 +30,7 @@ public final class OpenCLRuntime {
             return true;
         }
         try {
+            OpenCLLinuxLoaderCompatibility.configureBeforeLwjglOpenCl();
             Binding b = BINDING.get();
             if (b == Binding.UNKNOWN) {
                 b = probeBinding();
@@ -43,6 +45,8 @@ public final class OpenCLRuntime {
                     String message = t.getMessage() != null ? t.getMessage() : t.getClass().getName();
                     LAST_ERROR.set(message);
                     LOGGER.warning("OpenCL runtime unavailable (LWJGL): " + message);
+                    GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", true, embeddedProbePresent(), false,
+                        failureDetail(t), List.of());
                     // Dedicated servers (or mismatched LWJGL runtimes) may not ship the required org.lwjgl classes.
                     // Don't spam full stack traces for a known "binding missing" condition.
                     if (!isMissingLwjgl(t)) {
@@ -53,16 +57,22 @@ public final class OpenCLRuntime {
                 INITIALISED.set(true);
                 LAST_ERROR.set(null);
                 LOGGER.info("OpenCL runtime initialised via LWJGL");
+                GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", true, embeddedProbePresent(), true,
+                    null, List.of());
                 return true;
             } else {
                 LAST_ERROR.set("No Java OpenCL binding found (org.lwjgl.opencl)");
                 LOGGER.warning("OpenCL runtime unavailable: No Java binding found");
+                GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", false, embeddedProbePresent(), false,
+                    LAST_ERROR.get(), List.of());
                 return false;
             }
         } catch (Throwable throwable) {
             String message = throwable.getMessage() != null ? throwable.getMessage() : throwable.getClass().getName();
             LAST_ERROR.set(message);
             LOGGER.warning("OpenCL runtime unavailable: " + message);
+            GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", BINDING.get() == Binding.LWJGL,
+                embeddedProbePresent(), false, failureDetail(throwable), List.of());
             if (!isMissingLwjgl(throwable)) {
                 LOGGER.log(Level.INFO, "Full OpenCL init failure", throwable);
             }
@@ -137,6 +147,10 @@ public final class OpenCLRuntime {
             snapshot = result.ok()
                 ? ProbeSnapshot.success(devices)
                 : ProbeSnapshot.failed(result.failureReason(), devices);
+            GpuStartupDiagnostics.reportOpenCl(LOGGER, "isolated-probe", bindingsPresent, embeddedProbePresent,
+                snapshot.success() && !devices.isEmpty(), snapshot.success() && devices.isEmpty()
+                    ? "Probe completed but the Linux/host OpenCL ICD reported zero devices"
+                    : snapshot.failureReason(), devices);
         }
         LAST_PROBE_SNAPSHOT.compareAndSet(null, snapshot);
         return LAST_PROBE_SNAPSHOT.get();
@@ -197,6 +211,22 @@ public final class OpenCLRuntime {
             cur = cur.getCause();
         }
         return false;
+    }
+
+    private static String failureDetail(Throwable throwable) {
+        if (throwable == null) {
+            return "unknown";
+        }
+        StringBuilder detail = new StringBuilder(throwable.getClass().getName());
+        Throwable cause = throwable.getCause();
+        if (cause != null && cause != throwable) {
+            detail.append(" caused-by ").append(cause.getClass().getName());
+        }
+        String message = throwable.getMessage();
+        if (message != null && !message.isBlank()) {
+            detail.append(": ").append(message);
+        }
+        return detail.toString();
     }
 
     private static void invokeLWJGLCreate() throws Exception {

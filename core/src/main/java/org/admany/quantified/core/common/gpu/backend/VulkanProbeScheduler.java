@@ -254,7 +254,7 @@ public final class VulkanProbeScheduler {
             return;
         }
         String reason = probeFailureReason();
-        String detail = reason != null && !reason.isBlank() ? reason : "GPU acceleration disabled";
+        String detail = reason != null && !reason.isBlank() ? reason : "Vulkan runtime did not become available";
         DeveloperOverlayManager.recordApiLog("[Vulkan] Probe unavailable - attempt " + attemptNo + " (" + trigger + ") - " + detail);
         if (detail.contains("execution will use the isolated bundled runtime")) {
             LOGGER.info("Vulkan isolated probe completed; isolated runtime execution is available");
@@ -285,6 +285,9 @@ public final class VulkanProbeScheduler {
                     ? reason
                     : failure != null ? failure.getMessage() : "runtime preflight returned unavailable";
                 LOGGER.warn("Vulkan isolated runtime preflight failed (" + trigger + "): " + detail);
+                VulkanRuntime.AvailabilitySnapshot snapshot = VulkanRuntime.snapshot();
+                GpuStartupDiagnostics.reportVulkan(LOGGER, -1, snapshot.bindingPresent(), true,
+                    VulkanRuntime.runtimeMode(), false, "isolated runtime preflight: " + detail, snapshot.devices());
                 DeveloperOverlayManager.recordApiLog("[Vulkan] Isolated runtime unavailable - " + detail);
                 return;
             }

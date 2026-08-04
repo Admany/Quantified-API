@@ -64,6 +64,28 @@ class PersistentCacheTest {
     }
 
     @Test
+    void testLoadedValueIsPersisted() {
+        assertThat(cache.get("loaded_key", key -> "loaded_value")).isEqualTo("loaded_value");
+        cache.close();
+
+        CaffeineThreadSafeCache<String, String> replacementDelegate = CaffeineThreadSafeCache.create(
+            new CaffeineThreadSafeCache.CacheBuilderSpec(100, Duration.ofMinutes(5), false, 16)
+        );
+        ThreadSafeCache<String, String> replacement = new PersistentCache<>(
+            replacementDelegate,
+            "testmod",
+            "testcache",
+            true,
+            tempDir.resolve("test-cache")
+        );
+        try {
+            assertThat(replacement.getIfPresent("loaded_key")).isEqualTo("loaded_value");
+        } finally {
+            replacement.close();
+        }
+    }
+
+    @Test
     void testPersistence() {
         // Put some data
         cache.put("persistent_key", "persistent_value");

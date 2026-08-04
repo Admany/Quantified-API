@@ -6,6 +6,7 @@ import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.network.chat.Style;
@@ -91,6 +92,14 @@ public final class QuantifiedFabricCommand {
         deliver(source, prefixed(colored(message, COLOR_ERROR)), true);
     }
 
+    private static MutableComponent link(String url) {
+        Style style = Style.EMPTY
+            .withColor(COLOR_PRIMARY)
+            .withUnderlined(true)
+            .withClickEvent(new ClickEvent(ClickEvent.Action.OPEN_URL, url));
+        return Component.literal(url).setStyle(style);
+    }
+
     private static int webPanel(CommandSourceStack source, String rawState) {
         LOGGER.info("Executing /quantified webpanel with state={}", rawState);
         if (!requireAdmin(source)) {
@@ -113,7 +122,7 @@ public final class QuantifiedFabricCommand {
             MutableComponent message = colored(result.message(), COLOR_SUCCESS);
             message.append(Component.literal(" | "));
             message.append(colored("Open UI: ", COLOR_PRIMARY));
-            message.append(colored(result.url(), COLOR_PRIMARY));
+            message.append(link(result.url()));
             deliver(source, prefixed(message), false);
         } else {
             QuantifiedCommandService.DashboardResult result = QuantifiedCommandService.disableDashboard();

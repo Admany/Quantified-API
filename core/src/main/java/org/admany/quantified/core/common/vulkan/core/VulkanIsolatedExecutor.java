@@ -328,16 +328,16 @@ public final class VulkanIsolatedExecutor {
             }
             urls.add(destination.toUri().toURL());
         }
-        // Prefer Minecraft's already-loaded LWJGL core when the parent exposes
-        // it.  Loading a second lwjgl.dll in a child loader is illegal on
-        // Windows and poisons MemoryUtil for the rest of the session. Older
-        // runtimes that genuinely do not expose core retain the bundled-core
-        // fallback.
+        // Prefer Minecraft's already-loaded LWJGL core only where it can own
+        // the native library too. A dedicated Linux server may expose the Java
+        // classes but not liblwjgl.so, which otherwise blocks our bundled
+        // Linux natives. Windows stays parent-owned to avoid a second lwjgl.dll
+        // in another class loader.
         Set<String> childFirstPackages = new LinkedHashSet<>();
         childFirstPackages.add("org.lwjgl.vulkan.");
         childFirstPackages.add("org.admany.quantified.core.common.vulkan.");
         childFirstPackages.add("org.admany.quantified.core.common.util.");
-        if (!VulkanIsolatedExecutor.parentExposesLwjglCore()) {
+        if (VulkanIsolatedExecutor.mustUseBundledLwjglCore()) {
             childFirstPackages.add("org.lwjgl.");
         }
         ChildFirstPackageClassLoader loader = new ChildFirstPackageClassLoader(
@@ -396,6 +396,14 @@ public final class VulkanIsolatedExecutor {
                                 Method executeApiTask,
                                 Method executeApiTasks,
                                 Method residencySnapshot) {
+    }
+
+    private static boolean mustUseBundledLwjglCore() {
+        String osName = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+        if (osName.contains("linux")) {
+            return true;
+        }
+        return !VulkanIsolatedExecutor.parentExposesLwjglCore();
     }
 
     private static boolean parentExposesLwjglCore() {

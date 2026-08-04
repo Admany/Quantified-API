@@ -24,6 +24,7 @@ public final class OpenCLProbeEntrypoint {
     }
 
     public static void main(String[] args) {
+        configureLinuxIcdLoader();
         Result result;
         try {
             ensureOpenClCreated();
@@ -41,6 +42,14 @@ public final class OpenCLProbeEntrypoint {
         System.out.println(result.toJson());
         System.out.flush();
         System.exit(result.ok ? 0 : 1);
+    }
+
+    private static void configureLinuxIcdLoader() {
+        String osName = System.getProperty("os.name", "");
+        String configured = System.getProperty("org.lwjgl.opencl.libname");
+        if (osName.toLowerCase(Locale.ROOT).contains("linux") && (configured == null || configured.isBlank())) {
+            System.setProperty("org.lwjgl.opencl.libname", "libOpenCL.so.1");
+        }
     }
 
     private static void ensureOpenClCreated() {

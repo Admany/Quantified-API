@@ -51,6 +51,7 @@ public final class AsyncManager {
     private static final AtomicBoolean INITIALISED = new AtomicBoolean(false);
     private static final boolean FORCE_RENDER_REROUTE = Boolean.parseBoolean(System.getProperty("quantified.forceMainThreadForRender", "true"));
     private static final AtomicBoolean RENDER_REROUTE_LOGGED = new AtomicBoolean(false);
+    private static final AtomicBoolean MAIN_THREAD_UNAVAILABLE_LOGGED = new AtomicBoolean(false);
 
     private static PriorityScheduler scheduler;
     private static ScheduledExecutorService coalescer;
@@ -251,7 +252,7 @@ public final class AsyncManager {
             TaskEntry<T> existingEntry = cast(existing);
             return existingEntry.future;
         }
-        if (!schedule(key, entry, v.type(), v.score())) {
+        if (!schedule(key, entry, v.type(), v.score(), effectiveThreadSafe)) {
             TASKS.remove(key, entry);
         }
 
@@ -301,7 +302,7 @@ public final class AsyncManager {
             TaskEntry<T> existingEntry = cast(existing);
             return existingEntry.future;
         }
-        if (!schedule(key, entry, v.type(), v.score())) {
+        if (!schedule(key, entry, v.type(), v.score(), effectiveThreadSafe)) {
             TASKS.remove(key, entry);
         }
 
@@ -313,7 +314,11 @@ public final class AsyncManager {
         return submit(key, type, score, computation, null, modId, TaskMetadata.DEFAULT);
     }
 
-    private static <T> boolean schedule(long key, TaskEntry<T> entry, PriorityTaskType type, double score) {
+    private static <T> boolean schedule(long key,
+                                         TaskEntry<T> entry,
+                                         PriorityTaskType type,
+                                         double score,
+                                         boolean runOnWorker) {
 
         if (!MOD_MANAGER.tryReserveTask(entry.modId)) {
             entry.future.completeExceptionally(new RuntimeException("Mod limit exceeded: " + entry.modId));
@@ -362,6 +367,10 @@ public final class AsyncManager {
             });
         };
 
+        if (!runOnWorker) {
+            return scheduleOnMainThread(key, entry, payload);
+        }
+
         PriorityTask task = new PriorityTask(key, type, modScore, payload, entry.metadata, entry.modId,
             // Drop callback: ensure the future is always resolved so callers never hang.
             () -> {
@@ -376,6 +385,40 @@ public final class AsyncManager {
 
         enqueue(task);
         return true;
+    }
+
+    /**
+     * A non-thread-safe computation must never enter a worker priority lane and
+     * only then discover that it needs the Minecraft server thread.  Doing that
+     * caused the old "BUILDING requires thread safety" warning followed by a
+     * failed reroute when a task arrived before the platform had installed its
+     * server executor.  Queue it directly on the installed main executor
+     * instead, while retaining the normal task bookkeeping and timeout path.
+     */
+    private static <T> boolean scheduleOnMainThread(long key, TaskEntry<T> entry, Runnable payload) {
+        var mainThreadExecutor = MainThreadExecutor.executor();
+        if (mainThreadExecutor.isEmpty()) {
+            IllegalStateException failure = new IllegalStateException(
+                "Cannot run non-thread-safe task before the server main-thread executor is installed");
+            entry.future.completeExceptionally(failure);
+            releaseReservation(entry.modId, false, entry.reservationReleased);
+            TASKS.remove(key, entry);
+            if (MAIN_THREAD_UNAVAILABLE_LOGGED.compareAndSet(false, true)) {
+                LOGGER.log(Level.WARNING,
+                    "Rejected non-thread-safe task before a server main-thread executor was installed; "
+                        + "the task was not sent to a worker thread", failure);
+            }
+            return false;
+        }
+        try {
+            mainThreadExecutor.get().execute(payload);
+            return true;
+        } catch (Throwable failure) {
+            entry.future.completeExceptionally(failure);
+            releaseReservation(entry.modId, false, entry.reservationReleased);
+            TASKS.remove(key, entry);
+            return false;
+        }
     }
 
     private static void enqueue(PriorityTask task) {

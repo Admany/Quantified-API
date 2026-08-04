@@ -232,12 +232,14 @@ public class MultithreadingConfig {
                         if (CONFIG != null) {
                             validateAndSetDefaults(CONFIG, detectedServer);
                             log.info("Loaded " + (boxedFirst ? "boxed" : "flat") + " configuration from " + path);
+                            logGpuConfiguration(log);
                             return CONFIG;
                         }
                         CONFIG = boxedFirst ? parseFlatConfig(jsonData) : parseBoxedConfig(jsonData);
                         if (CONFIG != null) {
                             validateAndSetDefaults(CONFIG, detectedServer);
                             log.info("Loaded " + (boxedFirst ? "flat" : "boxed") + " configuration from " + path);
+                            logGpuConfiguration(log);
                             return CONFIG;
                         }
                     }
@@ -263,7 +265,20 @@ public class MultithreadingConfig {
         }
 
         log.info("Final config loaded: developerDashboard=" + CONFIG.developerDashboard + ", developerMode=" + CONFIG.developerMode + ", port=" + CONFIG.developerDashboardPort + ", host=" + CONFIG.developerDashboardHost);
+        logGpuConfiguration(log);
         return CONFIG;
+    }
+
+    private static void logGpuConfiguration(Logger log) {
+        Config config = CONFIG;
+        if (config == null) {
+            return;
+        }
+        log.info("Quantified GPU config: enabled=" + config.enableGpuAcceleration
+            + ", preferredBackend=" + config.preferredGpuBackend
+            + ", vulkanDevice=" + config.vulkanDeviceId
+            + ", openclDevice=" + config.openclDeviceId
+            + ", forceOpenCL=" + config.openclForced);
     }
 
     private static void validateAndSetDefaults(Config config, boolean isServer) {

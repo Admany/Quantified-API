@@ -28,6 +28,10 @@ public final class CacheManager {
     private static final Logger LOGGER = Logger.getLogger(CacheManager.class.getName());
 
     private static final ConcurrentMap<String, ThreadSafeCache<?, ?>> REGISTRY = new ConcurrentHashMap<>();
+    /**
+     * Conservative dashboard estimate used until a cache supplies an explicit weigher.
+     * Keep this value shared so per-mod and global cache telemetry cannot disagree.
+     */
     private static final long ESTIMATED_ENTRY_BYTES = 512L;
     private static final AtomicBoolean MAINTENANCE_STARTED = new AtomicBoolean(false);
     private static final AtomicBoolean DISK_SCAN_IN_FLIGHT = new AtomicBoolean(false);
@@ -60,23 +64,61 @@ public final class CacheManager {
         return register(name, () -> new CaffeineThreadSafeCache.CacheBuilderSpec(maximumSize, ttl, refreshOnAccess, 0), persistence, compression);
     }
 
+    public static <K, V> ThreadSafeCache<K, V> register(String name,
+                                                           long maximumSize,
+                                                           Duration ttl,
+                                                           boolean refreshOnAccess,
+                                                           boolean persistence,
+                                                           boolean compression,
+                                                           String persistenceModId,
+                                                           String persistenceCacheName) {
+        return register(name,
+            () -> new CaffeineThreadSafeCache.CacheBuilderSpec(maximumSize, ttl, refreshOnAccess, 0),
+            persistence,
+            compression,
+            persistenceModId,
+            persistenceCacheName);
+    }
+
     public static <K, V> ThreadSafeCache<K, V> register(String name, Supplier<CaffeineThreadSafeCache.CacheBuilderSpec> specSupplier, boolean persistence) {
         return register(name, specSupplier, persistence, true);
     }
 
     public static <K, V> ThreadSafeCache<K, V> register(String name, Supplier<CaffeineThreadSafeCache.CacheBuilderSpec> specSupplier, boolean persistence, boolean compression) {
+        return register(name, specSupplier, persistence, compression, null, null);
+    }
+
+    /**
+     * Registers a cache with explicit persistence ownership. API handles already know
+     * their mod id and cache name, so do not try to recover them by splitting a dotted
+     * registry name such as {@code quantified.api.cache.modid.cache}.
+     */
+    public static <K, V> ThreadSafeCache<K, V> register(String name,
+                                                          Supplier<CaffeineThreadSafeCache.CacheBuilderSpec> specSupplier,
+                                                          boolean persistence,
+                                                          boolean compression,
+                                                          String persistenceModId,
+                                                          String persistenceCacheName) {
         Objects.requireNonNull(name, "name");
         Objects.requireNonNull(specSupplier, "specSupplier");
 
         return getOrCreate(name, () -> {
             ThreadSafeCache<K, V> cache = CaffeineThreadSafeCache.create(specSupplier.get());
             if (persistence) {
-                String modId = extractModId(name);
-                String cacheName = extractCacheName(name);
+                String modId = persistenceModId == null || persistenceModId.isBlank()
+                    ? extractModId(name)
+                    : persistenceModId;
+                String cacheName = persistenceCacheName == null || persistenceCacheName.isBlank()
+                    ? extractCacheName(name)
+                    : persistenceCacheName;
                 cache = new PersistentCache<>(cache, modId, cacheName, compression);
             }
             return cache;
         });
+    }
+
+    public static long estimatedEntryBytes() {
+        return ESTIMATED_ENTRY_BYTES;
     }
 
     private static String extractModId(String fullName) {

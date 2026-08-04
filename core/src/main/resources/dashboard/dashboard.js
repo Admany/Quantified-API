@@ -2047,7 +2047,7 @@ const App = () => {
         html`<section className="view logs-view">
             <div className="view-head">
                 <h2>Timeline & Logs</h2>
-                <p>Recent events and API runtime logs.</p>
+                <p>Recent events and Quantified runtime logs.</p>
             </div>
             <div className="tab-kpi-row">
                 <div className="tab-kpi"><span>Timeline events</span><strong>${formatNumber(timelineEvents.length)}</strong></div>
@@ -2057,7 +2057,7 @@ const App = () => {
             </div>
             <div className="tab-layout logs-layout">
                 <${Card}
-                    title="API Log"
+                    title="Quantified Runtime Log"
                     actions=${html`<button className="btn btn-ghost" onClick=${downloadHistory}>Download History</button>`}
                 >
                     <div className="log-window api-log wide-log">

@@ -106,10 +106,10 @@ public final class TaskSubmissionValidator {
                                                boolean threadSafe,
                                                AsyncMetrics metrics,
                                                Logger logger) {
-        if (type.requiresThreadSafe() && !threadSafe) {
-            metrics.recordThreadSafetyViolation();
-            String message = "Task " + computation.description() + " declared non-thread-safe but type " + type + " requires thread safety";
-            logger.log(Level.SEVERE, message + " (key=" + taskKey + ")");
+        if (type.requiresThreadSafe() && !threadSafe && logger.isLoggable(Level.FINER)) {
+            logger.log(Level.FINER,
+                "Task {0} declared non-thread-safe; AsyncManager will route it directly to the installed main-thread executor instead of a {1} worker lane",
+                new Object[]{taskKey, type});
         }
     }
 

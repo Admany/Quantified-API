@@ -52,6 +52,7 @@ public final class QuantifiedHandle {
     private final AtomicLong cacheMisses = new AtomicLong();
 
     final ConcurrentMap<String, ThreadSafeCache<String, Object>> caches = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, CompletableFuture<Object>> inFlightCacheLoads = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, CompletableFuture<java.util.UUID>> channels = new ConcurrentHashMap<>();
 
     QuantifiedHandle(String modId, String version, Supplier<NetworkManager> networkAccessor) {
@@ -275,19 +276,26 @@ public final class QuantifiedHandle {
             QuantifiedCoreRuntime.touchMod(modId);
             return cached;
         }
-        cacheMisses.incrementAndGet();
-        if (modMetrics != null) {
-            modMetrics.recordCacheMiss();
-        }
-        T computed = loader.get();
-        if (computed == null) {
-            QuantifiedCoreRuntime.touchMod(modId);
-            return null;
-        }
-        cache.put(key, computed);
-        if (modMetrics != null) {
-            modMetrics.recordCacheEntryAdded();
-            refreshModCacheTotals(modMetrics);
+        AtomicBoolean loaded = new AtomicBoolean(false);
+        @SuppressWarnings("unchecked")
+        T computed = (T) cache.get(key, ignored -> {
+            loaded.set(true);
+            return loader.get();
+        });
+        if (loaded.get()) {
+            cacheMisses.incrementAndGet();
+            if (modMetrics != null) {
+                modMetrics.recordCacheMiss();
+                if (computed != null) {
+                    modMetrics.recordCacheEntryAdded();
+                    refreshModCacheTotals(modMetrics);
+                }
+            }
+        } else {
+            cacheHits.incrementAndGet();
+            if (modMetrics != null) {
+                modMetrics.recordCacheHit();
+            }
         }
         QuantifiedCoreRuntime.touchMod(modId);
         return computed;
@@ -313,13 +321,24 @@ public final class QuantifiedHandle {
             return CompletableFuture.completedFuture(cached);
         }
 
+        String flightKey = cacheName + '\u0000' + key;
+        CompletableFuture<Object> ownerFuture = new CompletableFuture<>();
+        CompletableFuture<Object> existingFuture = inFlightCacheLoads.putIfAbsent(flightKey, ownerFuture);
+        if (existingFuture != null) {
+            return existingFuture.thenApply(result -> {
+                @SuppressWarnings("unchecked")
+                T shared = (T) result;
+                return shared;
+            });
+        }
+
         cacheMisses.incrementAndGet();
         if (modMetrics != null) {
             modMetrics.recordCacheMiss();
         }
 
-        long taskKey = ThreadLocalRandom.current().nextLong();
-        return AsyncManager.submitSync(
+        long taskKey = UNIQUE_TASK_SEQUENCE.getAndIncrement();
+        AsyncManager.submitSync(
             taskKey,
             PriorityTaskType.CACHE,
             PriorityTaskType.CACHE.defaultScore(),
@@ -340,10 +359,24 @@ public final class QuantifiedHandle {
             modId
         ).whenComplete((result, throwable) -> {
             QuantifiedCoreRuntime.touchMod(modId);
-            if (throwable == null && result != null && modMetrics != null) {
-                modMetrics.recordCacheEntryAdded();
-                refreshModCacheTotals(modMetrics);
+            try {
+                if (throwable == null) {
+                    ownerFuture.complete(result);
+                    if (result != null && modMetrics != null) {
+                        modMetrics.recordCacheEntryAdded();
+                        refreshModCacheTotals(modMetrics);
+                    }
+                } else {
+                    ownerFuture.completeExceptionally(throwable);
+                }
+            } finally {
+                inFlightCacheLoads.remove(flightKey, ownerFuture);
             }
+        });
+        return ownerFuture.thenApply(result -> {
+            @SuppressWarnings("unchecked")
+            T resolved = (T) result;
+            return resolved;
         });
     }
 
@@ -503,7 +536,7 @@ public final class QuantifiedHandle {
             Duration effectiveTtl = ttl == null || ttl.isNegative() || ttl.isZero()
                 ? DEFAULT_CACHE_TTL
                 : ttl;
-            return CacheManager.register(name, effectiveSize, effectiveTtl, refreshOnAccess, persistence, compression);
+            return CacheManager.register(name, effectiveSize, effectiveTtl, refreshOnAccess, persistence, compression, modId, cacheName);
         });
     }
 
@@ -559,7 +592,7 @@ public final class QuantifiedHandle {
         for (ThreadSafeCache<String, Object> cache : caches.values()) {
             totalEntries += cache.size();
         }
-        long totalBytes = totalEntries * 512L;
+        long totalBytes = totalEntries * CacheManager.estimatedEntryBytes();
         modMetrics.updateCacheStats(totalEntries, totalBytes);
     }
 
@@ -613,7 +646,7 @@ class ModCacheManagerImpl implements ModCacheManager {
     public long getTotalCacheSizeMB() {
         long totalBytes = 0;
         for (ThreadSafeCache<String, Object> cache : handle.caches.values()) {
-            totalBytes += cache.size() * 256; 
+            totalBytes += cache.size() * CacheManager.estimatedEntryBytes();
         }
         return totalBytes / (1024 * 1024);
     }
@@ -665,7 +698,7 @@ class ModCacheManagerImpl implements ModCacheManager {
     public long getCacheSizeMB(String cacheName) {
         ThreadSafeCache<String, Object> cache = getCache(cacheName);
         if (cache == null) return 0;
-        return (cache.size() * 256L) / (1024 * 1024); 
+        return (cache.size() * CacheManager.estimatedEntryBytes()) / (1024 * 1024);
     }
 
     @Override

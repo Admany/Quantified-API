@@ -106,6 +106,7 @@ final class OpenCLSubprocessProbe {
             }
             extractedEntries.add(destination);
         }
+        LwjglRuntimeTuning.extractIsolatedLinuxCoreNative(extractedEntries, bundleRoot);
         return new ExtractedProbeBundle(
             bundleRoot,
             String.join(File.pathSeparator, extractedEntries.stream().map(path -> path.toAbsolutePath().toString()).toList())

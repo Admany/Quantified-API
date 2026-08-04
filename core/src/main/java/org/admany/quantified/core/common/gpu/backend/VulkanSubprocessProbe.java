@@ -43,7 +43,12 @@ final class VulkanSubprocessProbe {
     private VulkanSubprocessProbe() {
     }
 
-    static Result run(Logger logger, int probeId) {
+    /**
+     * The probe extracts a fixed bundle path before launching its child JVM.
+     * On Windows a second extraction cannot replace a jar while the first child
+     * still has it mapped, so the full extract-launch-wait cycle must be shared.
+     */
+    static synchronized Result run(Logger logger, int probeId) {
         Objects.requireNonNull(logger, "logger");
         try {
             ExtractedProbeBundle probeBundle = extractProbeBundle();
@@ -120,6 +125,7 @@ final class VulkanSubprocessProbe {
             }
             extractedEntries.add(destination);
         }
+        LwjglRuntimeTuning.extractIsolatedLinuxCoreNative(extractedEntries, bundleRoot);
         String classpath = extractedEntries.stream()
             .map(path -> path.toAbsolutePath().toString())
             .reduce((left, right) -> left + File.pathSeparator + right)

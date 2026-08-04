@@ -5,7 +5,14 @@ import org.lwjgl.system.Configuration;
 import org.lwjgl.system.MemoryStack;
 
 import java.lang.reflect.Field;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.List;
+import java.util.Locale;
+import java.util.zip.ZipFile;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
@@ -207,5 +214,48 @@ public final class LwjglRuntimeTuning {
     public static void addIsolatedProbeNativeExtractPath(java.util.List<String> command, Path extractRoot) {
         Path nativesDir = extractRoot.resolve("natives");
         command.add("-Dorg.lwjgl.system.SharedLibraryExtractPath=" + nativesDir.toAbsolutePath());
+        // Some stripped dedicated-server launchers expose LWJGL classes but do
+        // not let the isolated JVM discover native jars on its classpath. The
+        // Linux probe explicitly extracts liblwjgl.so below, so give LWJGL its
+        // exact directory instead of relying on automatic jar scanning.
+        if (isLinux()) {
+            command.add("-Dorg.lwjgl.librarypath=" + nativesDir.toAbsolutePath());
+        }
+    }
+
+    /**
+     * Extracts the bundled LWJGL core native that an isolated Linux probe must
+     * load before it can reach Vulkan or OpenCL. This is deliberately scoped to
+     * probe subprocesses: Windows keeps Minecraft's parent-owned lwjgl.dll.
+     */
+    public static void extractIsolatedLinuxCoreNative(List<Path> extractedClasspath, Path extractRoot) throws IOException {
+        if (!isLinux()) {
+            return;
+        }
+        String architecture = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
+        String resource = architecture.contains("aarch64") || architecture.contains("arm64")
+            ? "linux/arm64/org/lwjgl/liblwjgl.so"
+            : "linux/x64/org/lwjgl/liblwjgl.so";
+        Path nativeJar = extractedClasspath.stream()
+            .filter(path -> path.getFileName().toString().startsWith("lwjgl-")
+                && path.getFileName().toString().contains("natives-linux")
+                && (resource.contains("arm64") == path.getFileName().toString().contains("arm64")))
+            .findFirst()
+            .orElseThrow(() -> new IOException("Embedded LWJGL Linux native jar is missing for " + resource));
+        Path target = extractRoot.resolve("natives").resolve("liblwjgl.so");
+        Files.createDirectories(target.getParent());
+        try (ZipFile archive = new ZipFile(nativeJar.toFile())) {
+            java.util.zip.ZipEntry entry = archive.getEntry(resource);
+            if (entry == null) {
+                throw new IOException("Embedded LWJGL native is missing: " + resource + " in " + nativeJar.getFileName());
+            }
+            try (InputStream input = archive.getInputStream(entry)) {
+                Files.copy(input, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+    }
+
+    private static boolean isLinux() {
+        return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("linux");
     }
 }

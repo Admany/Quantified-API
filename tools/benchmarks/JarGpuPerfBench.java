@@ -23,6 +23,9 @@ public final class JarGpuPerfBench {
     private static final int VECTOR_LENGTH = Integer.getInteger("quantified.gpubench.vectorLength", 262_144);
     private static final int MATRIX_SIZE = Integer.getInteger("quantified.gpubench.matrixSize", 256);
     private static final int MONTE_SAMPLES = Integer.getInteger("quantified.gpubench.samples", 250_000);
+    private static final boolean SKIP_OPENCL = Boolean.getBoolean("quantified.gpubench.skipOpencl");
+    private static final boolean ALLOW_SOFTWARE_VULKAN = Boolean.getBoolean("quantified.gpubench.allowSoftwareVulkan");
+    private static final boolean SKIP_RUNTIME_BOOTSTRAP = Boolean.getBoolean("quantified.gpubench.skipRuntimeBootstrap");
 
     private JarGpuPerfBench() {
     }
@@ -49,9 +52,11 @@ public final class JarGpuPerfBench {
                 harness.initialiseGlobals();
 
                 LinkedHashMap<String, ScenarioStats> stats = new LinkedHashMap<>();
-                stats.put("opencl_vector_add", measure(() -> harness.openClVectorAdd(), VECTOR_LENGTH));
-                stats.put("opencl_matrix_multiply", measure(() -> harness.openClMatrixMultiply(), MATRIX_SIZE * MATRIX_SIZE));
-                stats.put("opencl_monte_carlo_pi", measure(() -> harness.openClMonteCarlo(), MONTE_SAMPLES));
+                if (!SKIP_OPENCL) {
+                    stats.put("opencl_vector_add", measure(() -> harness.openClVectorAdd(), VECTOR_LENGTH));
+                    stats.put("opencl_matrix_multiply", measure(() -> harness.openClMatrixMultiply(), MATRIX_SIZE * MATRIX_SIZE));
+                    stats.put("opencl_monte_carlo_pi", measure(() -> harness.openClMonteCarlo(), MONTE_SAMPLES));
+                }
                 if (harness.vulkanAvailable()) {
                     stats.put("vulkan_vector_add", measure(() -> harness.vulkanVectorAdd(), VECTOR_LENGTH));
                     stats.put("vulkan_matrix_multiply", measure(() -> harness.vulkanMatrixMultiply(), MATRIX_SIZE * MATRIX_SIZE));
@@ -204,9 +209,11 @@ public final class JarGpuPerfBench {
         private final Method openClShutdownMethod;
         private final Method vulkanSetPreferredDeviceMethod;
         private final Method vulkanForceProbeMethod;
+        private final Method vulkanWarmupAsyncMethod;
         private final Method vulkanEnsureInitialisedMethod;
         private final Method vulkanListDevicesMethod;
         private final Method vulkanShutdownMethod;
+        private final Method vulkanRuntimeReprobeMethod;
         private final Method runtimeBootstrapMethod;
         private final Method runtimeShutdownMethod;
         private final Field configField;
@@ -228,11 +235,9 @@ public final class JarGpuPerfBench {
         private final AtomicLong taskSequence = new AtomicLong(10_000L);
 
         private GpuHarness(ClassLoader loader) throws Exception {
-            Class<?> quantifiedOpenClClass = Class.forName("org.admany.quantified.api.opencl.QuantifiedOpenCL", true, loader);
             Class<?> quantifiedVulkanClass = Class.forName("org.admany.quantified.api.vulkan.QuantifiedVulkan", true, loader);
-            Class<?> openClManagerClass = Class.forName("org.admany.quantified.core.common.opencl.core.OpenCLManager", true, loader);
-            Class<?> gpuDetectorClass = Class.forName("org.admany.quantified.core.common.opencl.gpu.GPUDetector", true, loader);
             Class<?> vulkanManagerClass = Class.forName("org.admany.quantified.core.common.vulkan.core.VulkanManager", true, loader);
+            Class<?> vulkanRuntimeClass = Class.forName("org.admany.quantified.core.common.gpu.backend.VulkanRuntime", true, loader);
             Class<?> configClass = Class.forName("org.admany.quantified.core.common.config.MultithreadingConfig", true, loader);
             Class<?> configEntryClass = Class.forName("org.admany.quantified.core.common.config.MultithreadingConfig$Config", true, loader);
             Class<?> lwjglRuntimeTuningClass = Class.forName("org.admany.quantified.core.common.util.LwjglRuntimeTuning", true, loader);
@@ -241,12 +246,29 @@ public final class JarGpuPerfBench {
             Class<?> loggerClass = Class.forName("org.slf4j.Logger", true, loader);
             Class<?> loggerFactoryClass = Class.forName("org.slf4j.LoggerFactory", true, loader);
 
-            openClVectorAddMethod = quantifiedOpenClClass.getMethod("parallelVectorAdd",
-                String.class, String.class, long.class, float[].class, float[].class);
-            openClMatrixMultiplyMethod = quantifiedOpenClClass.getMethod("parallelMatrixMultiply",
-                String.class, String.class, long.class, float[][].class, float[][].class);
-            openClMonteCarloMethod = quantifiedOpenClClass.getMethod("parallelMonteCarloPi",
-                String.class, String.class, long.class, int.class);
+            if (SKIP_OPENCL) {
+                openClVectorAddMethod = null;
+                openClMatrixMultiplyMethod = null;
+                openClMonteCarloMethod = null;
+                openClInitializeMethod = null;
+                openClProbeMethod = null;
+                openClListDevicesMethod = null;
+                openClShutdownMethod = null;
+            } else {
+                Class<?> quantifiedOpenClClass = Class.forName("org.admany.quantified.api.opencl.QuantifiedOpenCL", true, loader);
+                Class<?> openClManagerClass = Class.forName("org.admany.quantified.core.common.opencl.core.OpenCLManager", true, loader);
+                Class<?> gpuDetectorClass = Class.forName("org.admany.quantified.core.common.opencl.gpu.GPUDetector", true, loader);
+                openClVectorAddMethod = quantifiedOpenClClass.getMethod("parallelVectorAdd",
+                    String.class, String.class, long.class, float[].class, float[].class);
+                openClMatrixMultiplyMethod = quantifiedOpenClClass.getMethod("parallelMatrixMultiply",
+                    String.class, String.class, long.class, float[][].class, float[][].class);
+                openClMonteCarloMethod = quantifiedOpenClClass.getMethod("parallelMonteCarloPi",
+                    String.class, String.class, long.class, int.class);
+                openClInitializeMethod = openClManagerClass.getMethod("initialize");
+                openClProbeMethod = openClManagerClass.getMethod("forceProbeSynchronous");
+                openClListDevicesMethod = gpuDetectorClass.getMethod("listDevices");
+                openClShutdownMethod = openClManagerClass.getMethod("shutdown");
+            }
 
             vulkanVectorAddMethod = quantifiedVulkanClass.getMethod("parallelVectorAdd",
                 String.class, String.class, long.class, float[].class, float[].class);
@@ -255,18 +277,26 @@ public final class JarGpuPerfBench {
             vulkanMonteCarloMethod = quantifiedVulkanClass.getMethod("parallelMonteCarloPi",
                 String.class, String.class, long.class, int.class);
 
-            openClInitializeMethod = openClManagerClass.getMethod("initialize");
-            openClProbeMethod = openClManagerClass.getMethod("forceProbeSynchronous");
-            openClListDevicesMethod = gpuDetectorClass.getMethod("listDevices");
-            openClShutdownMethod = openClManagerClass.getMethod("shutdown");
-
             vulkanSetPreferredDeviceMethod = vulkanManagerClass.getMethod("setPreferredDevice", String.class);
             vulkanForceProbeMethod = vulkanManagerClass.getMethod("forceProbeSynchronous");
+            vulkanWarmupAsyncMethod = vulkanManagerClass.getMethod("warmupAsync", String.class);
             vulkanEnsureInitialisedMethod = vulkanManagerClass.getMethod("ensureInitialised");
             vulkanListDevicesMethod = vulkanManagerClass.getMethod("listDevices");
             vulkanShutdownMethod = vulkanManagerClass.getMethod("shutdown");
+            vulkanRuntimeReprobeMethod = vulkanRuntimeClass.getMethod("reprobe");
 
-            lwjglEnsureConfiguredMethod = lwjglRuntimeTuningClass.getMethod("ensureConfigured");
+            // A dedicated server can have no parent LWJGL at all: the isolated
+            // runtime owns its bundled LWJGL classes and natives. Do not inspect
+            // LwjglRuntimeTuning in that scenario; reflection resolves every
+            // public signature on the class, including MemoryStack, which would
+            // create a false parent-classpath dependency in this benchmark.
+            Method ensureConfigured;
+            try {
+                ensureConfigured = lwjglRuntimeTuningClass.getMethod("ensureConfigured");
+            } catch (LinkageError noParentLwjgl) {
+                ensureConfigured = null;
+            }
+            lwjglEnsureConfiguredMethod = ensureConfigured;
             runtimeBootstrapMethod = runtimeClass.getMethod("bootstrap", loggerClass, platformPathsClass);
             Method shutdownMethod;
             try {
@@ -289,7 +319,9 @@ public final class JarGpuPerfBench {
             runtimeRoot.toFile().mkdirs();
             Object platformPaths = platformPathsClass.getConstructor(Path.class, Path.class)
                 .newInstance(runtimeRoot, runtimeRoot.resolve("config"));
-            runtimeBootstrapMethod.invoke(null, logger, platformPaths);
+            if (!SKIP_RUNTIME_BOOTSTRAP) {
+                runtimeBootstrapMethod.invoke(null, logger, platformPaths);
+            }
 
             vectorA = createVector(VECTOR_LENGTH, 0.25f, 0.003f);
             vectorB = createVector(VECTOR_LENGTH, -0.15f, 0.005f);
@@ -298,12 +330,19 @@ public final class JarGpuPerfBench {
         }
 
         private void initialiseGlobals() throws Exception {
-            lwjglEnsureConfiguredMethod.invoke(null);
+            if (lwjglEnsureConfiguredMethod != null) {
+                lwjglEnsureConfiguredMethod.invoke(null);
+            }
             enableGpuAccelerationField.setBoolean(configObject, true);
-            preferredGpuBackendField.set(configObject, "OPENCL");
+            // Keep Vulkan eligible while the harness explicitly exercises both APIs.
+            // Selecting OPENCL here can suppress the Vulkan lifecycle before its
+            // direct API scenarios have a chance to initialise.
+            preferredGpuBackendField.set(configObject, "VULKAN_PREFERRED");
             configField.set(null, configObject);
 
-            selectOpenClDevice();
+            if (!SKIP_OPENCL) {
+                selectOpenClDevice();
+            }
             try {
                 selectVulkanDevice();
             } catch (Exception exception) {
@@ -333,10 +372,17 @@ public final class JarGpuPerfBench {
         }
 
         private void selectVulkanDevice() throws Exception {
+            // listDevices reads the cached probe snapshot. Populate it first so a
+            // freshly bootstrapped benchmark does not mistakenly report no GPU.
+            vulkanRuntimeReprobeMethod.invoke(null);
+            boolean probeReady = (Boolean) vulkanForceProbeMethod.invoke(null);
+            if (!probeReady) {
+                throw new IllegalStateException("Vulkan probe failed before device selection");
+            }
             @SuppressWarnings("unchecked")
             List<Object> devices = (List<Object>) vulkanListDevicesMethod.invoke(null);
             Object selected = devices.stream()
-                .filter(device -> !bool(device, "softwareAdapter"))
+                .filter(device -> ALLOW_SOFTWARE_VULKAN || !bool(device, "softwareAdapter"))
                 .filter(device -> !Objects.toString(invoke(device, "name"), "").startsWith("Microsoft ("))
                 .sorted(Comparator.comparing(device -> scoreVulkanDevice(device)).reversed())
                 .findFirst()
@@ -347,9 +393,16 @@ public final class JarGpuPerfBench {
             vulkanDeviceName = Objects.toString(invoke(selected, "name"), "Unavailable");
             vulkanDeviceIdField.set(configObject, invoke(selected, "id"));
             vulkanSetPreferredDeviceMethod.invoke(null, vulkanDeviceName);
-            boolean probeReady = (Boolean) vulkanForceProbeMethod.invoke(null);
-            boolean runtimeReady = (Boolean) vulkanEnsureInitialisedMethod.invoke(null);
-            if (!probeReady || !runtimeReady) {
+            // Changing the device intentionally shuts down the previous runtime. Requeue
+            // the cached probe and await its large-stack warmup before executing kernels.
+            if (!((Boolean) vulkanForceProbeMethod.invoke(null))) {
+                throw new IllegalStateException("Vulkan probe failed after selecting " + vulkanDeviceName);
+            }
+            @SuppressWarnings("unchecked")
+            CompletableFuture<Boolean> warmup = (CompletableFuture<Boolean>) vulkanWarmupAsyncMethod
+                .invoke(null, "jar-gpu-benchmark-device-selection");
+            boolean runtimeReady = warmup.get() && (Boolean) vulkanEnsureInitialisedMethod.invoke(null);
+            if (!runtimeReady) {
                 throw new IllegalStateException("Vulkan initialisation failed for " + vulkanDeviceName);
             }
         }
@@ -407,7 +460,7 @@ public final class JarGpuPerfBench {
         }
 
         private void shutdown() {
-            if (runtimeShutdownMethod == null) {
+            if (runtimeShutdownMethod == null || SKIP_RUNTIME_BOOTSTRAP) {
                 return;
             }
             try {
@@ -426,7 +479,11 @@ public final class JarGpuPerfBench {
             String name = Objects.toString(invoke(device, "name"), "").toLowerCase(Locale.ROOT);
             long vram = ((Number) invoke(device, "vramBytes")).longValue();
             int units = ((Number) invoke(device, "computeUnits")).intValue();
-            double vendorScore = vendor.contains("nvidia") ? 1_000_000d : (vendor.contains("amd") ? 500_000d : 100_000d);
+            // A shared-memory iGPU can report a larger addressable memory figure than a
+            // discrete adapter. Keep the benchmark representative by preferring the
+            // discrete compute vendor before comparing its dedicated-memory capacity.
+            double vendorScore = vendor.contains("nvidia") ? 10_000_000_000d
+                : (vendor.contains("amd") ? 5_000_000_000d : 100_000d);
             double namePenalty = name.startsWith("microsoft (") ? -10_000_000d : 0d;
             return vendorScore + vram + units * 1000d + namePenalty;
         }
@@ -435,7 +492,10 @@ public final class JarGpuPerfBench {
             String vendor = Objects.toString(invoke(device, "vendor"), "").toLowerCase(Locale.ROOT);
             long memory = ((Number) invoke(device, "localMemoryBytes")).longValue();
             int deviceType = ((Number) invoke(device, "deviceType")).intValue();
-            double vendorScore = vendor.contains("nvidia") ? 1_000_000d : (vendor.contains("amd") ? 500_000d : 100_000d);
+            // See scoreOpenClDevice: do not let an iGPU's shared-memory report outrank
+            // a real discrete GPU during a hardware acceleration benchmark.
+            double vendorScore = vendor.contains("nvidia") ? 10_000_000_000d
+                : (vendor.contains("amd") ? 5_000_000_000d : 100_000d);
             return vendorScore + memory + deviceType * 1000d;
         }
 
