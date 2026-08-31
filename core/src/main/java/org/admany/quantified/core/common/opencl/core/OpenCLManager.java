@@ -81,7 +81,7 @@ public final class OpenCLManager {
         if (!initialized.compareAndSet(false, true)) {
             LOGGER.fine("OpenCL acceleration already initialized");
             DeveloperOverlayManager.recordApiLog("[OpenCL] Already initialized");
-            if (isAvailable()) {
+            if (hasExecutableRuntime()) {
                 lastRuntimeStatus = RuntimeStatus.available();
                 notifyAvailabilityListeners();
             }
@@ -106,6 +106,23 @@ public final class OpenCLManager {
 
     public static boolean hasExecutableRuntime() {
         return isAvailable() || OpenCLIsolatedExecutor.canExecute();
+    }
+
+    /** Returns the best device name available to diagnostics, including the isolated runtime. */
+    public static String executableDeviceName() {
+        GPUMonitor currentMonitor = monitor;
+        if (currentMonitor != null) {
+            GPUMonitor.GPUStatus status = currentMonitor.getStatus();
+            if (status != null && status.deviceName() != null && !status.deviceName().isBlank()) {
+                return status.deviceName();
+            }
+        }
+        OpenCLRuntime.ProbeSnapshot probe = OpenCLRuntime.cachedProbeSnapshot();
+        if (probe != null && !probe.devices().isEmpty()) {
+            String name = probe.devices().get(0).name();
+            return name == null ? "" : name;
+        }
+        return "";
     }
 
     public static void registerAvailabilityListener(Runnable listener) {
@@ -405,7 +422,7 @@ public final class OpenCLManager {
     }
 
     public static RuntimeStatus runtimeStatus() {
-        return isAvailable() ? RuntimeStatus.available() : lastRuntimeStatus;
+        return hasExecutableRuntime() ? RuntimeStatus.available() : lastRuntimeStatus;
     }
 
     public static <T> CompletableFuture<T> submitTask(OpenCLTask<T> task) {
@@ -484,7 +501,7 @@ public final class OpenCLManager {
     }
 
     private static void notifyAvailabilityListeners() {
-        if (!isAvailable()) {
+        if (!hasExecutableRuntime()) {
             return;
         }
         if (!availabilityAnnounced.compareAndSet(false, true)) {

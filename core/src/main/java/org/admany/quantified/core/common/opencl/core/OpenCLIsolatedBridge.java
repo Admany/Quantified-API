@@ -8,15 +8,24 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
+import org.lwjgl.system.Configuration;
 
 public final class OpenCLIsolatedBridge {
+
+    private static final String ISOLATED_EXTRACT_PATH_PROPERTY = "quantified.opencl.isolated.extractPath";
 
     private static final Object LOCK = new Object();
     private static volatile OpenCLContext context;
     private static volatile GPUDetector.GPUCapabilities capabilities;
     private static final AtomicReference<String> FAILURE_REASON = new AtomicReference<>();
+
+    static {
+        configureIsolatedLwjgl();
+    }
 
     private OpenCLIsolatedBridge() {
     }
@@ -51,6 +60,19 @@ public final class OpenCLIsolatedBridge {
         return execute.invoke(workload, proxy);
     }
 
+    public static Object[] executeApiTasks(java.util.List<?> parentApiTasks) {
+        Objects.requireNonNull(parentApiTasks, "parentApiTasks");
+        Object[] results = new Object[parentApiTasks.size()];
+        for (int index = 0; index < parentApiTasks.size(); index++) {
+            try {
+                results[index] = executeApiTask(parentApiTasks.get(index));
+            } catch (Throwable throwable) {
+                results[index] = throwable;
+            }
+        }
+        return results;
+    }
+
     private static OpenCLContext ensureContext() {
         OpenCLLinuxLoaderCompatibility.configureBeforeLwjglOpenCl();
         OpenCLContext existing = context;
@@ -71,6 +93,23 @@ public final class OpenCLIsolatedBridge {
             capabilities = detected;
             context = created;
             return created;
+        }
+    }
+
+    private static void configureIsolatedLwjgl() {
+        String extractPath = System.getProperty(ISOLATED_EXTRACT_PATH_PROPERTY);
+        if (extractPath == null || extractPath.isBlank()) {
+            return;
+        }
+        try {
+            Path path = Path.of(extractPath).toAbsolutePath();
+            Files.createDirectories(path);
+            // These settings belong to the child class loader's LWJGL
+            // Configuration instance. The parent game's native path is left
+            // untouched, so the two runtimes cannot claim the same library.
+            Configuration.SHARED_LIBRARY_EXTRACT_PATH.set(path.toString());
+        } catch (Throwable throwable) {
+            FAILURE_REASON.set("Unable to configure isolated LWJGL path: " + describeFailure(throwable));
         }
     }
 
@@ -107,6 +146,10 @@ public final class OpenCLIsolatedBridge {
             }
             Class<?> parameter = method.getParameterTypes()[0];
             if (parameter.isAssignableFrom(contextType) || contextType.isAssignableFrom(parameter)) {
+                if (!method.trySetAccessible()) {
+                    throw new IllegalStateException("OpenCL workload execute(Context) is not accessible on "
+                        + workloadClass.getName());
+                }
                 return method;
             }
         }

@@ -85,7 +85,7 @@ public final class QuantifiedOpenCL {
     }
 
     public static boolean isGpuReady() {
-        return isCoreAvailable() && OpenCLManager.isAvailable();
+        return isCoreAvailable() && OpenCLManager.hasExecutableRuntime();
     }
 
     private static boolean isCoreAvailable() {

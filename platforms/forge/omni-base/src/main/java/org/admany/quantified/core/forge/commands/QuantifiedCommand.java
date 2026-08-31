@@ -310,7 +310,7 @@ public final class QuantifiedCommand {
             sendWarn(context.getSource(), "Vulkan reason: " + fallbackReason(vulkanFailureReason));
         }
 
-        if (OpenCLManager.isAvailable()) {
+        if (OpenCLManager.hasExecutableRuntime()) {
             sendSuccess(context.getSource(), "OpenCL: Available");
             var status = OpenCLManager.getGPUStatus();
             if (status != null) {
@@ -324,7 +324,13 @@ public final class QuantifiedCommand {
                     "OpenCL cache: %d/%d MB (%.1f%%) | System VRAM: %.1f%% | Compute: %.1f%% | Temp: %.1fC",
                     cacheUsedMb, cacheBudgetMb, vramUsage, systemUsage, computeUsage, temperature));
             } else {
-                sendWarn(context.getSource(), "OpenCL monitoring: Unavailable");
+                OpenCLRuntime.ProbeDeviceInfo device = openclProbeSnapshot.devices().isEmpty()
+                    ? null : openclProbeSnapshot.devices().get(0);
+                sendInfo(context.getSource(), "OpenCL runtime: Isolated bundled runtime");
+                if (device != null) {
+                    sendInfo(context.getSource(), "OpenCL device: " + device.name() + " | Vendor: " + device.vendor()
+                        + " | Type: " + device.type());
+                }
             }
         } else if (!openclProbeSnapshot.devices().isEmpty()) {
             OpenCLRuntime.ProbeDeviceInfo device = openclProbeSnapshot.devices().get(0);

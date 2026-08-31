@@ -206,8 +206,8 @@ public final class DeveloperOverlayManager {
             }
             boolean openclRuntimeAvailable = OpenCLManager.hasExecutableRuntime();
             boolean vulkanRuntimeAvailable = VulkanExecutionSupport.hasExecutableRuntime();
-            boolean gpuAvailable = (gpuStatusPresent && openclRuntimeAvailable) || vulkanRuntimeAvailable;
-            String deviceName = gpuStatusPresent ? gpuStatus.deviceName() : "";
+            boolean gpuAvailable = openclRuntimeAvailable || vulkanRuntimeAvailable;
+            String deviceName = gpuStatusPresent ? gpuStatus.deviceName() : OpenCLManager.executableDeviceName();
             if ((deviceName == null || deviceName.isBlank()) && vulkanRuntimeAvailable) {
                 deviceName = VulkanExecutionSupport.deviceName();
             }

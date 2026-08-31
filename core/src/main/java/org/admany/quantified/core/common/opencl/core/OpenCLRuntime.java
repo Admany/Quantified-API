@@ -12,6 +12,8 @@ public final class OpenCLRuntime {
 
     private static final Logger LOGGER = Logger.getLogger(OpenCLRuntime.class.getName());
     private static final AtomicBoolean INITIALISED = new AtomicBoolean(false);
+    private static final Object INITIALISE_LOCK = new Object();
+    private static final AtomicReference<String> IN_PROCESS_FAILURE = new AtomicReference<>(null);
     private static final AtomicReference<String> LAST_ERROR = new AtomicReference<>(null);
     private static final AtomicReference<Binding> BINDING = new AtomicReference<>(Binding.UNKNOWN);
     private static final AtomicReference<Boolean> PROBE_RUNTIME_PRESENT = new AtomicReference<>(null);
@@ -29,54 +31,69 @@ public final class OpenCLRuntime {
         if (INITIALISED.get()) {
             return true;
         }
-        try {
-            OpenCLLinuxLoaderCompatibility.configureBeforeLwjglOpenCl();
-            Binding b = BINDING.get();
-            if (b == Binding.UNKNOWN) {
-                b = probeBinding();
-                BINDING.set(b);
-            }
-
-            if (b == Binding.LWJGL) {
-                LOGGER.fine("Attempting to initialize LWJGL OpenCL runtime");
-                try {
-                    invokeLWJGLCreate();
-                } catch (Throwable t) {
-                    String message = t.getMessage() != null ? t.getMessage() : t.getClass().getName();
-                    LAST_ERROR.set(message);
-                    LOGGER.warning("OpenCL runtime unavailable (LWJGL): " + message);
-                    GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", true, embeddedProbePresent(), false,
-                        failureDetail(t), List.of());
-                    // Dedicated servers (or mismatched LWJGL runtimes) may not ship the required org.lwjgl classes.
-                    // Don't spam full stack traces for a known "binding missing" condition.
-                    if (!isMissingLwjgl(t)) {
-                        LOGGER.log(Level.INFO, "Full OpenCL init failure", t);
-                    }
-                    return false;
-                }
-                INITIALISED.set(true);
-                LAST_ERROR.set(null);
-                LOGGER.info("OpenCL runtime initialised via LWJGL");
-                GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", true, embeddedProbePresent(), true,
-                    null, List.of());
+        if (IN_PROCESS_FAILURE.get() != null) {
+            return false;
+        }
+        synchronized (INITIALISE_LOCK) {
+            if (INITIALISED.get()) {
                 return true;
-            } else {
-                LAST_ERROR.set("No Java OpenCL binding found (org.lwjgl.opencl)");
-                LOGGER.warning("OpenCL runtime unavailable: No Java binding found");
-                GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", false, embeddedProbePresent(), false,
-                    LAST_ERROR.get(), List.of());
+            }
+            if (IN_PROCESS_FAILURE.get() != null) {
                 return false;
             }
-        } catch (Throwable throwable) {
-            String message = throwable.getMessage() != null ? throwable.getMessage() : throwable.getClass().getName();
-            LAST_ERROR.set(message);
-            LOGGER.warning("OpenCL runtime unavailable: " + message);
-            GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", BINDING.get() == Binding.LWJGL,
-                embeddedProbePresent(), false, failureDetail(throwable), List.of());
-            if (!isMissingLwjgl(throwable)) {
-                LOGGER.log(Level.INFO, "Full OpenCL init failure", throwable);
+            try {
+                OpenCLLinuxLoaderCompatibility.configureBeforeLwjglOpenCl();
+                Binding b = BINDING.get();
+                if (b == Binding.UNKNOWN) {
+                    b = probeBinding();
+                    BINDING.set(b);
+                }
+
+                if (b == Binding.LWJGL) {
+                    LOGGER.fine("Attempting to initialize LWJGL OpenCL runtime");
+                    try {
+                        invokeLWJGLCreate();
+                    } catch (Throwable t) {
+                        String message = t.getMessage() != null ? t.getMessage() : t.getClass().getName();
+                        LAST_ERROR.set(message);
+                        if (isTerminalNativeFailure(t)) {
+                            IN_PROCESS_FAILURE.compareAndSet(null, failureDetail(t));
+                        }
+                        LOGGER.warning("OpenCL runtime unavailable (LWJGL): " + message);
+                        GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", true, embeddedProbePresent(), false,
+                            failureDetail(t), List.of());
+                        if (!isMissingLwjgl(t)) {
+                            LOGGER.log(Level.INFO, "Full OpenCL init failure", t);
+                        }
+                        return false;
+                    }
+                    INITIALISED.set(true);
+                    LAST_ERROR.set(null);
+                    LOGGER.info("OpenCL runtime initialised via LWJGL");
+                    GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", true, embeddedProbePresent(), true,
+                        null, List.of());
+                    return true;
+                } else {
+                    LAST_ERROR.set("No Java OpenCL binding found (org.lwjgl.opencl)");
+                    LOGGER.warning("OpenCL runtime unavailable: No Java binding found");
+                    GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", false, embeddedProbePresent(), false,
+                        LAST_ERROR.get(), List.of());
+                    return false;
+                }
+            } catch (Throwable throwable) {
+                String message = throwable.getMessage() != null ? throwable.getMessage() : throwable.getClass().getName();
+                LAST_ERROR.set(message);
+                if (isTerminalNativeFailure(throwable)) {
+                    IN_PROCESS_FAILURE.compareAndSet(null, failureDetail(throwable));
+                }
+                LOGGER.warning("OpenCL runtime unavailable: " + message);
+                GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", BINDING.get() == Binding.LWJGL,
+                    embeddedProbePresent(), false, failureDetail(throwable), List.of());
+                if (!isMissingLwjgl(throwable)) {
+                    LOGGER.log(Level.INFO, "Full OpenCL init failure", throwable);
+                }
+                return false;
             }
-            return false;
         }
     }
 
@@ -95,7 +112,7 @@ public final class OpenCLRuntime {
 
     public static AvailabilitySnapshot snapshot() {
         boolean available = ensureInitialised();
-        return new AvailabilitySnapshot(available, available ? null : LAST_ERROR.get());
+        return new AvailabilitySnapshot(available, available ? null : lastError());
     }
 
     public static boolean hasBindings() {
@@ -161,7 +178,8 @@ public final class OpenCLRuntime {
     }
 
     public static String lastError() {
-        return LAST_ERROR.get();
+        String terminal = IN_PROCESS_FAILURE.get();
+        return terminal != null ? terminal : LAST_ERROR.get();
     }
 
     public static boolean isInitialised() {
@@ -209,6 +227,24 @@ public final class OpenCLRuntime {
                 }
             }
             cur = cur.getCause();
+        }
+        return false;
+    }
+
+    private static boolean isTerminalNativeFailure(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof UnsatisfiedLinkError
+                || current instanceof ExceptionInInitializerError
+                || current instanceof NoClassDefFoundError) {
+                return true;
+            }
+            String message = current.getMessage();
+            if (message != null && (message.contains("already loaded in another classloader")
+                || message.contains("Could not initialize class org.lwjgl.opencl.CL"))) {
+                return true;
+            }
+            current = current.getCause();
         }
         return false;
     }

@@ -17,8 +17,17 @@ import java.util.Enumeration;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.GZIPInputStream;
+import org.admany.quantified.core.common.util.LwjglRuntimeTuning;
 
 public final class OpenCLIsolatedExecutor {
 
@@ -26,41 +35,80 @@ public final class OpenCLIsolatedExecutor {
     private static final String PROBE_INDEX_RESOURCE = PROBE_ROOT_RESOURCE + "/classpath.index";
     private static final String PROBE_RESOURCE_SUFFIX = ".bin";
     private static final String BRIDGE_CLASS = "org.admany.quantified.core.common.opencl.core.OpenCLIsolatedBridge";
+    private static final long EXECUTION_FAILURE_COOLDOWN_MS = 300_000L;
+    private static final String EXTRACT_PATH_PROPERTY = "quantified.opencl.isolated.extractPath";
     private static final AtomicReference<BridgeHandle> HANDLE = new AtomicReference<>();
-    private static final AtomicReference<Boolean> RUNTIME_READY = new AtomicReference<>(false);
+    private static final AtomicReference<CompletableFuture<Boolean>> WARMUP = new AtomicReference<>();
+    private static final AtomicBoolean RUNTIME_READY = new AtomicBoolean(false);
+    private static final AtomicLong DISABLED_UNTIL_MS = new AtomicLong();
     private static final AtomicReference<String> FAILURE_REASON = new AtomicReference<>();
+    private static final ThreadLocal<Boolean> ON_RUNTIME_THREAD = ThreadLocal.withInitial(() -> false);
+    private static final ExecutorService RUNTIME_EXECUTOR = Executors.newSingleThreadExecutor(runnable ->
+        LwjglRuntimeTuning.newDaemonThread(runnable, "Quantified-OpenCL-Isolated", LwjglRuntimeTuning.gpuThreadStackSizeKb()));
 
     private OpenCLIsolatedExecutor() {
     }
 
     public static boolean canExecute() {
-        return Boolean.TRUE.equals(RUNTIME_READY.get());
+        return RUNTIME_READY.get() && !isCoolingDown();
     }
 
     public static boolean warmup() {
-        if (canExecute()) {
-            return true;
-        }
-        OpenCLRuntime.ProbeSnapshot snapshot = OpenCLRuntime.cachedProbeSnapshot();
-        if (snapshot == null || !snapshot.success() || snapshot.devices().isEmpty()) {
-            FAILURE_REASON.set(snapshot != null ? snapshot.failureReason() : "OpenCL probe has not succeeded");
-            return false;
-        }
         try {
-            BridgeHandle handle = handle();
-            boolean available = Boolean.TRUE.equals(handle.isAvailable().invoke(null));
-            if (available) {
-                RUNTIME_READY.set(true);
-                FAILURE_REASON.set(null);
-                return true;
-            }
-            Object reason = handle.failureReason().invoke(null);
-            FAILURE_REASON.set(reason == null ? "Isolated OpenCL context creation failed" : String.valueOf(reason));
+            return warmupAsync().get(30, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            FAILURE_REASON.set("OpenCL isolated runtime warmup interrupted");
             return false;
         } catch (Throwable throwable) {
             FAILURE_REASON.set(describeFailure(throwable));
             return false;
         }
+    }
+
+    public static CompletableFuture<Boolean> warmupAsync() {
+        if (canExecute()) {
+            return CompletableFuture.completedFuture(true);
+        }
+        if (isCoolingDown()) {
+            return CompletableFuture.completedFuture(false);
+        }
+        OpenCLRuntime.ProbeSnapshot snapshot = OpenCLRuntime.cachedProbeSnapshot();
+        if (snapshot == null || !snapshot.success() || snapshot.devices().isEmpty()) {
+            FAILURE_REASON.set(snapshot != null ? snapshot.failureReason() : "OpenCL probe has not succeeded");
+            return CompletableFuture.completedFuture(false);
+        }
+        CompletableFuture<Boolean> current = WARMUP.get();
+        if (current != null && !current.isDone()) {
+            return current;
+        }
+        CompletableFuture<Boolean> created = new CompletableFuture<>();
+        if (!WARMUP.compareAndSet(current, created)) {
+            return WARMUP.get();
+        }
+        RUNTIME_EXECUTOR.execute(() -> {
+            ON_RUNTIME_THREAD.set(true);
+            try {
+                BridgeHandle bridge = handle();
+                boolean available = Boolean.TRUE.equals(bridge.isAvailable().invoke(null));
+                if (!available) {
+                    Object reason = bridge.failureReason().invoke(null);
+                    throw new IllegalStateException(reason == null
+                        ? "Isolated OpenCL context creation failed"
+                        : String.valueOf(reason));
+                }
+                RUNTIME_READY.set(true);
+                DISABLED_UNTIL_MS.set(0L);
+                FAILURE_REASON.set(null);
+                created.complete(true);
+            } catch (Throwable throwable) {
+                recordFailure(throwable);
+                created.complete(false);
+            } finally {
+                ON_RUNTIME_THREAD.remove();
+            }
+        });
+        return created;
     }
 
     public static String failureReason() {
@@ -70,13 +118,61 @@ public final class OpenCLIsolatedExecutor {
     @SuppressWarnings("unchecked")
     public static <T> T executeApiTask(QuantifiedOpenCL.ApiOpenClTask<T> apiTask) {
         try {
-            BridgeHandle handle = handle();
-            return (T) handle.executeApiTask().invoke(null, apiTask);
+            return runOnRuntimeThread(() -> {
+                if (!canExecute()) {
+                    throw new IllegalStateException("Isolated OpenCL runtime is unavailable: " + failureReason());
+                }
+                BridgeHandle handle = handle();
+                T result = (T) handle.executeApiTask().invoke(null, apiTask);
+                RUNTIME_READY.set(true);
+                return result;
+            });
         } catch (RuntimeException runtimeException) {
+            recordExecutionFailure(runtimeException);
             throw runtimeException;
         } catch (Throwable throwable) {
+            recordExecutionFailure(throwable);
             throw new RuntimeException("Isolated OpenCL execution failed", throwable);
         }
+    }
+
+    public static Object[] executeApiTasks(List<? extends QuantifiedOpenCL.ApiOpenClTask<?>> apiTasks) {
+        try {
+            return runOnRuntimeThread(() -> {
+                if (!canExecute()) {
+                    throw new IllegalStateException("Isolated OpenCL runtime is unavailable: " + failureReason());
+                }
+                return (Object[]) handle().executeApiTasks().invoke(null, apiTasks);
+            });
+        } catch (RuntimeException runtimeException) {
+            recordExecutionFailure(runtimeException);
+            throw runtimeException;
+        } catch (Throwable throwable) {
+            recordExecutionFailure(throwable);
+            throw new RuntimeException("Isolated OpenCL batch execution failed", throwable);
+        }
+    }
+
+    public static <T> CompletableFuture<T> executeApiTaskAsync(QuantifiedOpenCL.ApiOpenClTask<T> apiTask) {
+        CompletableFuture<T> result = new CompletableFuture<>();
+        RUNTIME_EXECUTOR.execute(() -> {
+            ON_RUNTIME_THREAD.set(true);
+            try {
+                if (!canExecute()) {
+                    throw new IllegalStateException("Isolated OpenCL runtime is unavailable: " + failureReason());
+                }
+                @SuppressWarnings("unchecked")
+                T value = (T) handle().executeApiTask().invoke(null, apiTask);
+                RUNTIME_READY.set(true);
+                result.complete(value);
+            } catch (Throwable throwable) {
+                recordExecutionFailure(throwable);
+                result.completeExceptionally(throwable);
+            } finally {
+                ON_RUNTIME_THREAD.remove();
+            }
+        });
+        return result;
     }
 
     private static BridgeHandle handle() throws Exception {
@@ -91,9 +187,40 @@ public final class OpenCLIsolatedExecutor {
         return HANDLE.get();
     }
 
+    private static <T> T runOnRuntimeThread(Callable<T> callable) throws Exception {
+        if (ON_RUNTIME_THREAD.get()) {
+            return callable.call();
+        }
+        Future<T> future = RUNTIME_EXECUTOR.submit(() -> {
+            ON_RUNTIME_THREAD.set(true);
+            try {
+                return callable.call();
+            } finally {
+                ON_RUNTIME_THREAD.remove();
+            }
+        });
+        try {
+            return future.get();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw interrupted;
+        } catch (ExecutionException execution) {
+            Throwable cause = execution.getCause();
+            if (cause instanceof Exception exception) {
+                throw exception;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new RuntimeException(cause);
+        }
+    }
+
     private static BridgeHandle createHandle() throws Exception {
         Path bundleRoot = QuantifiedPaths.getCacheDir().resolve("tools").resolve("openclIsolated");
         Files.createDirectories(bundleRoot);
+        Path nativeRoot = bundleRoot.resolve("native-runtime");
+        Files.createDirectories(nativeRoot);
         List<String> relativeEntries = readClasspathIndex();
         if (relativeEntries.isEmpty()) {
             throw new IOException("Embedded OpenCL runtime bundle missing classpath index: " + PROBE_INDEX_RESOURCE);
@@ -113,27 +240,32 @@ public final class OpenCLIsolatedExecutor {
             urls.add(destination.toUri().toURL());
         }
         Set<String> childFirstPackages = new LinkedHashSet<>();
-        childFirstPackages.add("org.lwjgl.opencl.");
+        // Do not mix the game's LWJGL classes with the embedded OpenCL
+        // binding. The parent may already own a different lwjgl.dll, and
+        // LWJGL refuses to load that JNI library from another class loader.
+        childFirstPackages.add("org.lwjgl.");
         childFirstPackages.add("org.admany.quantified.core.common.opencl.");
-        // A dedicated Linux server can expose LWJGL Java classes through the
-        // loader while shipping no liblwjgl.so at all.  Reusing that partial
-        // parent runtime makes LWJGL search the server classpath and prevents
-        // the embedded native jars from ever being considered.  On Linux the
-        // isolated runtime must own both its LWJGL classes and bundled natives.
-        // Windows keeps the shared parent path to avoid loading lwjgl.dll twice.
-        if (mustUseBundledLwjglCore()) {
-            childFirstPackages.add("org.lwjgl.");
-        }
+        String previousExtractPath = System.getProperty(EXTRACT_PATH_PROPERTY);
+        System.setProperty(EXTRACT_PATH_PROPERTY, nativeRoot.toAbsolutePath().toString());
         ChildFirstPackageClassLoader loader = new ChildFirstPackageClassLoader(
             urls.toArray(URL[]::new),
             OpenCLIsolatedExecutor.class.getClassLoader(),
             childFirstPackages
         );
-        Class<?> bridgeClass = Class.forName(BRIDGE_CLASS, true, loader);
-        java.lang.reflect.Method isAvailable = bridgeClass.getMethod("isAvailable");
-        java.lang.reflect.Method failureReason = bridgeClass.getMethod("failureReason");
-        java.lang.reflect.Method executeApiTask = bridgeClass.getMethod("executeApiTask", Object.class);
-        return new BridgeHandle(loader, bridgeClass, isAvailable, failureReason, executeApiTask);
+        try {
+            Class<?> bridgeClass = Class.forName(BRIDGE_CLASS, true, loader);
+            java.lang.reflect.Method isAvailable = bridgeClass.getMethod("isAvailable");
+            java.lang.reflect.Method failureReason = bridgeClass.getMethod("failureReason");
+            java.lang.reflect.Method executeApiTask = bridgeClass.getMethod("executeApiTask", Object.class);
+            java.lang.reflect.Method executeApiTasks = bridgeClass.getMethod("executeApiTasks", List.class);
+            return new BridgeHandle(loader, bridgeClass, isAvailable, failureReason, executeApiTask, executeApiTasks);
+        } finally {
+            if (previousExtractPath == null) {
+                System.clearProperty(EXTRACT_PATH_PROPERTY);
+            } else {
+                System.setProperty(EXTRACT_PATH_PROPERTY, previousExtractPath);
+            }
+        }
     }
 
     private static URL resolveCurrentCodeSource() throws IOException {
@@ -177,7 +309,8 @@ public final class OpenCLIsolatedExecutor {
         Class<?> bridgeClass,
         java.lang.reflect.Method isAvailable,
         java.lang.reflect.Method failureReason,
-        java.lang.reflect.Method executeApiTask
+        java.lang.reflect.Method executeApiTask,
+        java.lang.reflect.Method executeApiTasks
     ) {
     }
 
@@ -197,6 +330,79 @@ public final class OpenCLIsolatedExecutor {
         } catch (Throwable ignored) {
             return false;
         }
+    }
+
+    private static boolean isCoolingDown() {
+        long blockedUntil = DISABLED_UNTIL_MS.get();
+        if (blockedUntil <= 0L) {
+            return false;
+        }
+        if (System.currentTimeMillis() >= blockedUntil) {
+            DISABLED_UNTIL_MS.compareAndSet(blockedUntil, 0L);
+            return false;
+        }
+        return true;
+    }
+
+    private static void recordFailure(Throwable throwable) {
+        RUNTIME_READY.set(false);
+        FAILURE_REASON.set(describeFailure(throwable));
+        if (isPermanentNativeFailure(throwable)) {
+            DISABLED_UNTIL_MS.set(Long.MAX_VALUE);
+        } else {
+            DISABLED_UNTIL_MS.set(System.currentTimeMillis() + EXECUTION_FAILURE_COOLDOWN_MS);
+        }
+    }
+
+    /**
+     * A failed API workload is not a failed OpenCL runtime.  Keep the child
+     * context hot for the next task and only trip the cooldown when the
+     * bridge or native runtime itself has broken.
+     */
+    private static void recordExecutionFailure(Throwable throwable) {
+        if (isRuntimeFailure(throwable)) {
+            recordFailure(throwable);
+        }
+    }
+
+    private static boolean isRuntimeFailure(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof LinkageError || current instanceof ExceptionInInitializerError) {
+                return true;
+            }
+            String message = current.getMessage();
+            if (message != null) {
+                String lower = message.toLowerCase(java.util.Locale.ROOT);
+                if (lower.contains("opencl context")
+                    || lower.contains("opencl runtime")
+                    || lower.contains("lwjgl")
+                    || lower.contains("native library")
+                    || lower.contains("no opencl")) {
+                    return true;
+                }
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private static boolean isPermanentNativeFailure(Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof UnsatisfiedLinkError
+                || current instanceof ExceptionInInitializerError
+                || current instanceof NoClassDefFoundError) {
+                return true;
+            }
+            String message = current.getMessage();
+            if (message != null && (message.contains("already loaded in another classloader")
+                || message.contains("already loaded in another ClassLoader"))) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     private static String describeFailure(Throwable throwable) {

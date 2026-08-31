@@ -5,6 +5,7 @@ import org.admany.quantified.api.compute.GpuBackendType;
 import org.admany.quantified.core.common.async.core.AsyncManager;
 import org.admany.quantified.core.common.async.gpu.GpuWorkloadRegistry;
 import org.admany.quantified.core.common.async.gpu.OpenClBatchWorkload;
+import org.admany.quantified.core.common.async.gpu.OpenClIsolatedBatchWorkload;
 import org.admany.quantified.core.common.async.gpu.VulkanBatchWorkload;
 import org.admany.quantified.core.common.async.gpu.VulkanIsolatedBatchWorkload;
 import org.admany.quantified.core.common.async.task.PriorityTaskType;
@@ -231,6 +232,7 @@ public final class TaskScheduler {
             parallelUnits,
             complexity,
             type,
+            isolatedOpenClEligible,
             isolatedVulkanEligible
         );
 
@@ -367,6 +369,7 @@ public final class TaskScheduler {
                                               int parallelUnits,
                                               TaskComplexity complexity,
                                               TaskType type,
+                                              boolean isolatedOpenClEligible,
                                               boolean isolatedVulkanEligible) {
         TaskMetadata.Builder builder = TaskMetadata.builder();
         double estimatedCost = Math.max(1.0, dataSizeBytes / 4096.0);
@@ -385,7 +388,8 @@ public final class TaskScheduler {
         builder.maximumBatchSize(Math.max(preferred, preferred * 2));
           if (gpuSelected) {
               builder.gpuPreferred(true);
-              TaskMetadata.GpuBatchWorkload workload = resolveGpuBatchWorkload(backendType, isolatedVulkanEligible);
+              TaskMetadata.GpuBatchWorkload workload = resolveGpuBatchWorkload(
+                  backendType, isolatedOpenClEligible, isolatedVulkanEligible);
               builder.batchable(workload != null);
               if (workload != null) {
                   builder.gpuWorkload(workload);
@@ -402,8 +406,12 @@ public final class TaskScheduler {
     }
 
     private static TaskMetadata.GpuBatchWorkload resolveGpuBatchWorkload(GpuBackendType backendType,
+                                                                         boolean isolatedOpenClEligible,
                                                                          boolean isolatedVulkanEligible) {
         if (backendType != GpuBackendType.VULKAN) {
+            if (backendType == GpuBackendType.OPENCL && isolatedOpenClEligible && !OpenCLManager.isAvailable()) {
+                return OpenClIsolatedBatchWorkload.INSTANCE;
+            }
             return gpuBatchWorkload;
         }
         if (VulkanExecutionSupport.inProcessAvailable()) {

@@ -37,7 +37,7 @@ public class AutoHealthChecker {
     private void initializeDefaultChecks() {
         registerHealthCheck("gpu_available", Duration.ofSeconds(30), () -> {
             try {
-                return org.admany.quantified.core.common.opencl.core.OpenCLManager.isAvailable();
+                return org.admany.quantified.core.common.opencl.core.OpenCLManager.hasExecutableRuntime();
             } catch (Exception e) {
                 return false;
             }

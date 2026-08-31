@@ -10,6 +10,10 @@ public final class ApiOpenClTaskWrapper<T> extends OpenCLTask<T> implements Cach
         this.apiTask = apiTask;
     }
 
+    public QuantifiedOpenCL.ApiOpenClTask<T> apiTask() {
+        return apiTask;
+    }
+
     @Override
     public long estimatedVramBytes() {
         return apiTask.estimatedVramBytes();

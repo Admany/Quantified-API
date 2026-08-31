@@ -1,5 +1,12 @@
 # Quantified API Update Changelogs 
 
+## v2.2.1
+
+- Fixed isolated OpenCL execution when the game already loaded LWJGL through another classloader.
+- Added single flight OpenCL startup and a dedicated runtime thread so concurrent GPU requests do not duplicate native loading or stall the game.
+- Routed API OpenCL workloads through the isolated runtime when the in process binding is unavailable.
+- Fixed GPU status, dashboard, overlay, command, and health reporting so an executable isolated runtime is shown as active.
+
 ## v2.2.0
 
 - Fixed Linux GPU acceleration by packaging the Linux x64 and ARM64 LWJGL natives inside the isolated Vulkan and OpenCL runtimes.

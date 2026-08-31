@@ -1546,7 +1546,8 @@ public final class DeveloperDashboardServer {
         String vulkanFailureReason = vulkanBindingsPresent
             ? VulkanExecutionSupport.failureReason()
             : "Using isolated bundled Vulkan runtime for this Minecraft version";
-        payload.addProperty("openclAvailable", openclStatus.isAvailable());
+        boolean openclAvailable = OpenCLManager.hasExecutableRuntime();
+        payload.addProperty("openclAvailable", openclAvailable);
         if (openclStatus.failureReason() != null) {
             payload.addProperty("openclFailureReason", openclStatus.failureReason());
         }
@@ -1560,7 +1561,7 @@ public final class DeveloperDashboardServer {
             : "UNAVAILABLE");
         payload.addProperty("openclRuntimeState", !gpuAccelerationEnabled
             ? "DISABLED_BY_CONFIG"
-            : openclStatus.isAvailable() ? "READY"
+            : openclAvailable ? "READY"
             : "UNAVAILABLE");
         if (!vulkanProbeAvailable) {
             payload.addProperty("vulkanFailureReason", vulkanFailureReason);
@@ -1568,7 +1569,7 @@ public final class DeveloperDashboardServer {
             payload.addProperty("vulkanFailureReason", "Probe succeeded; runtime initialization deferred until first use");
         }
         GPUMonitor.GPUStatus gpuStatus = OpenCLManager.getGPUStatus();
-        payload.addProperty("openclDeviceName", gpuStatus != null ? gpuStatus.deviceName() : "");
+        payload.addProperty("openclDeviceName", gpuStatus != null ? gpuStatus.deviceName() : OpenCLManager.executableDeviceName());
         payload.addProperty("vulkanDeviceName", vulkanProbeAvailable ? VulkanExecutionSupport.deviceName() : "");
         payload.add("vulkanResidency", buildVulkanResidencyPayload());
         GpuBackendPreference configuredPreference = GpuBackendRouter.getDefaultPreference();
