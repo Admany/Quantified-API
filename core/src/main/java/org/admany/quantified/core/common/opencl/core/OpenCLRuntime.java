@@ -18,10 +18,12 @@ public final class OpenCLRuntime {
     private static final AtomicReference<Binding> BINDING = new AtomicReference<>(Binding.UNKNOWN);
     private static final AtomicReference<Boolean> PROBE_RUNTIME_PRESENT = new AtomicReference<>(null);
     private static final AtomicReference<ProbeSnapshot> LAST_PROBE_SNAPSHOT = new AtomicReference<>(null);
+    private static final AtomicBoolean OWNS_LWJGL = new AtomicBoolean(false);
 
     private enum Binding {
         UNKNOWN,
         LWJGL,
+        FOREIGN,
         NONE
     }
 
@@ -50,9 +52,19 @@ public final class OpenCLRuntime {
                 }
 
                 if (b == Binding.LWJGL) {
+                    if (hasForeignOwner()) {
+                        BINDING.set(Binding.FOREIGN);
+                        LAST_ERROR.set("OpenCL binding is owned by another runtime");
+                        return false;
+                    }
                     LOGGER.fine("Attempting to initialize LWJGL OpenCL runtime");
                     try {
-                        invokeLWJGLCreate();
+                        if (!invokeLWJGLCreate()) {
+                            BINDING.set(Binding.FOREIGN);
+                            LAST_ERROR.set("OpenCL binding is owned by another runtime");
+                            return false;
+                        }
+                        OWNS_LWJGL.set(true);
                     } catch (Throwable t) {
                         String message = t.getMessage() != null ? t.getMessage() : t.getClass().getName();
                         LAST_ERROR.set(message);
@@ -73,6 +85,9 @@ public final class OpenCLRuntime {
                     GpuStartupDiagnostics.reportOpenCl(LOGGER, "in-process-init", true, embeddedProbePresent(), true,
                         null, List.of());
                     return true;
+                } else if (b == Binding.FOREIGN) {
+                    LAST_ERROR.set("OpenCL binding is owned by another runtime");
+                    return false;
                 } else {
                     LAST_ERROR.set("No Java OpenCL binding found (org.lwjgl.opencl)");
                     LOGGER.warning("OpenCL runtime unavailable: No Java binding found");
@@ -100,7 +115,7 @@ public final class OpenCLRuntime {
     public static void destroy() {
         if (INITIALISED.compareAndSet(true, false)) {
             try {
-                if (BINDING.get() == Binding.LWJGL) {
+                if (OWNS_LWJGL.compareAndSet(true, false) && !hasForeignOwner()) {
                     invokeLWJGLDestroy();
                 }
                 LOGGER.fine("OpenCL runtime destroyed");
@@ -192,7 +207,9 @@ public final class OpenCLRuntime {
     }
 
     private static Binding probeBinding() {
-        // LWJGL check: use reflection and treat LinkageError/CNFE as "not available".
+        if (hasForeignOwner()) {
+            return Binding.FOREIGN;
+        }
         if (isClassPresent("org.lwjgl.opencl.CL")) {
             return Binding.LWJGL;
         }
@@ -231,6 +248,36 @@ public final class OpenCLRuntime {
         return false;
     }
 
+    private static boolean hasForeignOwner() {
+        if (Boolean.getBoolean("quantified.opencl.foreignOwner")) {
+            return true;
+        }
+        String[] markers = {
+            "com.ishland.c2me.opts.accel.opencl.ModuleEntryPoint",
+            "com.ishland.c2me.opts.accel.opencl.common.gen.CLServerGlobalContext",
+            "com.ishland.c2me.opts.accel.opencl.common.gen.CLServerWorldContext",
+            "com.ishland.c2me.opts.accel.opencl.common.gen.OpenCLDevice"
+        };
+        ClassLoader[] loaders = {
+            OpenCLRuntime.class.getClassLoader(),
+            Thread.currentThread().getContextClassLoader(),
+            ClassLoader.getSystemClassLoader()
+        };
+        for (ClassLoader loader : loaders) {
+            if (loader == null) {
+                continue;
+            }
+            for (String marker : markers) {
+                try {
+                    Class.forName(marker, false, loader);
+                    return true;
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return false;
+    }
+
     private static boolean isTerminalNativeFailure(Throwable throwable) {
         Throwable current = throwable;
         while (current != null) {
@@ -265,17 +312,21 @@ public final class OpenCLRuntime {
         return detail.toString();
     }
 
-    private static void invokeLWJGLCreate() throws Exception {
+    private static boolean invokeLWJGLCreate() throws Exception {
         Class<?> cl = Class.forName("org.lwjgl.opencl.CL");
         Method create = cl.getMethod("create");
         try {
             create.invoke(null);
+            return true;
         } catch (Exception e) {
-            if (e.getCause() instanceof IllegalStateException && e.getCause().getMessage().contains("already been created")) {
-                LOGGER.fine("OpenCL already initialized");
-            } else {
-                throw e;
+            Throwable cause = e instanceof java.lang.reflect.InvocationTargetException invocation
+                ? invocation.getCause() : e.getCause();
+            if (cause instanceof IllegalStateException
+                && cause.getMessage() != null
+                && cause.getMessage().contains("already been created")) {
+                return false;
             }
+            throw e;
         }
     }
 

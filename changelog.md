@@ -1,5 +1,11 @@
 # Quantified API Update Changelogs 
 
+## v2.2.2
+
+- QAPI no longer claims an OpenCL runtime already owned by C2ME or another loader.
+- OpenCL work uses the isolated runtime when another mod owns LWJGL, and QAPI leaves that runtime loaded during shutdown.
+- Kept the legacy balanced stress profile setting compatible with the CPU-heavy profile.
+
 ## v2.2.1
 
 - Fixed isolated OpenCL execution when the game already loaded LWJGL through another classloader.

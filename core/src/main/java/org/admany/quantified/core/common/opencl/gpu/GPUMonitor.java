@@ -49,7 +49,25 @@ public final class GPUMonitor {
             JUL_LOGGER.removeHandler(h);
         }
         JUL_LOGGER.addHandler(BRIDGE);
-        JUL_LOGGER.setLevel(Level.ALL);
+        java.util.logging.Level configured = java.util.logging.Level.ALL;
+        if (org.admany.quantified.core.common.config.MultithreadingConfig.CONFIG != null) {
+            var config = org.admany.quantified.core.common.config.MultithreadingConfig.CONFIG;
+            if (!config.logToConsole) {
+                configured = java.util.logging.Level.OFF;
+            } else if ("TRACE".equalsIgnoreCase(config.logLevel)) {
+                configured = Level.FINEST;
+            } else if ("DEBUG".equalsIgnoreCase(config.logLevel)) {
+                configured = Level.FINE;
+            } else if ("WARN".equalsIgnoreCase(config.logLevel) || "WARNING".equalsIgnoreCase(config.logLevel)) {
+                configured = Level.WARNING;
+            } else if ("ERROR".equalsIgnoreCase(config.logLevel)) {
+                configured = Level.SEVERE;
+            } else {
+                configured = Level.INFO;
+            }
+        }
+        BRIDGE.setLevel(configured);
+        JUL_LOGGER.setLevel(configured);
     }
 
     private static final long MONITORING_INTERVAL_MS = 1_000L;

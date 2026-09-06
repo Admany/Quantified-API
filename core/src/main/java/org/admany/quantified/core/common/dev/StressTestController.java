@@ -493,6 +493,9 @@ public final class StressTestController {
                 return CPU_HEAVY;
             }
             String normalised = key.trim().toLowerCase();
+            if (normalised.equals("balanced")) {
+                return CPU_HEAVY;
+            }
             for (StressTestProfile profile : values()) {
                 if (profile.configKey.equals(normalised)) {
                     return profile;

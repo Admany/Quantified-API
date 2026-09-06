@@ -89,7 +89,7 @@ public class MultithreadingConfig {
         public int dashboardSessionTimeoutMinutes = 30; // Dashboard session timeout in minutes
 
         // === Stress Testing Configuration ===
-        public String developerStressProfile = "balanced"; // Default stress test profile
+        public String developerStressProfile = "cpu_heavy"; // Default stress test profile
         public int stressTestCpuChunkMs = 50; // CPU stress test chunk size in milliseconds
 
         // === Monitoring and Diagnostics ===
@@ -501,6 +501,7 @@ public class MultithreadingConfig {
     public static void initializeGlobals(org.slf4j.Logger logger) {
         LOGGER = logger;
         CONFIG = loadOrCreateConfig(logger);
+        QuantifiedLogging.configure(logger, CONFIG);
     }
 
     private static boolean looksLikeBoxedConfig(com.google.gson.JsonObject jsonData) {

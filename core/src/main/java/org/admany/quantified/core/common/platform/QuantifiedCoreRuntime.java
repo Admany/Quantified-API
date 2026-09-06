@@ -1,5 +1,7 @@
 package org.admany.quantified.core.common.platform;
 
+import org.admany.quantified.core.common.config.QuantifiedLogging;
+
 import org.admany.quantified.api.QuantifiedAPI;
 import org.admany.quantified.core.client.legacy.LegacyApiClientNotifier;
 import org.admany.quantified.core.compat.LegacyModScanner;
@@ -82,6 +84,7 @@ public final class QuantifiedCoreRuntime {
         if (!CORE_BOOTSTRAPPED.compareAndSet(false, true)) {
             return;
         }
+        QuantifiedLogging.configureFromFile(paths.configDir());
         WorkerClassLoaderContext.capture();
         registerRuntimeShutdownHook();
 
@@ -103,6 +106,7 @@ public final class QuantifiedCoreRuntime {
 
         recordLog(logger, "[Quantified] Quantified API starting");
         MultithreadingConfig.initializeGlobals(logger);
+        QuantifiedLogging.configure(logger, MultithreadingConfig.CONFIG);
         recordLog(logger, "[Quantified] Quantified Core Starting");
 
         int availableProcessors = Math.max(2, Runtime.getRuntime().availableProcessors());
