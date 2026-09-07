@@ -1,5 +1,10 @@
 # Quantified API Update Changelogs 
 
+## v2.2.3
+
+- Fixed isolated OpenCL execution from loading the bundled LWJGL 3.3.3 native alongside Minecraft's LWJGL runtime.
+- Isolated OpenCL now reuses the parent LWJGL runtime when available, including C2ME-owned OpenCL bindings.
+
 ## v2.2.2
 
 - QAPI no longer claims an OpenCL runtime already owned by C2ME or another loader.

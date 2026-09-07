@@ -19,6 +19,8 @@ public final class OpenCLRuntime {
     private static final AtomicReference<Boolean> PROBE_RUNTIME_PRESENT = new AtomicReference<>(null);
     private static final AtomicReference<ProbeSnapshot> LAST_PROBE_SNAPSHOT = new AtomicReference<>(null);
     private static final AtomicBoolean OWNS_LWJGL = new AtomicBoolean(false);
+    private static final AtomicBoolean LAST_CREATE_OWNERSHIP = new AtomicBoolean(false);
+    private static final String ISOLATED_RUNTIME_PROPERTY = "quantified.opencl.isolated.runtime";
 
     private enum Binding {
         UNKNOWN,
@@ -64,7 +66,7 @@ public final class OpenCLRuntime {
                             LAST_ERROR.set("OpenCL binding is owned by another runtime");
                             return false;
                         }
-                        OWNS_LWJGL.set(true);
+                        OWNS_LWJGL.set(LAST_CREATE_OWNERSHIP.get());
                     } catch (Throwable t) {
                         String message = t.getMessage() != null ? t.getMessage() : t.getClass().getName();
                         LAST_ERROR.set(message);
@@ -249,6 +251,9 @@ public final class OpenCLRuntime {
     }
 
     private static boolean hasForeignOwner() {
+        if (Boolean.getBoolean(ISOLATED_RUNTIME_PROPERTY)) {
+            return false;
+        }
         if (Boolean.getBoolean("quantified.opencl.foreignOwner")) {
             return true;
         }
@@ -317,6 +322,7 @@ public final class OpenCLRuntime {
         Method create = cl.getMethod("create");
         try {
             create.invoke(null);
+            LAST_CREATE_OWNERSHIP.set(true);
             return true;
         } catch (Exception e) {
             Throwable cause = e instanceof java.lang.reflect.InvocationTargetException invocation
@@ -324,8 +330,10 @@ public final class OpenCLRuntime {
             if (cause instanceof IllegalStateException
                 && cause.getMessage() != null
                 && cause.getMessage().contains("already been created")) {
-                return false;
+                LAST_CREATE_OWNERSHIP.set(false);
+                return true;
             }
+            LAST_CREATE_OWNERSHIP.set(false);
             throw e;
         }
     }

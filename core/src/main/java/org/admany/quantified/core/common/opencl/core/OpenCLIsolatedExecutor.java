@@ -37,6 +37,7 @@ public final class OpenCLIsolatedExecutor {
     private static final String BRIDGE_CLASS = "org.admany.quantified.core.common.opencl.core.OpenCLIsolatedBridge";
     private static final long EXECUTION_FAILURE_COOLDOWN_MS = 300_000L;
     private static final String EXTRACT_PATH_PROPERTY = "quantified.opencl.isolated.extractPath";
+    private static final String ISOLATED_RUNTIME_PROPERTY = "quantified.opencl.isolated.runtime";
     private static final AtomicReference<BridgeHandle> HANDLE = new AtomicReference<>();
     private static final AtomicReference<CompletableFuture<Boolean>> WARMUP = new AtomicReference<>();
     private static final AtomicBoolean RUNTIME_READY = new AtomicBoolean(false);
@@ -90,9 +91,9 @@ public final class OpenCLIsolatedExecutor {
             ON_RUNTIME_THREAD.set(true);
             try {
                 BridgeHandle bridge = handle();
-                boolean available = Boolean.TRUE.equals(bridge.isAvailable().invoke(null));
+                boolean available = Boolean.TRUE.equals(invokeBridge(bridge.isAvailable()));
                 if (!available) {
-                    Object reason = bridge.failureReason().invoke(null);
+                    Object reason = invokeBridge(bridge.failureReason());
                     throw new IllegalStateException(reason == null
                         ? "Isolated OpenCL context creation failed"
                         : String.valueOf(reason));
@@ -123,7 +124,7 @@ public final class OpenCLIsolatedExecutor {
                     throw new IllegalStateException("Isolated OpenCL runtime is unavailable: " + failureReason());
                 }
                 BridgeHandle handle = handle();
-                T result = (T) handle.executeApiTask().invoke(null, apiTask);
+                T result = (T) invokeBridge(handle.executeApiTask(), apiTask);
                 RUNTIME_READY.set(true);
                 return result;
             });
@@ -142,7 +143,7 @@ public final class OpenCLIsolatedExecutor {
                 if (!canExecute()) {
                     throw new IllegalStateException("Isolated OpenCL runtime is unavailable: " + failureReason());
                 }
-                return (Object[]) handle().executeApiTasks().invoke(null, apiTasks);
+                return (Object[]) invokeBridge(handle().executeApiTasks(), apiTasks);
             });
         } catch (RuntimeException runtimeException) {
             recordExecutionFailure(runtimeException);
@@ -162,7 +163,7 @@ public final class OpenCLIsolatedExecutor {
                     throw new IllegalStateException("Isolated OpenCL runtime is unavailable: " + failureReason());
                 }
                 @SuppressWarnings("unchecked")
-                T value = (T) handle().executeApiTask().invoke(null, apiTask);
+                T value = (T) invokeBridge(handle().executeApiTask(), apiTask);
                 RUNTIME_READY.set(true);
                 result.complete(value);
             } catch (Throwable throwable) {
@@ -240,13 +241,17 @@ public final class OpenCLIsolatedExecutor {
             urls.add(destination.toUri().toURL());
         }
         Set<String> childFirstPackages = new LinkedHashSet<>();
-        // Do not mix the game's LWJGL classes with the embedded OpenCL
-        // binding. The parent may already own a different lwjgl.dll, and
-        // LWJGL refuses to load that JNI library from another class loader.
-        childFirstPackages.add("org.lwjgl.");
         childFirstPackages.add("org.admany.quantified.core.common.opencl.");
+        boolean bundledLwjglCore = mustUseBundledLwjglCore();
+        if (bundledLwjglCore) {
+            childFirstPackages.add("org.lwjgl.");
+        } else if (!parentHasUsableLwjglOpenCl()) {
+            childFirstPackages.add("org.lwjgl.opencl.");
+        }
         String previousExtractPath = System.getProperty(EXTRACT_PATH_PROPERTY);
-        System.setProperty(EXTRACT_PATH_PROPERTY, nativeRoot.toAbsolutePath().toString());
+        if (bundledLwjglCore) {
+            System.setProperty(EXTRACT_PATH_PROPERTY, nativeRoot.toAbsolutePath().toString());
+        }
         ChildFirstPackageClassLoader loader = new ChildFirstPackageClassLoader(
             urls.toArray(URL[]::new),
             OpenCLIsolatedExecutor.class.getClassLoader(),
@@ -260,10 +265,27 @@ public final class OpenCLIsolatedExecutor {
             java.lang.reflect.Method executeApiTasks = bridgeClass.getMethod("executeApiTasks", List.class);
             return new BridgeHandle(loader, bridgeClass, isAvailable, failureReason, executeApiTask, executeApiTasks);
         } finally {
-            if (previousExtractPath == null) {
-                System.clearProperty(EXTRACT_PATH_PROPERTY);
+            if (bundledLwjglCore) {
+                if (previousExtractPath == null) {
+                    System.clearProperty(EXTRACT_PATH_PROPERTY);
+                } else {
+                    System.setProperty(EXTRACT_PATH_PROPERTY, previousExtractPath);
+                }
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <T> T invokeBridge(java.lang.reflect.Method method, Object... args) throws Exception {
+        String previous = System.getProperty(ISOLATED_RUNTIME_PROPERTY);
+        System.setProperty(ISOLATED_RUNTIME_PROPERTY, "true");
+        try {
+            return (T) method.invoke(null, args);
+        } finally {
+            if (previous == null) {
+                System.clearProperty(ISOLATED_RUNTIME_PROPERTY);
             } else {
-                System.setProperty(EXTRACT_PATH_PROPERTY, previousExtractPath);
+                System.setProperty(ISOLATED_RUNTIME_PROPERTY, previous);
             }
         }
     }
@@ -326,6 +348,15 @@ public final class OpenCLIsolatedExecutor {
         try {
             Class.forName("org.lwjgl.system.MemoryUtil", true, OpenCLIsolatedExecutor.class.getClassLoader());
             Class.forName("org.lwjgl.PointerBuffer", true, OpenCLIsolatedExecutor.class.getClassLoader());
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean parentHasUsableLwjglOpenCl() {
+        try {
+            Class.forName("org.lwjgl.opencl.CL", false, OpenCLIsolatedExecutor.class.getClassLoader());
             return true;
         } catch (Throwable ignored) {
             return false;
