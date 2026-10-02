@@ -511,7 +511,7 @@ public class MultithreadingConfig {
         String[] groupKeys = {
             "general", "networking", "gpu", "taskProcessing", "developerFeatures",
             "developerDashboard", "stressTesting", "monitoring", "security", "debug",
-            "fixes", "experimental"
+            "fixes", "experimental", "parallel"
         };
         for (String key : groupKeys) {
             if (jsonData.has(key) && jsonData.get(key).isJsonObject()) {
@@ -527,6 +527,8 @@ public class MultithreadingConfig {
             // Parse all fields directly from the root JSON object (ADM-style flat format)
             config.logToConsole = extractBoxedBoolean(jsonData, "logToConsole", config.logToConsole);
             config.logLevel = extractBoxedString(jsonData, "logLevel", config.logLevel);
+
+            parseParallelConfig(jsonData, config);
 
             config.enableNetworking = extractBoxedBoolean(jsonData, "enableNetworking", config.enableNetworking);
             config.networkTimeoutMs = extractBoxedInt(jsonData, "networkTimeoutMs", config.networkTimeoutMs);
@@ -595,6 +597,11 @@ public class MultithreadingConfig {
         Config config = new Config();
 
         try {
+            parseParallelConfig(jsonData, config);
+            if (jsonData.has("parallel") && jsonData.get("parallel").isJsonObject()) {
+                parseParallelConfig(jsonData.getAsJsonObject("parallel"), config);
+            }
+
             // Parse general settings
             if (jsonData.has("general") && jsonData.get("general").isJsonObject()) {
                 com.google.gson.JsonObject general = jsonData.get("general").getAsJsonObject();
@@ -710,6 +717,13 @@ public class MultithreadingConfig {
         }
 
         return config;
+    }
+
+    private static void parseParallelConfig(com.google.gson.JsonObject jsonData, Config config) {
+        config.parallelMaxThreads = extractBoxedInt(jsonData, "parallelMaxThreads", config.parallelMaxThreads);
+        config.parallelQueueLimit = extractBoxedInt(jsonData, "parallelQueueLimit", config.parallelQueueLimit);
+        config.parallelMaxSlicesPerMod = extractBoxedInt(jsonData, "parallelMaxSlicesPerMod", config.parallelMaxSlicesPerMod);
+        config.parallelFailurePolicy = extractBoxedString(jsonData, "parallelFailurePolicy", config.parallelFailurePolicy);
     }
 
     private static String extractBoxedString(com.google.gson.JsonObject parent, String key, String defaultValue) {

@@ -1,5 +1,10 @@
 # Quantified API Update Changelogs 
 
+## v2.2.4
+
+- Fixed parallel execution settings being ignored after restarting. Thread limits, queue limits, per-mod slice limits, and the failure policy now load from the config properly.
+- Kept flat and boxed configs supported, with save/reload checks for all four settings.
+
 ## v2.2.3
 
 - Fixed isolated OpenCL execution from loading the bundled LWJGL 3.3.3 native alongside Minecraft's LWJGL runtime.
